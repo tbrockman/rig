@@ -3,7 +3,6 @@
 # guarded lives in VFIO and QEMU, and a mock will cheerfully tell you
 # everything is fine.
 #
-#   export GPUCTL_PCI=0000:04:00.0
 #   ./test-invariants.sh <base-image-alias>
 #
 # Creates instances gputest-a / gputest-b and deletes them at the end.
@@ -12,13 +11,18 @@ set -uo pipefail
 
 IMAGE="${1:-nixos-gpu-base}"
 GPUCTL="${GPUCTL:-./gpuctl}"
+RIG="${RIG:-./rig}"
 PASS=0; FAIL=0
 
 pass() { echo "  PASS: $*"; PASS=$((PASS+1)); }
 fail() { echo "  FAIL: $*"; FAIL=$((FAIL+1)); }
 hdr()  { printf '\n--- %s ---\n' "$*"; }
 
-: "${GPUCTL_PCI:?set GPUCTL_PCI first, e.g. 0000:04:00.0}"
+# Only test 6 needs a literal address, for the poisoned profile. The tools
+# discover it themselves.
+GPUCTL_PCI="${GPUCTL_PCI:-$($GPUCTL status --json |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["card"])')}"
+: "${GPUCTL_PCI:?no GPU found; set GPUCTL_PCI, e.g. 0000:04:00.0}"
 
 cleanup() {
   hdr "cleanup"

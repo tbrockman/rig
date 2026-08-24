@@ -1,374 +1,200 @@
 # STATUS
 
-Context for picking this work up. Written 2026-08-23, updated 2026-08-24.
+State, decisions and open work. Written 2026-08-23, updated 2026-08-24.
+Start at `CLAUDE.md` for how to actually use this.
 
 ## Goal
 
-An isolated VM with real GPU access, for an unsupervised coding agent to build
-and test GPU software in. Architecture:
+An isolated VM with real GPU access for an unsupervised coding agent:
 
-    monitored claude code on host
-      -> Incus VM (GPU passed through, dev tooling)
-        -> unsupervised agent working on a project
+    monitored claude code on host  ->  Incus VM (GPU passed through)
+                                        ->  unsupervised agent on a project
 
-One VM active at a time, roughly one per project, stopped when unused. Remote
-paid models power the agent — the GPU is for the software being built, not for
-running models locally.
-
-All three boxes now exist: `rig` on the host, the `nixos-gpu-base` image with
-the driver, and `project-template/run-agent` in the guest. **Start at
-`CLAUDE.md`** — it says which tool does what and how to stand up a project.
+One VM at a time, one per project, stopped when unused. Remote paid models power
+the agent; the GPU is for the software being built.
 
 ## Hardware
 
 - AMD Ryzen 7 7800X3D, 60 GiB RAM, Ubuntu 26.04, kernel 7.0.0-29
-- RTX 4080 SUPER at `0000:04:00.0` (+ audio `04:00.1`), IDs `10de:2702` / `10de:22bb`
-- IOMMU group 13: bridge + both NVIDIA functions. Clean. No ACS override needed.
-- AMD Raphael iGPU at `0f:00.0` — drives the console over HDMI
+- RTX 4080 SUPER at `0000:04:00.0` (+ audio `04:00.1`), `10de:2702` / `10de:22bb`
+- IOMMU group 13: bridge + both NVIDIA functions. Clean, no ACS override needed.
+- AMD Raphael iGPU at `0f:00.0` drives the console over HDMI
 - Samsung 990 PRO 4TB: LUKS -> LVM -> ext4 root, VG fully allocated
 
-**The GPU is in a chipset slot wired for x2.** `max=x2`, not a training failure.
-Measured 3.19 GB/s H2D, 3.30 GB/s D2H (~82% of PCIe 4.0 x2, so the link is clean,
-just narrow). On-card D2D 316 GB/s, normal.
+**The GPU is in a chipset slot wired for x2.** `max=x2`, not a training failure:
+3.19 GB/s H2D, 3.30 GB/s D2H is ~82% of PCIe 4.0 x2. On-card D2D 316 GB/s.
 
-Slot 1 (the only Gen5 x16) has a snapped retention latch and previously failed to
-POST with the card installed. **Unresolved.** Worth diagnosing: monitor on iGPU,
-card in slot 1, check for POST; try forcing Gen4/Gen3; inspect for bent pins,
-debris, cracked slot body, lifted solder. Matters because the agent will profile
-GPU code, and at x2 it would draw wrong conclusions about transfer bottlenecks.
-If the card moves, its PCI address changes — update `GPUCTL_PCI` and re-claim.
+**Slot 1 (the only Gen5 x16) is unresolved** — snapped retention latch, and the
+card previously failed to POST there. Diagnose with the monitor on the iGPU:
+check for POST, try forcing Gen4/Gen3, inspect for bent pins or a cracked slot.
+It matters because an agent profiling GPU code at x2 draws wrong conclusions
+about transfer bottlenecks. The tools discover the PCI address, so moving the
+card needs no config change.
 
-## Decisions made, and why
+## Decisions, and why
 
-- **Incus, not microsandbox.** microsandbox optimises fast disposable microVM
-  spawn; this workload is one long-lived VM. Incus has physical GPU passthrough,
-  network ACLs, and profiles as first-class features.
-- **VFIO passthrough, not virtio-gpu/venus.** Venus is Vulkan-only — no CUDA, no
-  NVENC, no OpenGL. Passthrough also has a smaller host attack surface: no
-  virglrenderer parsing untrusted guest commands in host userspace.
-- **NixOS guest.** One base image; per-project toolchains live in project flakes.
-  Avoids per-project image proliferation and version drift.
-- **Image is a build artifact.** `nix build` of `system.build.qemuImage` +
-  `system.build.metadata`, imported into Incus. Not `incus publish` of a mutated
-  instance.
-- **No state store.** Incus is the sole source of truth; `gpuctl` derives
-  everything from `GET /1.0/instances`. Only persistent artefact is a lock file.
-- **No Terraform/OpenTofu.** Nix + `incus admin init --preseed`. Note preseed does
-  not cover `network_acls` — those need a separate reconcile pass.
-- **Dynamic vfio binding, not static.** Proven working: five acquisitions
-  including one that took the card back from the live `nvidia` driver. Static
-  binding was considered and rejected because it needs boot-framebuffer
-  workarounds when the dGPU is firmware-primary.
+- **Incus, not microsandbox.** microsandbox optimises disposable microVM spawn;
+  this is one long-lived VM. Incus has passthrough, ACLs and profiles natively.
+- **VFIO passthrough, not virtio-gpu/venus.** Venus is Vulkan-only — no CUDA.
+  Also a smaller host attack surface: no virglrenderer parsing guest commands.
+- **NixOS guest.** One base image; per-project toolchains in project flakes.
+- **Image is a build artifact** of `base/flake.nix`, not `incus publish` of a
+  mutated instance.
+- **No state store.** Incus is the source of truth; everything is derived. The
+  only persistent artefact is a lock file.
+- **No Terraform.** Nix + `incus admin init --preseed`, except preseed does not
+  cover `network_acls` — hence `gpuctl apply`.
+- **Dynamic vfio binding.** Static binding needs boot-framebuffer workarounds
+  when the dGPU is firmware-primary.
+- **Go, not shell.** Typed, testable, and the Incus REST API is reachable
+  directly, so nothing parses CLI output. One module, three binaries: `rig`
+  (routine), `gpuctl` (privileged), `hostgpu` (host-side card moves).
+- **Credentials are env vars in a host file**, injected to tmpfs at start.
+  Scoping them is the operator's job; nothing else can judge it.
 
-## Known Incus behaviours (verified on this host)
+## Known Incus behaviours (verified here)
 
-1. **GPU is not released on VM stop.** Incus sets `driver_override=vfio-pci` and
-   never clears it. Manual rebind procedure is in `hostgpu`, verified working.
-2. **Starting a second VM with the same GPU hot-unplugs it from the running one.**
-   VFIO sends a device request to the current owner; QEMU's handler unplugs.
-   Both VMs lose. Loud on the VM that failed to start, **silent on the one that
-   was working** — `incus list` still shows it RUNNING with a healthy IP.
-   This is what `gpuctl` exists to prevent.
-3. **`dns.nameservers` + `security.acls` are incompatible** on 6.0.5. Incus emits
-   the cross product of nameservers x address families, producing invalid nftables
-   rules. Unnecessary anyway: Incus inserts DHCP/DNS rules ahead of ACL rules, so
-   blocking RFC1918 does not break the bridge resolver. Worth reporting upstream.
-   (`dns.nameservers` is currently unset, so this is not being triggered.)
-4. **Attaching *any* ACL to a NIC flips it to default-reject in both
-   directions.** `security.acls.default.egress.action` defaults to `reject`, so
-   attaching a *denylist* ACL does not do what it looks like: `vm-isolate`
-   blackholed all public egress. It presents as "the internet is a bit broken"
-   rather than "everything is blocked", because DHCP and the bridge resolver keep
-   working (Incus's own pre-rules) so DNS still resolves. A denylist posture
-   requires setting `security.acls.default.egress.action=allow` explicitly.
-5. **ACL default-action changes apply live.** Setting them on a running VM's NIC
-   took effect with no restart. *Attaching* the ACL to the NIC was done stopped.
-6. **An ACL's rules cannot be edited while the ACL is attached to anything.**
-   Any rule add/remove/rewrite on an ACL with `USED BY` > 0 fails with:
+Behaviours the code now handles are documented at their handling site, not here.
+What remains:
 
-       Failed to run: nft -f -: flush chain inet incus acl.incusbr0
-       Error: No such file or directory; did you mean chain 'fwd.incusbr0'?
+1. **The GPU is not released on VM stop.** Incus sets `driver_override=vfio-pci`
+   and never clears it. `hostgpu desktop` does the rebind.
+2. **Starting a second VM with the same GPU hot-unplugs it from the running
+   one.** Loud on the VM that failed to start, **silent on the victim** — it
+   still shows RUNNING with a healthy IP. This is what `gpuctl` prevents.
+3. **`dns.nameservers` + `security.acls` are incompatible** on 6.0.5: Incus emits
+   the cross product of nameservers x address families and produces invalid
+   nftables rules. `dns.nameservers` is unset, so this is not being triggered.
+   Unnecessary anyway — Incus inserts DHCP/DNS rules ahead of ACL rules.
+4. **Attaching any ACL flips the NIC to default-reject in both directions**, so a
+   denylist ACL is a blackout until `egress.action=allow` is set. It reads as
+   "the internet is a bit broken", because the bridge resolver keeps working.
+   See `internal/policy`.
+5. **An ACL's rules cannot be edited while it is attached** — Incus flushes an
+   nftables chain it never created and fails. `gpuctl apply` detaches, rewrites
+   and reattaches, and refuses while a consumer is running. See
+   `policy.rewriteACL`.
 
-   Incus flushes a chain named `acl.<bridge>` that this version never creates —
-   it uses `fwd.<bridge>`. Not a "no running instance" problem: it fails with a
-   consuming VM up, and succeeds the moment `USED BY` reaches 0. The failure is
-   clean, the ACL is left unchanged. Another one to report upstream.
+## Current state
 
-   Consequence for changing the policy later: do not edit `vm-isolate` in place.
-   Create `vm-isolate-v2` with the new rules, point the NIC at it, delete the
-   old one. `gpuctl apply` can create an ACL and fix NIC settings on an in-use
-   ACL, but a *rule* rewrite on one will hit this and fail loudly.
+- ZFS pool `fast` (loop-backed, 500 GiB, on the LUKS root, so encrypted at rest),
+  ARC capped at 8 GiB. CoW clones measured: `rig new` takes 1.5 s and adds no
+  pool usage.
+- Host headless, console on iGPU/HDMI. `boot_vga=1` on `0f:00.0`.
+- `./01-build-image.sh` builds and imports `nixos-gpu-base`.
+- **Passthrough verified in-guest:** RTX 4080 SUPER, 16376 MiB, driver
+  595.71.05, CUDA 13.2. `hardware.nvidia.open = true` works on Ada.
+- **CUDA compute verified, not just `nvidia-smi`:** all 4,194,304 elements
+  bit-exact under two launch geometries, with poison and negative-control checks
+  passing. 3.11 GB/s H2D / 3.24 GB/s D2H in-guest, matching the host-side x2
+  measurement — passthrough costs nothing measurable on top of a narrow link.
+- **Isolation verified empirically:** `test-network-acl.sh` 23 passed, 0 failed,
+  2 skipped. `test-invariants.sh` 11/11. `go test ./...` green.
+- The whole path works end to end: `rig new` → `start` (GPU claimed, credentials
+  injected) → `doctor` → CUDA test → ACL suite → `run-agent`.
 
-## Current state — what works
-
-- ZFS pool `fast` (loop-backed, 500 GiB, on the LUKS root so encrypted at rest).
-  ARC capped at 8 GiB via `/etc/modprobe.d/zfs.conf`. CoW clones measured
-  2026-08-24: `rig new` takes **1.5 s and adds no pool usage**. That claim is the
-  justification for this pool and had never actually been tested — the runbook's
-  check used `incus copy <image>`, which cannot work at all.
-- Host headless (`multi-user.target`), console on iGPU/HDMI, `getty@tty1` active.
-  `boot_vga=1` on `0f:00.0`, `fb0` on the iGPU. `amdgpu` added to initramfs.
-- `./01-build-image.sh` builds and imports `nixos-gpu-base` successfully.
-- **Passthrough verified from inside the guest:** RTX 4080 SUPER, 16376 MiB,
-  driver 595.71.05, CUDA 13.2. `hardware.nvidia.open = true` works on Ada.
-- `incus exec` works against the built image (agent is fine).
-- `gpuctl claim/start/stop/release` all working; `./test-invariants.sh` 11/11.
-- **`gpuctl` enforces network isolation as well as GPU exclusivity.** `start`
-  refuses an instance whose NIC lacks the isolation ACL (escape hatch:
-  `--allow-unisolated`), the check runs before the claim so a refusal does not
-  move the card, and `status` marks unisolated instances. The isolation is now
-  on the `default` profile too, so new instances inherit it.
-- **The new-project path works end to end and is now one command each step:**
-  `rig new` → `rig start` (GPU claimed, credentials injected) → `gpu-check` →
-  CUDA test → `test-network-acl.sh` → `run-agent`. Verified on `proj-demo`.
-- **CUDA compute verified end to end, not just `nvidia-smi`.** `project-template`
-  builds in a guest devShell and `vectoradd` reports all 4,194,304 elements
-  bit-exact under two launch geometries, with the poison and negative-control
-  checks passing. Measured 3.11 GB/s H2D, 3.24 GB/s D2H from inside the guest —
-  consistent with the host-side x2 measurement, so passthrough costs nothing
-  measurable on top of the narrow link.
-
-## Network isolation — verified 2026-08-24
-
-The posture is a **denylist**: the guest reaches the public internet and nothing
-on this machine or this LAN. IPv4 only, by decision — see "Parked" below.
-
-Config that produces it (on the NIC, not the profile — see the open decision):
-
-    security.acls: vm-isolate
-    security.acls.default.egress.action: allow     # denylist, NOT the default
-    security.acls.default.ingress.action: reject   # explicit; also the default
+### What the isolation is
 
 `vm-isolate` egress-rejects `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
-`169.254.0.0/16`, `100.64.0.0/10`.
+`169.254.0.0/16` and `100.64.0.0/10` (CGNAT/Tailscale — not covered by RFC1918
+and a real gap once), with `egress.action=allow` and `ingress.action=reject` on
+the NIC. Declared in `internal/policy`, reconciled by `gpuctl apply`.
 
-**The ACL existed but was attached to nothing.** `USED BY 0`, no `security.acls`
-on the `default` profile's NIC or on any instance. The isolation was config that
-had never been in force. Measured before attaching it, the guest could reach:
+Before it was attached, the guest could reach the host's sshd on all five
+addresses the host holds — including its tailnet address — plus the LAN gateway,
+a LAN peer, an online tailnet peer and the router's DNS.
 
-- the host's sshd on **all five** addresses the host holds — the bridge
-  (`10.187.156.1`), both docker bridges (`172.17.0.1`, `172.18.0.1`), the LAN
-  address (`192.168.18.2`), and **the host's own tailnet address**
-  (`100.74.124.13`)
-- the LAN gateway over HTTP and ICMP, and a live LAN peer over ICMP
-- an online tailnet peer over ICMP
-- the router's DNS over UDP
+What is proven and what is not:
 
-After attaching it: `./test-network-acl.sh cuda-smoke` → **23 passed, 0 failed,
-2 skipped**. The 2 skips are keycloak ports the host cannot reach either, so a
-guest failure there would prove nothing; the script skips rather than passes
-them. `vectoradd` still passes with the ACL in force, so the isolation does not
-cost the guest anything it needs.
-
-What is proven, and what is not:
-
-- **Attributable to the ACL:** every host address on tcp/22 (traffic to a host
-  address is INPUT, not FORWARD, so nothing else on this box is doing the
-  blocking), the LAN gateway on tcp/80, ICMP to the gateway / a LAN peer / a
-  tailnet peer, and UDP/53 to the router.
-- **Not attributable:** the docker *container* targets. Docker's own FORWARD
-  rules already drop traffic arriving from another bridge, so those tests stay
-  green with the ACL removed. They are kept as outcome checks and labelled in
-  the output; do not cite them as evidence.
+- **Attributable to the ACL:** every host address on tcp/22 (INPUT, not FORWARD,
+  so nothing else is doing the blocking), the LAN gateway on tcp/80, ICMP to the
+  gateway / a LAN peer / a tailnet peer, UDP/53 to the router.
+- **Not attributable:** the docker *container* targets — Docker's own FORWARD
+  rules drop cross-bridge traffic anyway. Kept as outcome checks, labelled.
 - **Not proven:** `169.254.0.0/16`. Nothing on it is reachable from the host, so
-  the test can only ever skip.
-- **Not inspected:** the generated nftables ruleset. `sudo` needs a password
-  here, so `sudo nft list ruleset` could not be run — the one Phase 4 item left
-  undone. The specific risk it was meant to catch (malformed cross-family rules
-  from the `dns.nameservers` bug) does not apply, since `dns.nameservers` is
-  unset.
-- **Residual gap, not exploitable:** the WAN address `64.46.8.186` is in no
-  reject range, so a guest could in principle hairpin to anything
-  port-forwarded. The router does not hairpin — unreachable from the host too —
-  so this cannot be demonstrated from inside. No rule was added: one keyed to a
-  dynamic ISP address fails open silently, which is worse than a documented gap.
+  the test can only skip.
+- **Not inspected:** the generated nftables ruleset — `sudo` needs a password.
+- **Residual, not exploitable:** the WAN address is in no reject range, so a
+  guest could hairpin to anything port-forwarded. The router does not hairpin, so
+  it cannot be demonstrated from inside. No rule added: one keyed to a dynamic
+  ISP address fails open silently, which is worse than a documented gap.
 - The bridge resolver on **udp/53 is reachable by design** (Incus inserts
-  DHCP/DNS rules ahead of ACL rules). Confirmed scoped, not a hole: tcp/22 on
-  the same address is blocked.
+  DHCP/DNS rules ahead of ACL rules). Scoped, not a hole: tcp/22 on the same
+  address is blocked.
 
-Both halves of "make it non-forgettable" are now done: the three settings are on
-the `default` profile so new instances inherit them, and `gpuctl start` refuses
-an instance whose NIC lacks the ACL. Note this is the opposite of the GPU rule —
-a NIC ACL in a profile is correct; a GPU device in a profile never is.
+## Open
 
-`gpuctl apply` is the reconcile pass preseed cannot do. It declares the five
-reject ranges and the three NIC keys in `gpuctl` itself, creates or rewrites the
-ACL, sets the keys on the profile NIC, and reports instances whose own NIC
-override leaves them uncovered without touching them (an override may be
-deliberate). `--dry-run` prints the diff. Exercised in both directions: create
-from nothing, and repair an ACL missing four of five ranges.
-
-## Agent surface
-
-`rig` is the whole control surface: `new`, `start`, `stop`, `status`, `claim`,
-`rm`. Not `gpu` any more — the tool creates VMs, injects credentials and manages
-lifecycle, so naming it after one device it attaches was wrong, and `gpu` /
-`gpuctl` were one letter apart with very different power.
-
-It covers the **entire** lifecycle deliberately. The first version had only
-start/stop/status/claim, which meant anyone using it dropped to raw `incus` for
-creation and deletion — the surface it exists to avoid — and since `incus init`
-was allowed while `incus delete` was denied, a failed attempt stranded an orphan
-that could not be cleaned up. Create-without-delete is not a safe subset.
-
-Also absent by design: `release`, `--force`, `apply`, `--allow-unisolated`. It
-rejects extra arguments so `rig start foo --allow-unisolated` cannot leak
-`gpuctl`'s escape hatch, and `rig rm` refuses anything lacking the
-`user.rig.managed` marker, so it cannot delete a hand-built instance.
-
-**The PCI address is derived, in three steps:** `GPUCTL_PCI` if set, else the
-current holder via `gpuctl status --json`, else the sole NVIDIA display
-controller on the PCI bus. The third was missing and made `rig claim` fail on a
-fresh host or straight after a `release` — which is exactly the first claim of a
-new project. Still no second copy of the address to go stale.
-
-`.claude/settings.json` allows `./rig` and denies the `incus` verbs that can
-break the one-card invariant or remove a guest's isolation (`init`, `launch`,
-`copy`, `start`, `stop`, `restart`, `delete`, `config device
-add/set/unset/remove/override`, `profile`, `network`), leaving
-`list`/`info`/`exec`/`file`/`show` usable. Each deny is written in both wildcard
-syntaxes (`incus profile *` and `incus profile:*`) because a deny rule that
-silently fails to match is worse than no rule.
-
-**Be honest about what that buys.** Deny rules are prefix matches on the command
-string. `bash -c 'incus start x'` sidesteps them, and the test scripts call
-`incus` internally without tripping anything. This makes `rig` the path of least
-resistance and an invariant-breaking command an explicit act rather than a
-convenient one. The actual security boundary is the VM and the network ACL, not
-this file.
-
-## Credentials for the unattended agent
-
-Decided 2026-08-24: **inject as environment variables, scoping is the
-operator's job.**
-
-`rig new <name> --env FILE` records the *path* on the instance
-(`user.rig.env`) — never the secret. `rig start` waits for the guest agent, then
-pushes that file to `/run/rig/env` (mode 0600, root). `/run` is tmpfs, so the
-credentials never reach the instance's disk or its Incus config, and they are
-gone when the VM stops; a restart re-injects them. `project-template/run-agent`
-sources the file and execs the agent.
-
-`rig` refuses an env file that other users can read, and refuses lines that are
-not `KEY=VALUE` — the first is a mistake rather than a choice, the second stops
-shell constructs reaching the guest. It makes no judgement about whether a key is
-narrowly enough scoped. That is the operator's call, and it is the one part of
-this design that tooling cannot check.
-
-`secrets/` in the repo is gitignored.
-
-The agent binary itself comes from the **project flake**
-(`pkgs.claude-code`), for the same reason the CUDA toolchain does: a project
-wanting a different version should not require a new base image.
-
-## Immediate next steps
-
-1. **Slot 1 diagnostic** (see Hardware) — worth doing before several projects
-   have `0000:04:00.0` baked in. Physical work: monitor on the iGPU, card in
-   slot 1, check for POST, then try forcing Gen4/Gen3.
+1. **Slot 1 diagnostic** (see Hardware). Physical work.
+2. See "What would make this harder over time" below.
 
 ## Parked — IPv6 (do not re-investigate without new information)
 
-**The ISP does not delegate an IPv6 prefix.** Verified 2026-08-23 on the
-ISP-supplied router:
+**The ISP does not delegate an IPv6 prefix.** Verified 2026-08-23 on the router:
+the WAN v6 link never comes up, and `Received IPv6 prefix` is empty. So
+`ipv6.address=none` stays on `incusbr0`. That is correct, not a workaround:
+bridge IPv6 with no upstream route would add a bypass around IPv4-only ACL rules
+and cause AAAA-first stalls.
 
-- WAN: `WAN link status(v6): Linking` — never reaches Up. No v6 WAN address or
-  gateway. IPv4 only (`64.46.8.186`).
-- LAN: `Prefix Config` offers "Use WAN provided prefix", but
-  `Received IPv6 prefix: -`, and the setting reverts to `Static` on save —
-  the router cannot hold the delegated mode because no prefix arrives.
+This does not block testing that software handles IPv6 — a bridge ULA gives a
+working v6 stack for socket code and happy-eyeballs. Only reachability to real
+v6 hosts is unavailable.
 
-Consequence: `ipv6.address=none` stays set on `incusbr0`. This is the correct
-setting, not a workaround — bridge IPv6 with no upstream route would add a
-bypass path around IPv4-only ACL rules and cause AAAA-first stalls (DNS returns
-AAAA records for e.g. archive.ubuntu.com, which a dual-stack guest would try
-first and time out on).
+If delegation ever appears: enable bridge IPv6 with **default-deny egress on
+IPv6 only** plus a short allowlist, keeping IPv4 as a denylist. No ISP-prefix
+tracking — a delegated prefix changes, and a denylist keyed to it fails open.
+Verify first that Incus supports a per-address-family default egress action.
 
-Note this does **not** block testing that software handles IPv6 correctly: a
-bridge ULA gives a working v6 stack for socket code, dual-stack listeners, and
-happy-eyeballs behaviour. Only reachability to real IPv6 internet hosts is
-unavailable.
-
-If the ISP ever enables delegation, the decision is already made: enable bridge
-IPv6 with **default-deny egress on IPv6 only** plus a short allowlist, keeping
-IPv4 as a denylist. No ISP-prefix tracking — a delegated prefix changes, and a
-denylist keyed to it fails open. Verify first that Incus supports a per-address-
-family default egress action; if not, the hybrid is not expressible as stated.
-
-Also considered and rejected: policy routing to give guests a routing table with
-only a host route to the gateway and a default via it, so LAN destinations have
-no route. Prefix-agnostic and guest-only (matches `iif incusbr0`, so host
-traffic is unaffected), but it lives outside the Incus ACL model and fails open
-if the rule is lost. Not worth it while there is no IPv6 at all.
+Also rejected: policy routing to give guests a table with only a host route.
+Prefix-agnostic and guest-only, but it lives outside the Incus ACL model and
+fails open if the rule is lost.
 
 ## Deferred
 
-Snapshots/rollback (Incus does it, wrap later), remote API access, multi-GPU
-generalisation, any scheduler. The constraint is one card, one active project.
+Snapshots/rollback, remote API access, multi-GPU, any scheduler. The constraint
+is one card, one active project.
 
 ## Files
 
-| File | Purpose |
+| Path | Purpose |
 |---|---|
-| `CLAUDE.md` | Which tool for what, and how to start a project. Read before touching anything. |
-| `STATUS.md` | This file: state, decisions, verified Incus behaviours, open work |
-| `RUNBOOK.md` | Ordered host setup procedure |
-| `rig` | The control surface: `new/start/stop/status/claim/rm`. Auditable at a glance, on purpose. |
-| `gpuctl` | GPU arbitration + `apply`. Stdlib Python over the Incus REST socket. |
-| `.claude/settings.json` | Allows `./rig`, denies the `incus` verbs that break the invariants |
-| `hostgpu` | Move the card between host desktop and VM use |
-| `base/flake.nix` | Declarative image definition |
-| `base/gpu-dev.nix` | Guest module: driver, Incus agent, `gpu-present` unit, `gpu-check` |
-| `01-build-image.sh` | Build + import the image |
-| `test-invariants.sh` | Invariant tests against real Incus |
-| `test-network-acl.sh` | Proves the isolation ACL empirically; skips, never passes, unprovable tests |
-| `project-template/flake.nix` | Per-project devShell: CUDA toolchain + the agent |
-| `project-template/vectoradd.cu` | GPU correctness test: poisoned buffers, bit-exact, negative control |
-| `project-template/run-agent` | Sources `/run/rig/env` and launches the unattended agent |
-| `project-template/README.md` | How to use the template, and why the toolchain is not in the image |
-| `secrets/` | Gitignored. Per-project env files holding credentials. |
+| `CLAUDE.md` | Which tool for what, and how to start a project |
+| `RUNBOOK.md` | Host setup, in order |
+| `cmd/rig` | The routine surface: lifecycle, exec, push, doctor |
+| `cmd/gpuctl` | Arbitration and `apply`; the verbs that can break an invariant |
+| `cmd/hostgpu` | Move the card between the desktop and VMs |
+| `internal/incus` | Typed REST client over the unix socket; exec over websockets |
+| `internal/policy` | Declared isolation policy and the reconcile |
+| `internal/gpu` | Arbitration, PCI discovery, the lock |
+| `internal/creds` | Credential validation and injection |
+| `base/` | Declarative image: flake + guest module |
+| `01-build-image.sh` | Build and import the image |
+| `test-invariants.sh` | GPU arbitration invariants against real Incus |
+| `test-network-acl.sh` | Proves the ACL empirically; skips, never passes, unprovable tests |
+| `project-template/` | Per-project devShell, the CUDA correctness test, `run-agent` |
+| `secrets/` | Gitignored. Per-project credential files. |
 
-Removed 2026-08-24: `00-spike.sh` (phase 0, served its purpose),
-`task-network-acl-verify.md` (done; findings are in this file), `guest/` (a
-committed copy of `base/gpu-dev.nix` that a build step kept in sync — two files
-waiting to drift), `gpu` (renamed to `rig`).
-| `00-spike.sh` | Phase 0 verification. Served its purpose; kept for reference. |
+## What would make this harder over time
 
-## Gotchas
+Ranked by when it starts hurting.
 
-- **Fixed sleeps are wrong.** The agent takes variable time to come up; a hung
-  `incus exec` ignores SIGTERM. Poll with `timeout -s KILL`, and pass
-  `</dev/null` so exec does not allocate a TTY.
-- **`writeShellScriptBin` provides no PATH.** Reference binaries by store path.
-  This bug produced a false "no NVIDIA device" report.
-- **`incus exec <vm> -- bash -c` gets a stub PATH** (`/usr/bin:/bin` and friends,
-  none of which exist on NixOS). Use `bash -lc`. Same family of bug as the one
-  above, and it was worse here: in `test-network-acl.sh` the missing `timeout`
-  and `nc` made every probe fail, which the script read as "target blocked" —
-  false PASSes on precisely the tests that matter. Any probe whose *failure* is
-  the passing condition needs its tooling verified independently.
-- **Guest PCI address differs from host** (guest sees `06:00.0`, host `04:00.0`).
-  Expected — the guest has its own PCI topology.
-- **`libcuda.so.1` comes from the driver, not the toolkit.** Nothing in
-  `cudaPackages` provides it. On NixOS it is in `/run/opengl-driver/lib`, which
-  the template's `shellHook` adds to `LD_LIBRARY_PATH`. Without it you get a
-  binary that compiles and links cleanly and then fails at runtime with
-  `cudaErrorInsufficientDriver` — which reads like a driver problem and is not.
-- **Toolkit and driver versions do not have to match.** Verified: a CUDA 12.9
-  toolkit against the guest's 13.2 driver. Drivers are backward compatible with
-  older runtimes; that is what lets the toolchain live in the project.
-- **Give project instances more than the default 10 GiB root.** The base system
-  plus a CUDA toolchain is 6.2 GiB of `/nix/store`. Use `-d root,size=40GiB`.
-- **DHCP is not up when the agent is.** `incus exec` succeeded several seconds
-  before the guest had an IPv4 address, so the first network call in a freshly
-  started VM can fail with a DNS error that means nothing. Poll for the address,
-  not for the agent, before assuming the network is broken.
-- **Never put a GPU device in a profile.** Every instance would then be configured
-  to grab the same card. `gpuctl` refuses to operate if it finds one — and it now
-  checks the profiles directly. The old check scanned instances' *expanded*
-  devices, where an instance-level `gpu0` (exactly what `gpuctl` creates) masks
-  the profile's `gpu0`, so it reported all-clear on a poisoned profile and could
-  not see one that no instance used yet. The test that covered this passed only
-  because of which way an earlier race went; it now asserts both cases.
-- **Watch root filesystem usage.** The ZFS pool file is under
-  `/var/lib/incus/disks/`. A full root means write errors on a ZFS vdev.
+1. **The base image has no version.** `nixos-gpu-base` is rebuilt in place, so
+   two VMs created a month apart can differ with nothing recording it. Stamp the
+   image with the flake lock revision and record it on each instance at `rig
+   new`, so `rig doctor` can say "this VM predates the current image".
+2. **Nothing garbage-collects.** Stopped project VMs accumulate at ~6 GiB each on
+   a 500 GiB loop file, and a full root means write errors on a ZFS vdev. `rig
+   status` should show age and size, and there should be a way to list what is
+   stale.
+3. **`/work` lives inside the instance.** `rig rm` destroys the project with the
+   VM, so the VM is the only copy until someone pushes a git remote. Either put
+   `/work` on a separate volume that outlives the instance, or have `rig rm`
+   refuse when the tree has uncommitted changes.
+4. **One card, one project is enforced but not scheduled.** With several
+   projects, "who had it last, and does something want it now" becomes guesswork
+   at the point where it is most annoying to add.
+5. **The ACL is a denylist.** Every new private range someone invents is a gap
+   until noticed. The IPv6 plan already says default-deny plus an allowlist; the
+   same argument applies to IPv4 once there is any appetite for the churn.
+6. **`test-network-acl.sh` skips silently-shaped tests.** It is honest about
+   skips, but a target disappearing (the docker stack going away) quietly
+   reduces coverage. It should fail when *coverage* drops below what it had.
