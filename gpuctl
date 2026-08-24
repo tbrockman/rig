@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""
+gpuctl - single-GPU arbitration for Incus VMs.
+
+Enforces one invariant: at most one instance has the GPU device configured,
+and it never moves away from a *running* instance.
+
+State is never stored. Incus is the sole source of truth; everything here is
+derived from `GET /1.0/instances`. The only persistent artefact is a lock file,
+because "check then act" is a race and flock is the smallest thing that fixes
+it.
+
+Verbs:
+    status              show who holds the GPU
+    claim   <instance>  move the GPU to <instance>
+    release             detach the GPU from whoever holds it
+    start   <instance>  claim, then start
+    stop    <instance>  stop (GPU stays attached to the stopped instance)
+
+Config via environment:
+    GPUCTL_PCI      PCI address, e.g. 0000:04:00.0   (required for claim)
+    GPUCTL_DEVICE   device name on the instance      (default: gpu0)
+    INCUS_SOCKET    default: /var/lib/incus/unix.socket
+    GPUCTL_LOCK     default: /var/lock/gpuctl.lock
+"""
+
+import argparse
+import fcntl
+import http.client
+import json
+import os
+import socket
+import sys
+from contextlib import contextmanager
+
+SOCKET = os.environ.get("INCUS_SOCKET", "/var/lib/incus/unix.socket")
+LOCKFILE = os.environ.get("GPUCTL_LOCK", "/var/lock/gpuctl.lock")
+DEVICE = os.environ.get("GPUCTL_DEVICE", "gpu0")
+PCI = os.environ.get("GPUCTL_PCI", "")
+
+
+class Fail(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+# Incus REST client (stdlib only, so this packages trivially with Nix)
+# --------------------------------------------------------------------------
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path, timeout=60):
+        super().__init__("localhost", timeout=timeout)
+        self.unix_path = path
+
+    def connect(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(self.timeout)
+        s.connect(self.unix_path)
+        self.sock = s
+
+
+def api(method, path, body=None, etag=None, timeout=60):
+    """Returns (parsed_document, etag). Raises Fail on API errors."""
+    conn = UnixHTTPConnection(SOCKET, timeout=timeout)
+    headers = {"Content-Type": "application/json"}
+    if etag:
+        headers["If-Match"] = etag
+    payload = json.dumps(body) if body is not None else None
+    try:
+        conn.request(method, path, payload, headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        resp_etag = resp.getheader("ETag")
+    except (FileNotFoundError, PermissionError) as e:
+        raise Fail(f"cannot reach Incus at {SOCKET}: {e}")
+    finally:
+        conn.close()
+
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError:
+        raise Fail(f"non-JSON response from {path}: {raw[:200]!r}")
+
+    if doc.get("type") == "error":
+        raise Fail(f"incus: {doc.get('error')} (code {doc.get('error_code')})")
+    return doc, resp_etag
+
+
+def wait(doc, timeout=180):
+    """Block on an async operation. Returns its metadata."""
+    if doc.get("type") != "async":
+        return doc.get("metadata")
+    op = doc["operation"]
+    res, _ = api("GET", f"{op}/wait?timeout={timeout}", timeout=timeout + 15)
+    md = res.get("metadata") or {}
+    if md.get("err"):
+        raise Fail(f"operation failed: {md['err']}")
+    if md.get("status_code", 0) >= 400:
+        raise Fail(f"operation failed: {md.get('status')}")
+    return md
+
+
+# --------------------------------------------------------------------------
+# Derived state
+# --------------------------------------------------------------------------
+
+def instances():
+    doc, _ = api("GET", "/1.0/instances?recursion=1")
+    return doc["metadata"]
+
+
+def instance(name):
+    doc, etag = api("GET", f"/1.0/instances/{name}")
+    return doc["metadata"], etag
+
+
+def gpu_devices(inst):
+    """GPU devices defined directly on the instance (not via a profile)."""
+    return {n: d for n, d in (inst.get("devices") or {}).items()
+            if d.get("type") == "gpu"}
+
+
+def check_no_profile_gpu(insts):
+    """A GPU in a profile means every instance has it. That is the double-attach
+    condition, so refuse to operate at all until it is removed."""
+    for i in insts:
+        local = i.get("devices") or {}
+        for n, d in (i.get("expanded_devices") or {}).items():
+            if d.get("type") == "gpu" and n not in local:
+                raise Fail(
+                    f"instance {i['name']!r} inherits GPU device {n!r} from a "
+                    f"profile. Remove it: a GPU in a profile means every "
+                    f"instance is configured to grab the same card."
+                )
+
+
+def find_holders(insts):
+    out = []
+    for i in insts:
+        for n, d in gpu_devices(i).items():
+            out.append({"instance": i["name"], "device": n,
+                        "status": i["status"], "pci": d.get("pci", "?")})
+    return out
+
+
+def set_devices(name, devices):
+    """Round-trip PUT with ETag, the same optimistic-concurrency dance the CLI
+    does. flock protects against our own concurrency; the ETag catches anyone
+    editing the instance out of band."""
+    inst, etag = instance(name)
+    body = {
+        "architecture": inst.get("architecture"),
+        "config": inst.get("config") or {},
+        "devices": devices,
+        "ephemeral": inst.get("ephemeral", False),
+        "profiles": inst.get("profiles") or [],
+        "description": inst.get("description", ""),
+    }
+    doc, _ = api("PUT", f"/1.0/instances/{name}", body, etag=etag)
+    wait(doc)
+
+
+def set_state(name, action, timeout=120):
+    doc, _ = api("PUT", f"/1.0/instances/{name}/state",
+                 {"action": action, "timeout": timeout},
+                 timeout=timeout + 15)
+    wait(doc, timeout=timeout)
+
+
+@contextmanager
+def locked():
+    os.makedirs(os.path.dirname(LOCKFILE), exist_ok=True)
+    fd = os.open(LOCKFILE, os.O_CREAT | os.O_RDWR, 0o664)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("waiting for gpuctl lock...", file=sys.stderr)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def cmd_status(args):
+    insts = instances()
+    check_no_profile_gpu(insts)
+    holders = find_holders(insts)
+
+    if args.json:
+        print(json.dumps({
+            "holders": holders,
+            "instances": [{"name": i["name"], "status": i["status"]}
+                          for i in insts],
+        }, indent=2))
+        return
+
+    if not holders:
+        print("GPU is unassigned.")
+    elif len(holders) > 1:
+        print("!! GPU device is configured on MULTIPLE instances:")
+        for h in holders:
+            print(f"   {h['instance']:<20} {h['status']:<10} {h['pci']}")
+        print("   Starting a second one will hot-unplug the card from the")
+        print("   first. Fix with: gpuctl release && gpuctl claim <instance>")
+    else:
+        h = holders[0]
+        print(f"GPU held by {h['instance']} ({h['status']}) at {h['pci']}")
+
+    print()
+    for i in sorted(insts, key=lambda x: x["name"]):
+        mark = "*" if any(h["instance"] == i["name"] for h in holders) else " "
+        print(f" {mark} {i['name']:<20} {i['status']}")
+
+
+def cmd_claim(args):
+    if not PCI:
+        raise Fail("GPUCTL_PCI is not set (e.g. export GPUCTL_PCI=0000:04:00.0)")
+
+    with locked():
+        insts = instances()
+        check_no_profile_gpu(insts)
+
+        names = {i["name"]: i for i in insts}
+        if args.instance not in names:
+            raise Fail(f"no such instance: {args.instance}")
+        target = names[args.instance]
+        holders = find_holders(insts)
+
+        if len(holders) > 1:
+            raise Fail("GPU is configured on multiple instances; "
+                       "run `gpuctl release` first")
+
+        # Already correct?
+        if holders and holders[0]["instance"] == args.instance:
+            print(f"{args.instance} already holds the GPU.")
+            return
+
+        # Refuse to take it from a running instance. This is the whole point.
+        if holders and holders[0]["status"] == "Running":
+            raise Fail(
+                f"GPU is held by {holders[0]['instance']}, which is RUNNING.\n"
+                f"Detaching it would hot-unplug the card from a live workload.\n"
+                f"Stop it first:  gpuctl stop {holders[0]['instance']}"
+            )
+
+        # GPU devices are not hotpluggable for VMs.
+        if target["status"] == "Running":
+            raise Fail(
+                f"{args.instance} is running; GPU devices cannot be hotplugged "
+                f"into a VM.\nStop it first:  gpuctl stop {args.instance}"
+            )
+
+        if holders:
+            prev = holders[0]
+            inst, _ = instance(prev["instance"])
+            devs = dict(inst.get("devices") or {})
+            devs.pop(prev["device"], None)
+            set_devices(prev["instance"], devs)
+            print(f"detached GPU from {prev['instance']}")
+
+        inst, _ = instance(args.instance)
+        devs = dict(inst.get("devices") or {})
+        devs[DEVICE] = {"type": "gpu", "gputype": "physical", "pci": PCI}
+        set_devices(args.instance, devs)
+        print(f"attached GPU ({PCI}) to {args.instance}")
+
+
+def cmd_release(args):
+    with locked():
+        insts = instances()
+        holders = find_holders(insts)
+        if not holders:
+            print("GPU is already unassigned.")
+            return
+        for h in holders:
+            if h["status"] == "Running" and not args.force:
+                raise Fail(
+                    f"{h['instance']} is RUNNING. Stop it first, or pass "
+                    f"--force to hot-unplug (this WILL break its workload)."
+                )
+        for h in holders:
+            inst, _ = instance(h["instance"])
+            devs = dict(inst.get("devices") or {})
+            devs.pop(h["device"], None)
+            set_devices(h["instance"], devs)
+            print(f"detached GPU from {h['instance']}")
+
+
+def cmd_start(args):
+    cmd_claim(args)
+    with locked():
+        inst, _ = instance(args.instance)
+        if inst["status"] == "Running":
+            print(f"{args.instance} already running.")
+            return
+        set_state(args.instance, "start")
+        print(f"started {args.instance}")
+
+
+def cmd_stop(args):
+    with locked():
+        inst, _ = instance(args.instance)
+        if inst["status"] == "Stopped":
+            print(f"{args.instance} already stopped.")
+            return
+        set_state(args.instance, "stop")
+        print(f"stopped {args.instance} (GPU still attached to it)")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="gpuctl", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("status");  s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("claim");   s.add_argument("instance")
+    s.set_defaults(func=cmd_claim)
+
+    s = sub.add_parser("release"); s.add_argument("--force", action="store_true")
+    s.set_defaults(func=cmd_release)
+
+    s = sub.add_parser("start");   s.add_argument("instance")
+    s.set_defaults(func=cmd_start)
+
+    s = sub.add_parser("stop");    s.add_argument("instance")
+    s.set_defaults(func=cmd_stop)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except Fail as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

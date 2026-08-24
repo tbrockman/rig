@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# hostgpu - switch the 4080 between host desktop use and VM use.
+#
+#   hostgpu desktop    reclaim the card for the host, start the desktop
+#   hostgpu headless   shut the desktop down, free the card for VMs
+#   hostgpu status     where the card currently is
+#
+# Assumes: console on the iGPU (HDMI), 4080 on DisplayPort, host default target
+# is multi-user.target. Run with sudo.
+
+set -uo pipefail
+
+GPU=${GPU_PCI:-0000:04:00.0}
+AUDIO=${GPU_AUDIO_PCI:-0000:04:00.1}
+
+drv() { basename "$(readlink -f "/sys/bus/pci/devices/$1/driver" 2>/dev/null)" \
+        2>/dev/null || echo "(none)"; }
+
+status() {
+  echo "GPU   $GPU   driver: $(drv "$GPU")"
+  echo "audio $AUDIO   driver: $(drv "$AUDIO")"
+  echo "override: $(cat "/sys/bus/pci/devices/$GPU/driver_override" 2>/dev/null)"
+  echo -n "gdm: "; systemctl is-active gdm
+  if command -v incus >/dev/null; then
+    echo "instances holding a gpu device:"
+    incus query /1.0/instances?recursion=1 2>/dev/null \
+      | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+for i in d:
+    for n,x in (i.get("devices") or {}).items():
+        if x.get("type")=="gpu":
+            print(f"  {i[\"name\"]} ({i[\"status\"]})")' || true
+  fi
+}
+
+to_desktop() {
+  # Refuse if a VM still has the card configured, otherwise the rebind races
+  # with Incus and both sides lose.
+  if command -v gpuctl >/dev/null && gpuctl status 2>/dev/null | grep -q "held by"; then
+    echo "A VM still holds the GPU. Run: gpuctl stop <instance> && gpuctl release" >&2
+    exit 1
+  fi
+
+  if [ "$(drv "$GPU")" = "vfio-pci" ]; then
+    echo "rebinding to nvidia..."
+    # Order matters: unload stale modules while the card is still on vfio-pci,
+    # or the reloaded module can grab it mid-transition and mismatch.
+    modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2>/dev/null
+    echo "$GPU"   > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null
+    echo "$AUDIO" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null
+    echo | tee "/sys/bus/pci/devices/$GPU/driver_override" \
+                "/sys/bus/pci/devices/$AUDIO/driver_override" >/dev/null
+    modprobe nvidia
+    echo "$AUDIO" > /sys/bus/pci/drivers_probe 2>/dev/null
+  fi
+
+  echo "starting desktop..."
+  systemctl start gdm
+  echo
+  echo "Switch your monitor to the DisplayPort input."
+  echo "(The HDMI/iGPU console stays available on tty1.)"
+  status
+}
+
+to_headless() {
+  systemctl stop gdm
+  sleep 2
+  if fuser -v /dev/nvidia* 2>&1 | grep -q .; then
+    echo "warning: something still holds /dev/nvidia*:" >&2
+    fuser -v /dev/nvidia* 2>&1 >&2
+  fi
+  echo "desktop stopped; card is free for VMs."
+  status
+}
+
+case "${1:-status}" in
+  desktop)  to_desktop ;;
+  headless) to_headless ;;
+  status)   status ;;
+  *) echo "usage: $0 {desktop|headless|status}" >&2; exit 2 ;;
+esac
