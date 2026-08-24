@@ -51,6 +51,13 @@ card needs no config change.
   everything about VMs, `hostgpu` for the host itself — root, driver rebinds,
   and the desktop. `rig` was briefly split into a second binary to encode which
   verbs are dangerous; command groups in `--help` do that without the split.
+- **Checking and proving are separate verbs.** `doctor` reads configuration;
+  `verify` sends real packets from inside the guest. Config has been right here
+  while the effect was absent, so one does not imply the other.
+- **The acceptance suite is a CLI verb, the invariant suite is a Go test.**
+  `verify` is something you run on a VM before handing it over. The invariants
+  are something you run after changing `rig`, and they need to build states
+  `rig` exists to refuse, so they are build-tagged out of `go test ./...`.
 - **Credentials are env vars in a host file**, injected to tmpfs at start.
   Scoping them is the operator's job; nothing else can judge it.
 
@@ -83,17 +90,21 @@ What remains:
   ARC capped at 8 GiB. CoW clones measured: `rig new` takes 1.5 s and adds no
   pool usage.
 - Host headless, console on iGPU/HDMI. `boot_vga=1` on `0f:00.0`.
-- `./01-build-image.sh` builds and imports `nixos-gpu-base`.
+- `rig image build` builds and imports `nixos-gpu-base`, stamping it with the
+  store path it came from. A rebuild that changes nothing is a no-op, and
+  `rig doctor` reports a VM created from an older image.
 - **Passthrough verified in-guest:** RTX 4080 SUPER, 16376 MiB, driver
   595.71.05, CUDA 13.2. `hardware.nvidia.open = true` works on Ada.
 - **CUDA compute verified, not just `nvidia-smi`:** all 4,194,304 elements
   bit-exact under two launch geometries, with poison and negative-control checks
   passing. 3.11 GB/s H2D / 3.24 GB/s D2H in-guest, matching the host-side x2
   measurement — passthrough costs nothing measurable on top of a narrow link.
-- **Isolation verified empirically:** `test-network-acl.sh` 23 passed, 0 failed,
-  2 skipped. `test-invariants.sh` 11/11. `go test ./...` green.
+- **Isolation verified empirically:** `rig verify` 28 passed, 0 failed, verdict
+  PROVEN — every declared reject range has at least one attributable proof,
+  including 169.254.0.0/16, which the old shell suite could only skip.
+  `go test ./...` green; the integration suite green against the real card.
 - The whole path works end to end: `rig new` → `start` (GPU claimed, credentials
-  injected) → `doctor` → CUDA test → ACL suite → `run-agent`.
+  injected) → `doctor` → CUDA test → `rig verify` → `run-agent`.
 
 ### What the isolation is
 
@@ -113,9 +124,15 @@ What is proven and what is not:
   gateway / a LAN peer / a tailnet peer, UDP/53 to the router.
 - **Not attributable:** the docker *container* targets — Docker's own FORWARD
   rules drop cross-bridge traffic anyway. Kept as outcome checks, labelled.
-- **Not proven:** `169.254.0.0/16`. Nothing on it is reachable from the host, so
-  the test can only skip.
+- **Proven, unexpectedly:** `169.254.0.0/16`. Something on this host answers on
+  169.254.169.254:80, so the range has a real attributable proof rather than the
+  permanent skip the shell suite reported. `verify` still carries it as an
+  acknowledged gap by default, because on a host where nothing answers there the
+  honest outcome is "unproven", not "passed".
 - **Not inspected:** the generated nftables ruleset — `sudo` needs a password.
+- **The detector itself is tested.** `TestVerifyDetectsAnUnisolatedGuest` starts
+  a guest with the ACL stripped and requires `verify` to call it a violation.
+  Without that, a `verify` that always answered "blocked" would pass everything.
 - **Residual, not exploitable:** the WAN address is in no reject range, so a
   guest could hairpin to anything port-forwarded. The router does not hairpin, so
   it cannot be demonstrated from inside. No rule added: one keyed to a dynamic
@@ -161,41 +178,42 @@ is one card, one active project.
 |---|---|
 | `CLAUDE.md` | Which tool for what, and how to start a project |
 | `RUNBOOK.md` | Host setup, in order |
-| `cmd/rig` | The whole surface: lifecycle, guest access, card and policy |
+| `cmd/rig` | The whole surface: image, lifecycle, guest access, card and policy |
 | `cmd/hostgpu` | Move the card between the desktop and VMs |
 | `internal/incus` | Typed REST client over the unix socket; exec over websockets |
 | `internal/policy` | Declared isolation policy and the reconcile |
 | `internal/gpu` | Arbitration, PCI discovery, the lock |
 | `internal/creds` | Credential validation and injection |
-| `base/` | Declarative image: flake + guest module |
-| `01-build-image.sh` | Build and import the image |
-| `test-invariants.sh` | GPU arbitration invariants against real Incus |
-| `test-network-acl.sh` | Proves the ACL empirically; skips, never passes, unprovable tests |
+| `internal/verify` | Probes a live guest; refuses to pass what it cannot prove |
+| `base/` | Declarative image: flake + guest module, built by `rig image build` |
+| `integration/` | Build-tagged: invariants against real Incus and the real card |
 | `project-template/` | Per-project devShell, the CUDA correctness test, `run-agent` |
 | `secrets/` | Gitignored. Per-project credential files. |
 
 ## What would make this harder over time
 
-Ranked by when it starts hurting.
+Ranked by when it starts hurting. Two earlier items are now closed: the base
+image is stamped and `rig doctor` reports drift, and `rig verify` fails when
+coverage of a declared reject range drops to nothing rather than skipping
+quietly.
 
-1. **The base image has no version.** `nixos-gpu-base` is rebuilt in place, so
-   two VMs created a month apart can differ with nothing recording it. Stamp the
-   image with the flake lock revision and record it on each instance at `rig
-   new`, so `rig doctor` can say "this VM predates the current image".
-2. **Nothing garbage-collects.** Stopped project VMs accumulate at ~6 GiB each on
-   a 500 GiB loop file, and a full root means write errors on a ZFS vdev. `rig
-   status` should show age and size, and there should be a way to list what is
-   stale.
-3. **`/work` lives inside the instance.** `rig rm` destroys the project with the
+1. **VMs are not garbage-collected.** Stopped project VMs accumulate at ~6 GiB
+   each on a 500 GiB loop file, and a full root means write errors on a ZFS
+   vdev. `rig image build` now deletes the image it replaced, but instances are
+   still nobody's job. `rig status` should show age and size, and there should
+   be a way to list what is stale.
+2. **`/work` lives inside the instance.** `rig rm` destroys the project with the
    VM, so the VM is the only copy until someone pushes a git remote. Either put
    `/work` on a separate volume that outlives the instance, or have `rig rm`
    refuse when the tree has uncommitted changes.
-4. **One card, one project is enforced but not scheduled.** With several
+3. **One card, one project is enforced but not scheduled.** With several
    projects, "who had it last, and does something want it now" becomes guesswork
    at the point where it is most annoying to add.
-5. **The ACL is a denylist.** Every new private range someone invents is a gap
+4. **The ACL is a denylist.** Every new private range someone invents is a gap
    until noticed. The IPv6 plan already says default-deny plus an allowlist; the
    same argument applies to IPv4 once there is any appetite for the churn.
-6. **`test-network-acl.sh` skips silently-shaped tests.** It is honest about
-   skips, but a target disappearing (the docker stack going away) quietly
-   reduces coverage. It should fail when *coverage* drops below what it had.
+5. **Nothing here is portable off this host.** Not a goal yet, and the CLI is
+   already parameterised (`--flake`, `--attr`, `--alias`, `RIG_*`). The real
+   blockers are elsewhere: `base/gpu-dev.nix` hardcodes `hardware.nvidia.open`,
+   `gpu-check` greps PCI vendor `10de:`, `hostgpu` names the NVIDIA module set,
+   and `project-template` bakes in CUDA and `sm_89`.

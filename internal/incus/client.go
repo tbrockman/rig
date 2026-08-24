@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -69,12 +70,6 @@ type envelope struct {
 	Metadata   json.RawMessage `json:"metadata"`
 }
 
-type operation struct {
-	Err        string `json:"err"`
-	Status     string `json:"status"`
-	StatusCode int    `json:"status_code"`
-}
-
 func (c *Client) call(method, path string, body any, etag string) (*envelope, string, error) {
 	var rdr io.Reader
 	if body != nil {
@@ -93,7 +88,12 @@ func (c *Client) call(method, path string, body any, etag string) (*envelope, st
 	if etag != "" {
 		req.Header.Set("If-Match", etag)
 	}
+	return c.do(req)
+}
 
+// do sends a prepared request and parses Incus's response envelope. Separate
+// from call because an image upload builds its own streaming multipart request.
+func (c *Client) do(req *http.Request) (*envelope, string, error) {
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("cannot reach incus: %w", err)
@@ -107,7 +107,7 @@ func (c *Client) call(method, path string, body any, etag string) (*envelope, st
 
 	var env envelope
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, "", fmt.Errorf("non-JSON response from %s: %.200s", path, raw)
+		return nil, "", fmt.Errorf("non-JSON response from %s: %.200s", req.URL.Path, raw)
 	}
 	if env.Type == "error" {
 		return nil, "", &APIError{Code: env.ErrorCode, Message: env.Error}
@@ -163,11 +163,27 @@ func (c *Client) mutate(method, path string, body any, etag string, out any) err
 // wait blocks on an async operation. Incus reports operation failure inside a
 // 200 response, so the metadata has to be inspected rather than the status code.
 func (c *Client) wait(op string, timeout time.Duration) error {
+	return c.WaitOperation(op, timeout, nil)
+}
+
+// WaitOperation blocks on an async operation and decodes its final metadata
+// into out. An operation carries results there and nowhere else — an image
+// upload reports the new fingerprint this way — so waiting without reading it
+// throws them away.
+func (c *Client) WaitOperation(op string, timeout time.Duration, out any) error {
 	if op == "" {
-		return nil
+		if out == nil {
+			return nil
+		}
+		return errors.New("expected an async operation, got none")
 	}
 	q := url.Values{"timeout": {fmt.Sprint(int(timeout.Seconds()))}}
-	var res operation
+	var res struct {
+		Err        string          `json:"err"`
+		Status     string          `json:"status"`
+		StatusCode int             `json:"status_code"`
+		Metadata   json.RawMessage `json:"metadata"`
+	}
 	if _, err := c.Get(op+"/wait?"+q.Encode(), &res); err != nil {
 		return err
 	}
@@ -176,6 +192,9 @@ func (c *Client) wait(op string, timeout time.Duration) error {
 	}
 	if res.StatusCode >= 400 {
 		return fmt.Errorf("operation failed: %s", res.Status)
+	}
+	if out != nil && len(res.Metadata) > 0 {
+		return json.Unmarshal(res.Metadata, out)
 	}
 	return nil
 }

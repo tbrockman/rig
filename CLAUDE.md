@@ -11,10 +11,10 @@ tooling:
 
 ## Which tool for what
 
-`./rig` does everything: VM lifecycle, working inside a guest, and the card and
-policy verbs. `rig --help` groups them; the third group — `release`, `apply`,
-`start --allow-unisolated` — is the one that can break an invariant, so reach for
-it deliberately.
+`./rig` does everything: the base image, VM lifecycle, working inside a guest,
+and the card and policy verbs. `rig --help` groups them; the third group —
+`release`, `apply`, `start --allow-unisolated` — is the one that can break an
+invariant, so reach for it deliberately.
 
 `./hostgpu` is separate because it is the only thing that touches the host
 itself: it needs root, rebinds the card between `vfio-pci` and `nvidia`, and
@@ -22,6 +22,11 @@ starts or stops the desktop.
 
 `rig` covers the whole lifecycle, so raw `incus` should not be needed. If you
 reach for it, that is a gap in `rig` — say so rather than working around it.
+
+`doctor` and `verify` answer different questions. `doctor` reads configuration:
+is this VM set up right? `verify` sends real packets from inside the guest: is
+that setup actually true? Configuration has been right here while the effect was
+absent, so the second is not implied by the first.
 
 Build with `make`. Go 1.26, two binaries from one module.
 
@@ -36,14 +41,17 @@ chmod 600 secrets/myproj.env
 ./rig doctor myproj                           # isolation, GPU, agent, address, creds
 ```
 
-Then prove the GPU actually computes before handing the VM over — `doctor` shows
-the card is attached, not that a kernel returns correct results:
+Then prove the two things `doctor` cannot: that a kernel returns correct results,
+and that the isolation holds against real traffic.
 
 ```bash
 ./rig exec --dir /work/project-template myproj nix develop "path:." -c make run
-./test-network-acl.sh myproj
+./rig verify myproj    # 0 proven, 1 violated, 2 could not be proven
 ./rig exec --dir /work/project-template myproj nix develop "path:." -c ./run-agent
 ```
+
+`verify` exit 2 is not a pass. It means some check could not tell a blocked
+guest from a broken probe, so it says nothing either way.
 
 `rig rm myproj` deletes it — stopped only, and only VMs `rig` created.
 

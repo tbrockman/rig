@@ -261,6 +261,32 @@ func (c *Client) Profile(name string) (*Profile, string, error) {
 	return &p, etag, nil
 }
 
+func (c *Client) CreateProfile(name string, devices map[string]Device) error {
+	return c.Post("/1.0/profiles", map[string]any{
+		"name": name, "devices": devices, "config": map[string]string{},
+	}, nil)
+}
+
+func (c *Client) DeleteProfile(name string) error {
+	return c.Delete("/1.0/profiles/" + url.PathEscape(name))
+}
+
+// SetProfiles replaces the list of profiles an instance inherits from.
+func (c *Client) SetProfiles(name string, profiles []string) error {
+	inst, etag, err := c.Instance(name)
+	if err != nil {
+		return err
+	}
+	return c.PutWithETag("/1.0/instances/"+url.PathEscape(name), map[string]any{
+		"architecture": inst.Architecture,
+		"config":       inst.Config,
+		"devices":      inst.Devices,
+		"ephemeral":    inst.Ephemeral,
+		"profiles":     profiles,
+		"description":  inst.Description,
+	}, etag)
+}
+
 func (c *Client) SetProfileDevices(name string, p *Profile, devices map[string]Device, etag string) error {
 	return c.PutWithETag("/1.0/profiles/"+url.PathEscape(name), map[string]any{
 		"config":      p.Config,
@@ -305,9 +331,18 @@ func (c *Client) DeleteACL(name string) error {
 	return c.Delete("/1.0/network-acls/" + url.PathEscape(name))
 }
 
-// --- images --------------------------------------------------------------
+// --- networks ------------------------------------------------------------
 
-func (c *Client) ImageExists(alias string) bool {
-	_, err := c.Get("/1.0/images/aliases/"+url.PathEscape(alias), nil)
-	return err == nil
+type Network struct {
+	Name   string            `json:"name"`
+	Type   string            `json:"type"`
+	Config map[string]string `json:"config"`
+}
+
+func (c *Client) Network(name string) (*Network, error) {
+	var n Network
+	if _, err := c.Get("/1.0/networks/"+url.PathEscape(name), &n); err != nil {
+		return nil, err
+	}
+	return &n, nil
 }

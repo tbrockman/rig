@@ -86,8 +86,8 @@ The image is a build artifact of `base/`. No logging into a VM, no
 `incus publish` of mutated state.
 
 ```bash
-make                            # the three binaries
-./01-build-image.sh nixos-gpu-base
+make                            # the two binaries
+./rig image build
 ```
 
 It uses `nixos/modules/virtualisation/incus-virtual-machine.nix` from nixpkgs for
@@ -105,20 +105,12 @@ Smoke-test:
 If the GPU check fails the driver did not build:
 `./rig exec smoke journalctl -b -u gpu-present`.
 
-Updating the image later is a flake edit plus `./01-build-image.sh`. Existing
-instances keep their current image; recreate them to pick up the new one.
+Updating the image later is a flake edit plus `./rig image build`. It stamps each
+image with the store path it came from, so a rebuild that changes nothing is a
+no-op, and `rig doctor` tells you when a VM predates the current image. Existing
+instances keep the image they were made from; recreate them to move.
 
-## Step 3 — Test the invariants
-
-```bash
-make test              # go vet + unit tests
-./test-invariants.sh nixos-gpu-base
-```
-
-Test 3 is the one that matters: it asserts the *victim* is still healthy after a
-refused claim, not merely that the claim was refused.
-
-## Step 4 — Isolate the guest network
+## Step 3 — Isolate the guest network
 
 Before creating any project — isolation is inherited from the `default` profile,
 so getting it right once covers every VM after it.
@@ -128,15 +120,29 @@ so getting it right once covers every VM after it.
 ./rig apply
 ```
 
-Then prove it against a running VM rather than trusting the config:
+## Step 4 — Test
 
 ```bash
-./test-network-acl.sh <instance>
+make test              # go vet + unit tests, no daemon needed
+make test-integration  # against real Incus and the real card
 ```
 
-Expect `0 failed`. Skips are not passes — they mean the target was unreachable
-from the host too, so blocking it proves nothing. If everything is blocked
-including the public internet, check the egress default action.
+The integration suite is destructive and refuses to run while anything else is
+up. Two of its cases carry the weight: one asserts the *victim* is still healthy
+after a refused claim rather than merely that the claim was refused, and one
+starts a guest with the ACL stripped and requires `rig verify` to call that a
+violation — without which a verify that always said "blocked" would pass
+everything else.
+
+Then prove isolation on a real project VM rather than trusting the config:
+
+```bash
+./rig verify <instance>
+```
+
+Exit 0 proven, 1 violated, 2 could not be proven. Exit 2 is not a pass: those
+checks could not distinguish a blocked guest from a broken probe. If everything
+is blocked including the public internet, check the egress default action.
 
 ## Step 5 — Create a project
 

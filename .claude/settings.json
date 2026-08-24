@@ -4,8 +4,6 @@
       "Bash(./rig)",
       "Bash(./rig *)",
       "Bash(./rig:*)",
-      "Bash(./test-invariants.sh *)",
-      "Bash(./test-network-acl.sh *)",
       "Bash(incus list)",
       "Bash(incus list *)",
       "Bash(incus list:*)",

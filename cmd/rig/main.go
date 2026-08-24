@@ -32,6 +32,9 @@ import (
 // cannot delete something built by hand.
 const managedKey = "user.rig.managed"
 
+// defaultImage is the alias `rig image build` writes and `rig new` reads.
+const defaultImage = "nixos-gpu-base"
+
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}$`)
 
 type app struct {
@@ -49,8 +52,9 @@ func main() {
 			"It enforces two invariants: at most one instance has the GPU configured\n" +
 			"and it never moves away from a running one, and no instance starts\n" +
 			"without network isolation.\n\n" +
-			"Environment: RIG_PCI, RIG_DEVICE, RIG_ACL, RIG_PROFILE,\n" +
-			"RIG_LOCK, INCUS_SOCKET, RIG_IMAGE, RIG_CPUS, RIG_MEMORY, RIG_DISK.",
+			"Environment: RIG_PCI, RIG_DEVICE, RIG_ACL, RIG_PROFILE, RIG_LOCK,\n" +
+			"INCUS_SOCKET, RIG_IMAGE, RIG_CPUS, RIG_MEMORY, RIG_DISK, RIG_FLAKE,\n" +
+			"RIG_FLAKE_ATTR.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -63,9 +67,9 @@ func main() {
 	)
 	root.AddCommand(
 		a.newCmd(), a.startCmd(), a.stopCmd(), a.restartCmd(), a.rmCmd(),
-		a.statusCmd(), a.doctorCmd(), a.logsCmd(),
+		a.statusCmd(), a.doctorCmd(), a.verifyCmd(), a.logsCmd(),
 		a.execCmd(), a.shellCmd(), a.pushCmd(), a.pullCmd(),
-		a.claimCmd(), a.releaseCmd(), a.applyCmd(),
+		a.claimCmd(), a.releaseCmd(), a.applyCmd(), a.imageCmd(),
 	)
 
 	if err := root.Execute(); err != nil {
@@ -73,10 +77,24 @@ func main() {
 		if errors.As(err, &exit) {
 			os.Exit(exit.Code) // propagate the guest command's status
 		}
+		var coded *exitCodeError
+		if errors.As(err, &coded) {
+			os.Exit(coded.code) // the command already reported the detail
+		}
 		fmt.Fprintf(os.Stderr, "rig: %v\n", err)
 		os.Exit(1)
 	}
 }
+
+// exitCodeError carries a specific process exit status out of a command whose
+// result is more than pass/fail. Its message is not reprinted: the command has
+// already said more than one line could.
+type exitCodeError struct {
+	code int
+	msg  string
+}
+
+func (e *exitCodeError) Error() string { return e.msg }
 
 func note(format string, args ...any) { fmt.Printf("rig: "+format+"\n", args...) }
 
@@ -112,7 +130,7 @@ func (a *app) newCmd() *cobra.Command {
 				return fmt.Errorf("%s already exists", name)
 			}
 			if !a.c.ImageExists(image) {
-				return fmt.Errorf("no such image: %s (build it with ./01-build-image.sh)", image)
+				return fmt.Errorf("no such image: %s\n  Build it:  rig image build", image)
 			}
 
 			var absEnv string
@@ -163,7 +181,7 @@ func (a *app) newCmd() *cobra.Command {
 	}
 	f := cmd.Flags()
 	f.StringVar(&envFile, "env", "", "host file of KEY=VALUE credentials to inject on start")
-	f.StringVar(&image, "image", envOr("RIG_IMAGE", "nixos-gpu-base"), "base image alias")
+	f.StringVar(&image, "image", envOr("RIG_IMAGE", defaultImage), "base image alias")
 	f.IntVar(&cpus, "cpus", envInt("RIG_CPUS", 8), "vCPUs")
 	f.StringVar(&memory, "memory", envOr("RIG_MEMORY", "16GiB"), "RAM")
 	f.StringVar(&disk, "disk", envOr("RIG_DISK", "40GiB"), "root disk size")
@@ -500,11 +518,14 @@ func (a *app) statusCmd() *cobra.Command {
 // doctor answers "is this VM what I think it is" in one command, so the answer
 // does not depend on remembering six checks in the right order.
 func (a *app) doctorCmd() *cobra.Command {
-	return &cobra.Command{
+	var image string
+	cmd := &cobra.Command{
 		Use:     "doctor <name>",
 		GroupID: "vm",
 		Short:   "Check a VM is what you think it is",
-		Args:    cobra.ExactArgs(1),
+		Long: "Reads configuration and asks the guest a few questions. It reports\n" +
+			"that the isolation is configured; `rig verify` proves it holds.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			name := args[0]
 			if err := a.requireInstance(name); err != nil {
@@ -524,6 +545,12 @@ func (a *app) doctorCmd() *cobra.Command {
 				}
 				fmt.Printf("  %s  %-22s %s\n", status, label, detail)
 			}
+			// Drift is worth knowing, not worth failing on: a VM created before
+			// the last image build is perfectly serviceable, it is just not what
+			// a new one would be.
+			info := func(label, detail string) {
+				fmt.Printf("  note  %-22s %s\n", label, detail)
+			}
 
 			unisolated, noEgress := policy.Report(inst, a.cfg.ACL)
 			check("network isolation", len(unisolated) == 0, isolationDetail(a.cfg.ACL, unisolated, noEgress))
@@ -534,6 +561,12 @@ func (a *app) doctorCmd() *cobra.Command {
 				gpuDetail = dev["pci"]
 			}
 			check("gpu device", len(gpus) == 1, gpuDetail)
+
+			if drifted, detail := a.imageDrift(inst, image); drifted {
+				info("base image", detail)
+			} else {
+				check("base image", true, detail)
+			}
 
 			if !inst.Running() {
 				fmt.Printf("  --    %-22s %s\n", "guest checks", "skipped: instance is "+inst.Status)
@@ -563,9 +596,13 @@ func (a *app) doctorCmd() *cobra.Command {
 			if failed > 0 {
 				return fmt.Errorf("%d check(s) failed", failed)
 			}
+			fmt.Printf("\nIsolation is configured. To prove it holds:  rig verify %s\n", name)
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&image, "image", envOr("RIG_IMAGE", defaultImage),
+		"alias to compare this VM's base image against")
+	return cmd
 }
 
 func (a *app) logsCmd() *cobra.Command {

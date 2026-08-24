@@ -55,7 +55,7 @@ Sources `/run/rig/env` — the credentials `rig start` injected — and execs th
 agent with `--dangerously-skip-permissions`. That flag is the point of this VM,
 not a shortcut around it: the agent is unattended, so there is nobody to answer a
 prompt, and the containment is the VM boundary and the network ACL. Verify both
-before trusting it: `./rig doctor <vm>` and `./test-network-acl.sh <vm>`.
+before trusting it: `./rig doctor <vm>` and `./rig verify <vm>`.
 
 ## Sizing
 
