@@ -249,6 +249,41 @@ is the chipset **x2** slot, not a fault. Anything much lower is worth chasing.
 
 ---
 
+## Step 5 — Isolate the guest network
+
+Three settings, all on the NIC. The ACL alone is **not** the policy:
+
+```bash
+incus config device override proj-foo eth0 \
+  security.acls=vm-isolate \
+  security.acls.default.egress.action=allow \
+  security.acls.default.ingress.action=reject
+```
+
+`egress.action=allow` is the one that looks wrong and is not. Attaching any ACL
+flips the NIC to **default-reject in both directions**, which turns a denylist
+into a blackout — and it presents as "the internet is a bit broken" rather than
+"nothing works", because Incus's DHCP/DNS pre-rules keep the bridge resolver
+alive so names still resolve. `allow` restores denylist semantics; the five
+reject rules in `vm-isolate` then do the actual work.
+
+Attaching the ACL needs the instance stopped. Changing the default actions
+afterwards applies live.
+
+Then prove it, rather than trusting the config:
+
+```bash
+./test-network-acl.sh proj-foo
+```
+
+Expect `0 failed`. Skips are fine and are not passes — they mean the target was
+unreachable from the host too, so blocking it proves nothing.
+
+If everything is blocked including the public internet, the egress default
+action is the first thing to check.
+
+---
+
 ## Daily use
 
 ```bash
@@ -268,5 +303,11 @@ is the chipset **x2** slot, not a fault. Anything much lower is worth chasing.
   moves, update `GPUCTL_PCI` and re-`claim` each instance.
 - **ACL reconcile.** `incus admin init --preseed` does not cover `network_acls`,
   so the ACL still gets applied by hand. Add a reconcile pass to `gpuctl apply`
-  once the rest is stable. Remember `100.64.0.0/10` for Tailscale.
+  once the rest is stable, and have it assert the two default-action settings —
+  the ACL object on its own does not express the policy. Remember
+  `100.64.0.0/10` for Tailscale.
+- **Getting the ACL onto every instance.** Step 5 is per-instance and easy to
+  forget, and forgetting it fails silently. Put it on the `default` profile's
+  `eth0`, and/or have `gpuctl start` refuse an instance whose NIC lacks it. Note
+  a NIC ACL in a profile is correct — unlike a GPU device, which never is.
 - **Agent-facing wrapper.** Expose only `status`, `start`, `stop`, `claim`.

@@ -69,6 +69,16 @@ If the card moves, its PCI address changes — update `GPUCTL_PCI` and re-claim.
    the cross product of nameservers x address families, producing invalid nftables
    rules. Unnecessary anyway: Incus inserts DHCP/DNS rules ahead of ACL rules, so
    blocking RFC1918 does not break the bridge resolver. Worth reporting upstream.
+   (`dns.nameservers` is currently unset, so this is not being triggered.)
+4. **Attaching *any* ACL to a NIC flips it to default-reject in both
+   directions.** `security.acls.default.egress.action` defaults to `reject`, so
+   attaching a *denylist* ACL does not do what it looks like: `vm-isolate`
+   blackholed all public egress. It presents as "the internet is a bit broken"
+   rather than "everything is blocked", because DHCP and the bridge resolver keep
+   working (Incus's own pre-rules) so DNS still resolves. A denylist posture
+   requires setting `security.acls.default.egress.action=allow` explicitly.
+5. **ACL default-action changes apply live.** Setting them on a running VM's NIC
+   took effect with no restart. *Attaching* the ACL to the NIC was done stopped.
 
 ## Current state — what works
 
@@ -88,22 +98,81 @@ If the card moves, its PCI address changes — update `GPUCTL_PCI` and re-claim.
   consistent with the host-side x2 measurement, so passthrough costs nothing
   measurable on top of the narrow link.
 
+## Network isolation — verified 2026-08-24
+
+The posture is a **denylist**: the guest reaches the public internet and nothing
+on this machine or this LAN. IPv4 only, by decision — see "Parked" below.
+
+Config that produces it (on the NIC, not the profile — see the open decision):
+
+    security.acls: vm-isolate
+    security.acls.default.egress.action: allow     # denylist, NOT the default
+    security.acls.default.ingress.action: reject   # explicit; also the default
+
+`vm-isolate` egress-rejects `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
+`169.254.0.0/16`, `100.64.0.0/10`.
+
+**The ACL existed but was attached to nothing.** `USED BY 0`, no `security.acls`
+on the `default` profile's NIC or on any instance. The isolation was config that
+had never been in force. Measured before attaching it, the guest could reach:
+
+- the host's sshd on **all five** addresses the host holds — the bridge
+  (`10.187.156.1`), both docker bridges (`172.17.0.1`, `172.18.0.1`), the LAN
+  address (`192.168.18.2`), and **the host's own tailnet address**
+  (`100.74.124.13`)
+- the LAN gateway over HTTP and ICMP, and a live LAN peer over ICMP
+- an online tailnet peer over ICMP
+- the router's DNS over UDP
+
+After attaching it: `./test-network-acl.sh cuda-smoke` → **23 passed, 0 failed,
+2 skipped**. The 2 skips are keycloak ports the host cannot reach either, so a
+guest failure there would prove nothing; the script skips rather than passes
+them. `vectoradd` still passes with the ACL in force, so the isolation does not
+cost the guest anything it needs.
+
+What is proven, and what is not:
+
+- **Attributable to the ACL:** every host address on tcp/22 (traffic to a host
+  address is INPUT, not FORWARD, so nothing else on this box is doing the
+  blocking), the LAN gateway on tcp/80, ICMP to the gateway / a LAN peer / a
+  tailnet peer, and UDP/53 to the router.
+- **Not attributable:** the docker *container* targets. Docker's own FORWARD
+  rules already drop traffic arriving from another bridge, so those tests stay
+  green with the ACL removed. They are kept as outcome checks and labelled in
+  the output; do not cite them as evidence.
+- **Not proven:** `169.254.0.0/16`. Nothing on it is reachable from the host, so
+  the test can only ever skip.
+- **Not inspected:** the generated nftables ruleset. `sudo` needs a password
+  here, so `sudo nft list ruleset` could not be run — the one Phase 4 item left
+  undone. The specific risk it was meant to catch (malformed cross-family rules
+  from the `dns.nameservers` bug) does not apply, since `dns.nameservers` is
+  unset.
+- **Residual gap, not exploitable:** the WAN address `64.46.8.186` is in no
+  reject range, so a guest could in principle hairpin to anything
+  port-forwarded. The router does not hairpin — unreachable from the host too —
+  so this cannot be demonstrated from inside. No rule was added: one keyed to a
+  dynamic ISP address fails open silently, which is worse than a documented gap.
+- The bridge resolver on **udp/53 is reachable by design** (Incus inserts
+  DHCP/DNS rules ahead of ACL rules). Confirmed scoped, not a hole: tcp/22 on
+  the same address is blocked.
+
 ## Immediate next steps
 
-1. **Network ACL (IPv4 only).** `vm-isolate` rejecting RFC1918 +
-   `169.254.0.0/16` **and `100.64.0.0/10`** — the Tailscale range was a real gap
-   found earlier and is not covered by RFC1918. Keep bridge IPv6 disabled
-   (`ipv6.address=none`); see "Parked" below.
+1. **Decide how the ACL gets onto every instance.** It is currently on
+   `cuda-smoke` only, via `incus config device override`. A new instance is
+   **unisolated** until someone remembers — a silent failure of exactly the kind
+   `gpuctl` exists to prevent. Two options:
+   - put the three settings on the `default` profile's `eth0`, so every instance
+     inherits them (note this is the opposite of the GPU rule: a NIC ACL in a
+     profile is correct, a GPU device in a profile is not);
+   - have `gpuctl start` refuse an instance whose NIC lacks `vm-isolate`, which
+     fits its existing "refuse to operate on a misconfigured instance" stance.
+   Recommend both: the profile makes it work, `gpuctl` makes it non-forgettable.
 2. **ACL reconcile pass** in whatever `apply` verb gets written, since preseed
-   does not cover ACLs.
+   does not cover ACLs. It should assert the two default-action settings too —
+   the ACL object alone is not the policy.
 3. **Agent-facing wrapper**: expose only `status`, `start`, `stop`, `claim` — not
    the 204-operation Incus MCP server.
-
-Note for the ACL work: `cuda-smoke` is left in place, stopped, holding the GPU
-device. It is a ready-made subject — it has the CUDA toolchain in its store
-already, so `nix develop` there is offline-fast and will keep working once egress
-is restricted. Re-running `vectoradd` after applying the ACL is a cheap check
-that the rules did not break anything the guest actually needs.
 
 ## Parked — IPv6 (do not re-investigate without new information)
 
@@ -155,6 +224,7 @@ generalisation, any scheduler. The constraint is one card, one active project.
 | `guest/gpu-dev.nix` | Guest module: driver, agent, `gpu-present` unit, `gpu-check` |
 | `01-build-image.sh` | Build + import the image |
 | `test-invariants.sh` | Invariant tests against real Incus |
+| `test-network-acl.sh` | Proves the isolation ACL empirically; skips, never passes, unprovable tests |
 | `project-template/flake.nix` | Per-project devShell template (CUDA toolchain) |
 | `project-template/vectoradd.cu` | GPU correctness test: poisoned buffers, bit-exact, negative control |
 | `project-template/README.md` | How to use the template, and why the toolchain is not in the image |
@@ -167,6 +237,12 @@ generalisation, any scheduler. The constraint is one card, one active project.
   `</dev/null` so exec does not allocate a TTY.
 - **`writeShellScriptBin` provides no PATH.** Reference binaries by store path.
   This bug produced a false "no NVIDIA device" report.
+- **`incus exec <vm> -- bash -c` gets a stub PATH** (`/usr/bin:/bin` and friends,
+  none of which exist on NixOS). Use `bash -lc`. Same family of bug as the one
+  above, and it was worse here: in `test-network-acl.sh` the missing `timeout`
+  and `nc` made every probe fail, which the script read as "target blocked" —
+  false PASSes on precisely the tests that matter. Any probe whose *failure* is
+  the passing condition needs its tooling verified independently.
 - **Guest PCI address differs from host** (guest sees `06:00.0`, host `04:00.0`).
   Expected — the guest has its own PCI topology.
 - **`libcuda.so.1` comes from the driver, not the toolkit.** Nothing in

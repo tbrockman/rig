@@ -1,5 +1,12 @@
 # Task: verify and prove out the VM network isolation ACL
 
+> **Executed 2026-08-24.** Findings are in the "Network isolation" section of
+> `STATUS.md`; the phase 5 script is `test-network-acl.sh`. Headline: the ACL
+> existed but was attached to nothing, and attaching it flips the NIC to
+> default-reject in both directions, so a denylist ACL needs
+> `security.acls.default.egress.action=allow` to mean what it says. One item was
+> not completed — the nftables dump needs a sudo password.
+
 Audit the Incus network ACL applied to the GPU dev VMs and **prove the policy
 empirically** rather than asserting it from the config. IPv4 only — see phase 2.
 
