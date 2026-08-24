@@ -20,9 +20,9 @@ func nic(acls, egress string) incus.Device {
 
 func TestReport(t *testing.T) {
 	cases := []struct {
-		name              string
-		dev               incus.Device
-		unisolated, noEg  int
+		name             string
+		dev              incus.Device
+		unisolated, noEg int
 	}{
 		{"correct", nic("vm-isolate", "allow"), 0, 0},
 		{"no acl", nic("", ""), 1, 0},
@@ -102,12 +102,12 @@ func TestRejectRangesCoverCGNAT(t *testing.T) {
 
 func TestRemoveACL(t *testing.T) {
 	cases := map[string]string{
-		"vm-isolate":              "",
-		"a,vm-isolate":            "a",
-		"vm-isolate,b":            "b",
-		"a, vm-isolate ,b":        "a,b",
-		"":                        "",
-		"vm-isolate-v2":           "vm-isolate-v2", // prefix must not match
+		"vm-isolate":       "",
+		"a,vm-isolate":     "a",
+		"vm-isolate,b":     "b",
+		"a, vm-isolate ,b": "a,b",
+		"":                 "",
+		"vm-isolate-v2":    "vm-isolate-v2", // prefix must not match
 	}
 	for in, want := range cases {
 		if got := removeACL(in, "vm-isolate"); got != want {

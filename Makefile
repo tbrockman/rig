@@ -1,6 +1,5 @@
-# Binaries land in the repo root so ./rig and ./gpuctl keep working, and so the
-# permission rules in .claude/settings.json keep matching.
-BINS := rig gpuctl hostgpu
+# Binaries land in the repo root so ./rig keeps working from the docs.
+BINS := rig hostgpu
 
 all: $(BINS)
 
@@ -11,9 +10,8 @@ test: FORCE
 	go vet ./...
 	go test ./...
 
-# Against real Incus. test-invariants needs the base image; test-network-acl
-# needs a running instance.
-test-invariants: rig gpuctl FORCE
+# Against real Incus. Needs the base image.
+test-invariants: rig FORCE
 	./test-invariants.sh nixos-gpu-base
 
 clean: FORCE

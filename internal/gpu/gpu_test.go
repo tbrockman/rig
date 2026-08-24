@@ -43,8 +43,8 @@ func TestHoldersReportsUnknownPCI(t *testing.T) {
 }
 
 func TestConfigFromEnvDefaults(t *testing.T) {
-	t.Setenv("GPUCTL_DEVICE", "")
-	t.Setenv("GPUCTL_ACL", "")
+	t.Setenv("RIG_DEVICE", "")
+	t.Setenv("RIG_ACL", "")
 	cfg := ConfigFromEnv()
 	if cfg.Device != DefaultDevice || cfg.ACL != DefaultACL {
 		t.Fatalf("defaults not applied: %+v", cfg)
@@ -52,7 +52,7 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 }
 
 func TestConfigFromEnvOverrides(t *testing.T) {
-	t.Setenv("GPUCTL_ACL", "custom-acl")
+	t.Setenv("RIG_ACL", "custom-acl")
 	if cfg := ConfigFromEnv(); cfg.ACL != "custom-acl" {
 		t.Fatalf("ACL = %q, want custom-acl", cfg.ACL)
 	}

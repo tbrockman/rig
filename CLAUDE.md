@@ -11,17 +11,19 @@ tooling:
 
 ## Which tool for what
 
-| Task | Use |
-|---|---|
-| Anything routine — create, start, exec, push, delete | `./rig` |
-| Release, forced detach, policy reconcile, start unisolated | `./gpuctl` |
-| Move the card between the desktop and VMs | `./hostgpu` |
+`./rig` does everything: VM lifecycle, working inside a guest, and the card and
+policy verbs. `rig --help` groups them; the third group — `release`, `apply`,
+`start --allow-unisolated` — is the one that can break an invariant, so reach for
+it deliberately.
+
+`./hostgpu` is separate because it is the only thing that touches the host
+itself: it needs root, rebinds the card between `vfio-pci` and `nvidia`, and
+starts or stops the desktop.
 
 `rig` covers the whole lifecycle, so raw `incus` should not be needed. If you
 reach for it, that is a gap in `rig` — say so rather than working around it.
-`gpuctl` holds the verbs that can break an invariant: reach for it deliberately.
 
-Build with `make`. Go 1.26, three binaries from one module.
+Build with `make`. Go 1.26, two binaries from one module.
 
 ## Starting a new project
 

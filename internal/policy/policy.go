@@ -16,11 +16,11 @@ import (
 // because the ISP delegates no prefix. IPv6 needs the opposite posture
 // (default-deny plus an allowlist), so do not just add ranges here.
 var RejectRanges = []string{
-	"10.0.0.0/8",      // RFC1918. Includes the Incus bridge itself.
-	"172.16.0.0/12",   // RFC1918. Includes both docker bridges on this host.
-	"192.168.0.0/16",  // RFC1918. The LAN.
-	"169.254.0.0/16",  // Link-local, and every cloud metadata address.
-	"100.64.0.0/10",   // CGNAT — the Tailscale range. NOT covered by RFC1918.
+	"10.0.0.0/8",     // RFC1918. Includes the Incus bridge itself.
+	"172.16.0.0/12",  // RFC1918. Includes both docker bridges on this host.
+	"192.168.0.0/16", // RFC1918. The LAN.
+	"169.254.0.0/16", // Link-local, and every cloud metadata address.
+	"100.64.0.0/10",  // CGNAT — the Tailscale range. NOT covered by RFC1918.
 }
 
 const aclDescription = "Guest isolation: public internet only (IPv4 denylist)"
@@ -31,7 +31,7 @@ const aclDescription = "Guest isolation: public internet only (IPv4 denylist)"
 // because Incus's own DHCP/DNS rules keep the bridge resolver working.
 func NICKeys(acl string) map[string]string {
 	return map[string]string{
-		"security.acls":                       acl,
+		"security.acls":                        acl,
 		"security.acls.default.egress.action":  "allow",
 		"security.acls.default.ingress.action": "reject",
 	}
@@ -86,10 +86,6 @@ func hasACL(list, want string) bool {
 }
 
 // --- reconcile -----------------------------------------------------------
-
-type Change struct {
-	What string
-}
 
 // Apply reconciles the ACL object and the profile NIC. Returns the changes it
 // made (or would make, when dryRun).

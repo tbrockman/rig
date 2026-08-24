@@ -253,4 +253,3 @@ func (c *Client) WaitAddress(name string, timeout time.Duration) (string, error)
 		time.Sleep(2 * time.Second)
 	}
 }
-

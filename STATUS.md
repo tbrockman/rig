@@ -43,12 +43,14 @@ card needs no config change.
 - **No state store.** Incus is the source of truth; everything is derived. The
   only persistent artefact is a lock file.
 - **No Terraform.** Nix + `incus admin init --preseed`, except preseed does not
-  cover `network_acls` — hence `gpuctl apply`.
+  cover `network_acls` — hence `rig apply`.
 - **Dynamic vfio binding.** Static binding needs boot-framebuffer workarounds
   when the dGPU is firmware-primary.
 - **Go, not shell.** Typed, testable, and the Incus REST API is reachable
-  directly, so nothing parses CLI output. One module, three binaries: `rig`
-  (routine), `gpuctl` (privileged), `hostgpu` (host-side card moves).
+  directly, so nothing parses CLI output. One module, two binaries: `rig` for
+  everything about VMs, `hostgpu` for the host itself — root, driver rebinds,
+  and the desktop. `rig` was briefly split into a second binary to encode which
+  verbs are dangerous; command groups in `--help` do that without the split.
 - **Credentials are env vars in a host file**, injected to tmpfs at start.
   Scoping them is the operator's job; nothing else can judge it.
 
@@ -61,7 +63,7 @@ What remains:
    and never clears it. `hostgpu desktop` does the rebind.
 2. **Starting a second VM with the same GPU hot-unplugs it from the running
    one.** Loud on the VM that failed to start, **silent on the victim** — it
-   still shows RUNNING with a healthy IP. This is what `gpuctl` prevents.
+   still shows RUNNING with a healthy IP. This is what `rig` prevents.
 3. **`dns.nameservers` + `security.acls` are incompatible** on 6.0.5: Incus emits
    the cross product of nameservers x address families and produces invalid
    nftables rules. `dns.nameservers` is unset, so this is not being triggered.
@@ -71,7 +73,7 @@ What remains:
    "the internet is a bit broken", because the bridge resolver keeps working.
    See `internal/policy`.
 5. **An ACL's rules cannot be edited while it is attached** — Incus flushes an
-   nftables chain it never created and fails. `gpuctl apply` detaches, rewrites
+   nftables chain it never created and fails. `rig apply` detaches, rewrites
    and reattaches, and refuses while a consumer is running. See
    `policy.rewriteACL`.
 
@@ -98,7 +100,7 @@ What remains:
 `vm-isolate` egress-rejects `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
 `169.254.0.0/16` and `100.64.0.0/10` (CGNAT/Tailscale — not covered by RFC1918
 and a real gap once), with `egress.action=allow` and `ingress.action=reject` on
-the NIC. Declared in `internal/policy`, reconciled by `gpuctl apply`.
+the NIC. Declared in `internal/policy`, reconciled by `rig apply`.
 
 Before it was attached, the guest could reach the host's sshd on all five
 addresses the host holds — including its tailnet address — plus the LAN gateway,
@@ -159,8 +161,7 @@ is one card, one active project.
 |---|---|
 | `CLAUDE.md` | Which tool for what, and how to start a project |
 | `RUNBOOK.md` | Host setup, in order |
-| `cmd/rig` | The routine surface: lifecycle, exec, push, doctor |
-| `cmd/gpuctl` | Arbitration and `apply`; the verbs that can break an invariant |
+| `cmd/rig` | The whole surface: lifecycle, guest access, card and policy |
 | `cmd/hostgpu` | Move the card between the desktop and VMs |
 | `internal/incus` | Typed REST client over the unix socket; exec over websockets |
 | `internal/policy` | Declared isolation policy and the reconcile |

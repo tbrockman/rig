@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Invariant tests for gpuctl. Runs against REAL Incus — the behaviour being
+# Invariant tests for rig. Runs against REAL Incus — the behaviour being
 # guarded lives in VFIO and QEMU, and a mock will cheerfully tell you
 # everything is fine.
 #
@@ -10,7 +10,6 @@
 set -uo pipefail
 
 IMAGE="${1:-nixos-gpu-base}"
-GPUCTL="${GPUCTL:-./gpuctl}"
 RIG="${RIG:-./rig}"
 PASS=0; FAIL=0
 
@@ -20,9 +19,9 @@ hdr()  { printf '\n--- %s ---\n' "$*"; }
 
 # Only test 6 needs a literal address, for the poisoned profile. The tools
 # discover it themselves.
-GPUCTL_PCI="${GPUCTL_PCI:-$($GPUCTL status --json |
+RIG_PCI="${RIG_PCI:-$($RIG status --json |
   python3 -c 'import json,sys; print(json.load(sys.stdin)["card"])')}"
-: "${GPUCTL_PCI:?no GPU found; set GPUCTL_PCI, e.g. 0000:04:00.0}"
+: "${RIG_PCI:?no GPU found; set RIG_PCI, e.g. 0000:04:00.0}"
 
 cleanup() {
   hdr "cleanup"
@@ -40,7 +39,7 @@ echo "created gputest-a, gputest-b"
 
 # ---------------------------------------------------------------------------
 hdr "1. claim on a stopped instance attaches the device"
-$GPUCTL claim gputest-a >/dev/null
+$RIG claim gputest-a >/dev/null
 if incus config device get gputest-a gpu0 pci 2>/dev/null | grep -q .; then
   pass "device present on gputest-a"
 else
@@ -49,7 +48,7 @@ fi
 
 # ---------------------------------------------------------------------------
 hdr "2. migration between two STOPPED instances is allowed"
-if $GPUCTL claim gputest-b >/dev/null 2>&1; then
+if $RIG claim gputest-b >/dev/null 2>&1; then
   if incus config device get gputest-b gpu0 pci >/dev/null 2>&1 \
      && ! incus config device get gputest-a gpu0 pci >/dev/null 2>&1; then
     pass "device moved a -> b, and only b has it"
@@ -62,10 +61,10 @@ fi
 
 # ---------------------------------------------------------------------------
 hdr "3. THE BIG ONE: cannot steal the GPU from a RUNNING instance"
-$GPUCTL start gputest-b >/dev/null
+$RIG start gputest-b >/dev/null
 sleep 20
 
-if $GPUCTL claim gputest-a >/dev/null 2>&1; then
+if $RIG claim gputest-a >/dev/null 2>&1; then
   fail "claim SUCCEEDED against a running holder — invariant violated"
 else
   pass "claim refused while holder is running"
@@ -81,7 +80,7 @@ fi
 
 # ---------------------------------------------------------------------------
 hdr "4. release refuses a running holder without --force"
-if $GPUCTL release >/dev/null 2>&1; then
+if $RIG release >/dev/null 2>&1; then
   fail "release detached from a running instance without --force"
 else
   pass "release refused"
@@ -89,11 +88,11 @@ fi
 
 # ---------------------------------------------------------------------------
 hdr "5. concurrent claims serialise (exactly one winner)"
-$GPUCTL stop gputest-b >/dev/null
-( $GPUCTL claim gputest-a >/tmp/gc-a 2>&1 ) &
-( $GPUCTL claim gputest-b >/tmp/gc-b 2>&1 ) &
+$RIG stop gputest-b >/dev/null
+( $RIG claim gputest-a >/tmp/gc-a 2>&1 ) &
+( $RIG claim gputest-b >/tmp/gc-b 2>&1 ) &
 wait
-HOLDERS=$($GPUCTL status --json | python3 -c \
+HOLDERS=$($RIG status --json | python3 -c \
   'import json,sys; print(len(json.load(sys.stdin)["holders"]))')
 if [ "$HOLDERS" = "1" ]; then
   pass "exactly one holder after concurrent claims"
@@ -107,21 +106,21 @@ hdr "6. a GPU in a profile is rejected outright"
 # slip through: an instance-level gpu0 masks the profile's gpu0, so scanning
 # instances' expanded devices reports all-clear. Claiming before the bad profile
 # exists also keeps the test deterministic — after test 5 the winner is a race.
-$GPUCTL claim gputest-a >/dev/null 2>&1
+$RIG claim gputest-a >/dev/null 2>&1
 incus profile create gputest-bad 2>/dev/null || true
 incus profile device add gputest-bad gpu0 gpu gputype=physical \
-  pci="$GPUCTL_PCI" >/dev/null 2>&1
+  pci="$RIG_PCI" >/dev/null 2>&1
 
 # No instance uses the profile yet. It is still primed to misconfigure the next
 # instance created, so it must be rejected on its own.
-if $GPUCTL status >/dev/null 2>&1; then
+if $RIG status >/dev/null 2>&1; then
   fail "poisoned profile not detected while unused"
 else
   pass "poisoned profile rejected while unused"
 fi
 
 incus profile add gputest-a gputest-bad >/dev/null 2>&1
-if $GPUCTL status >/dev/null 2>&1; then
+if $RIG status >/dev/null 2>&1; then
   fail "profile-borne GPU not detected (masked by the instance's own gpu0)"
 else
   pass "profile-borne GPU rejected even when masked by a local gpu0"
@@ -134,11 +133,11 @@ hdr "7. start refuses an instance with no network isolation"
 # The ACL is expected to come from the default profile. Override the NIC onto
 # the instance and drop the ACL key to simulate someone creating an instance
 # before the profile was fixed.
-$GPUCTL release >/dev/null 2>&1
+$RIG release >/dev/null 2>&1
 incus config device override gputest-a eth0 >/dev/null 2>&1
 incus config device unset gputest-a eth0 security.acls >/dev/null 2>&1
 
-if $GPUCTL start gputest-a >/dev/null 2>&1; then
+if $RIG start gputest-a >/dev/null 2>&1; then
   fail "start SUCCEEDED on an instance with no isolation ACL"
 else
   pass "start refused an unisolated instance"
@@ -146,7 +145,7 @@ fi
 
 # The isolation check runs before the claim, so a refusal must not have moved
 # the card. Otherwise a refused start still perturbs GPU ownership.
-HOLDERS=$($GPUCTL status --json | python3 -c \
+HOLDERS=$($RIG status --json | python3 -c \
   'import json,sys; print(len(json.load(sys.stdin)["holders"]))')
 if [ "$HOLDERS" = "0" ]; then
   pass "refused start did not claim the GPU"
@@ -154,9 +153,9 @@ else
   fail "refused start left the GPU attached ($HOLDERS holders)"
 fi
 
-if $GPUCTL start gputest-a --allow-unisolated >/dev/null 2>&1; then
+if $RIG start gputest-a --allow-unisolated >/dev/null 2>&1; then
   pass "--allow-unisolated overrides the refusal"
-  $GPUCTL stop gputest-a >/dev/null 2>&1
+  $RIG stop gputest-a >/dev/null 2>&1
 else
   fail "--allow-unisolated did not start the instance"
 fi

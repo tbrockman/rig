@@ -1,8 +1,9 @@
 // Command rig creates and runs isolated project VMs with the GPU attached.
 //
-// This is the whole routine surface, covering the full lifecycle. The verbs that
-// can break an invariant — release, --force detach, apply, starting a VM with no
-// network isolation — live in gpuctl instead, and are not reachable from here.
+// The verbs that can break an invariant — release, forced detach, apply,
+// starting a VM with no network isolation — are grouped separately in help but
+// live here too. They were a second binary once, which only ever encoded that
+// distinction more loudly than it needed to be.
 //
 // rig restricts nothing by itself: incus is still on PATH. It makes the safe
 // path the easy one. The boundary that matters is the VM and the network ACL.
@@ -45,15 +46,26 @@ func main() {
 		Use:   "rig",
 		Short: "Isolated project VMs with the GPU attached",
 		Long: "rig creates and runs isolated project VMs with the GPU attached.\n\n" +
-			"Privileged verbs — release, apply, forced detach, starting an unisolated\n" +
-			"VM — live in gpuctl, not here.",
+			"It enforces two invariants: at most one instance has the GPU configured\n" +
+			"and it never moves away from a running one, and no instance starts\n" +
+			"without network isolation.\n\n" +
+			"Environment: RIG_PCI, RIG_DEVICE, RIG_ACL, RIG_PROFILE,\n" +
+			"RIG_LOCK, INCUS_SOCKET, RIG_IMAGE, RIG_CPUS, RIG_MEMORY, RIG_DISK.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+	// Grouped so the sharp verbs stay visibly separate in help. They used to be
+	// a second binary; that only ever encoded this distinction.
+	root.AddGroup(
+		&cobra.Group{ID: "vm", Title: "Project VMs:"},
+		&cobra.Group{ID: "guest", Title: "Working inside a guest:"},
+		&cobra.Group{ID: "card", Title: "The card and the policy:"},
+	)
 	root.AddCommand(
-		a.newCmd(), a.startCmd(), a.stopCmd(), a.restartCmd(), a.statusCmd(),
-		a.claimCmd(), a.rmCmd(), a.doctorCmd(),
-		a.execCmd(), a.shellCmd(), a.pushCmd(), a.pullCmd(), a.logsCmd(),
+		a.newCmd(), a.startCmd(), a.stopCmd(), a.restartCmd(), a.rmCmd(),
+		a.statusCmd(), a.doctorCmd(), a.logsCmd(),
+		a.execCmd(), a.shellCmd(), a.pushCmd(), a.pullCmd(),
+		a.claimCmd(), a.releaseCmd(), a.applyCmd(),
 	)
 
 	if err := root.Execute(); err != nil {
@@ -87,9 +99,10 @@ func (a *app) newCmd() *cobra.Command {
 		start                        bool
 	)
 	cmd := &cobra.Command{
-		Use:   "new <name>",
-		Short: "Create a project VM (isolated, GPU-ready)",
-		Args:  cobra.ExactArgs(1),
+		Use:     "new <name>",
+		GroupID: "vm",
+		Short:   "Create a project VM (isolated, GPU-ready)",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			name := args[0]
 			if !nameRE.MatchString(name) {
@@ -133,7 +146,7 @@ func (a *app) newCmd() *cobra.Command {
 			}
 			if !policy.Isolated(inst, a.cfg.ACL) {
 				note("WARNING: %s did NOT inherit network isolation.", name)
-				note("         Fix the profile:  gpuctl apply")
+				note("         Fix the profile:  rig apply")
 				note("         rig start will refuse it until then.")
 			}
 
@@ -160,25 +173,32 @@ func (a *app) newCmd() *cobra.Command {
 
 func (a *app) startCmd() *cobra.Command {
 	var timeout time.Duration
-	var noWait bool
+	var noWait, allowUnisolated bool
 	cmd := &cobra.Command{
-		Use:   "start <name>",
-		Short: "Claim the card, start the VM, inject credentials",
-		Args:  cobra.ExactArgs(1),
+		Use:     "start <name>",
+		Short:   "Claim the card, start the VM, inject credentials",
+		GroupID: "vm",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if err := a.requireInstance(args[0]); err != nil {
 				return err
 			}
-			return a.startInstance(args[0], timeout, !noWait)
+			return a.start(args[0], timeout, !noWait, allowUnisolated)
 		},
 	}
 	cmd.Flags().DurationVar(&timeout, "timeout", 3*time.Minute, "how long to wait for the guest to come up")
 	cmd.Flags().BoolVar(&noWait, "no-wait", false, "return as soon as Incus reports it started")
+	cmd.Flags().BoolVar(&allowUnisolated, "allow-unisolated", false,
+		"start even with no isolation ACL — the guest will reach this host and the LAN")
 	return cmd
 }
 
 func (a *app) startInstance(name string, timeout time.Duration, wait bool) error {
-	if err := gpu.Start(a.c, a.cfg, name, false, int(timeout.Seconds())); err != nil {
+	return a.start(name, timeout, wait, false)
+}
+
+func (a *app) start(name string, timeout time.Duration, wait, allowUnisolated bool) error {
+	if err := gpu.Start(a.c, a.cfg, name, allowUnisolated, int(timeout.Seconds())); err != nil {
 		return err
 	}
 	if !wait {
@@ -222,9 +242,10 @@ func (a *app) startInstance(name string, timeout time.Duration, wait bool) error
 func (a *app) stopCmd() *cobra.Command {
 	var timeout time.Duration
 	cmd := &cobra.Command{
-		Use:   "stop <name>",
-		Short: "Stop the VM (the card stays attached to it)",
-		Args:  cobra.ExactArgs(1),
+		Use:     "stop <name>",
+		GroupID: "vm",
+		Short:   "Stop the VM (the card stays attached to it)",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if err := a.requireInstance(args[0]); err != nil {
 				return err
@@ -239,9 +260,10 @@ func (a *app) stopCmd() *cobra.Command {
 func (a *app) restartCmd() *cobra.Command {
 	var timeout time.Duration
 	cmd := &cobra.Command{
-		Use:   "restart <name>",
-		Short: "Stop and start, re-injecting credentials",
-		Args:  cobra.ExactArgs(1),
+		Use:     "restart <name>",
+		GroupID: "vm",
+		Short:   "Stop and start, re-injecting credentials",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if err := a.requireInstance(args[0]); err != nil {
 				return err
@@ -256,11 +278,14 @@ func (a *app) restartCmd() *cobra.Command {
 	return cmd
 }
 
+// --- the card and the policy ---------------------------------------------
+
 func (a *app) claimCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "claim <name>",
-		Short: "Move the card to a stopped VM without starting it",
-		Args:  cobra.ExactArgs(1),
+		Use:     "claim <name>",
+		Short:   "Move the card to a stopped VM without starting it",
+		GroupID: "card",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if err := a.requireInstance(args[0]); err != nil {
 				return err
@@ -270,12 +295,91 @@ func (a *app) claimCmd() *cobra.Command {
 	}
 }
 
+func (a *app) releaseCmd() *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:     "release",
+		Short:   "Detach the card from whoever holds it",
+		GroupID: "card",
+		Args:    cobra.NoArgs,
+		RunE:    func(_ *cobra.Command, _ []string) error { return gpu.Release(a.c, a.cfg, force) },
+	}
+	cmd.Flags().BoolVar(&force, "force", false,
+		"hot-unplug from a running instance — this WILL break its workload")
+	return cmd
+}
+
+func (a *app) applyCmd() *cobra.Command {
+	var dryRun bool
+	var profile string
+	cmd := &cobra.Command{
+		Use:     "apply",
+		Short:   "Reconcile the isolation ACL and the profile NIC",
+		GroupID: "card",
+		Long: "Declares the policy — the egress reject ranges and the three NIC keys —\n" +
+			"and reconciles Incus to it. `incus admin init --preseed` does not cover\n" +
+			"network ACLs, so this is the only way to get them onto a clean host.",
+		Args: cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			changes, err := policy.Apply(a.c, a.cfg.ACL, profile, dryRun)
+			if err != nil {
+				for _, ch := range changes {
+					fmt.Printf("  %s\n", ch)
+				}
+				return err
+			}
+			if len(changes) == 0 {
+				fmt.Println("already reconciled; nothing to do.")
+			} else {
+				if dryRun {
+					fmt.Println("dry run, nothing applied:")
+				} else {
+					fmt.Println("applied:")
+				}
+				for _, ch := range changes {
+					fmt.Printf("  %s\n", ch)
+				}
+			}
+
+			// Instance-level NIC overrides win over the profile, so reconciling
+			// the profile does not necessarily isolate everything. Those are left
+			// alone — an override may be deliberate — but they are worth naming.
+			instances, err := a.c.Instances()
+			if err != nil {
+				return err
+			}
+			var stragglers []string
+			for i := range instances {
+				unisolated, noEgress := policy.Report(&instances[i], a.cfg.ACL)
+				if len(unisolated) > 0 {
+					stragglers = append(stragglers,
+						fmt.Sprintf("  %s: no ACL on %s", instances[i].Name, strings.Join(unisolated, ", ")))
+				} else if len(noEgress) > 0 {
+					stragglers = append(stragglers,
+						fmt.Sprintf("  %s: no egress on %s", instances[i].Name, strings.Join(noEgress, ", ")))
+				}
+			}
+			if len(stragglers) > 0 {
+				fmt.Println("\ninstances not covered (an instance's own NIC override wins over the profile; not changed):")
+				for _, s := range stragglers {
+					fmt.Println(s)
+				}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "report what would change without changing it")
+	cmd.Flags().StringVar(&profile, "profile", envOr("RIG_PROFILE", "default"), "profile to reconcile")
+	return cmd
+}
+
 func (a *app) rmCmd() *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
-		Use:   "rm <name>",
-		Short: "Delete a stopped VM that rig created",
-		Args:  cobra.ExactArgs(1),
+		Use:     "rm <name>",
+		GroupID: "vm",
+		Short:   "Delete a stopped VM that rig created",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			name := args[0]
 			if err := a.requireInstance(name); err != nil {
@@ -315,9 +419,10 @@ func (a *app) rmCmd() *cobra.Command {
 func (a *app) statusCmd() *cobra.Command {
 	var asJSON bool
 	cmd := &cobra.Command{
-		Use:   "status",
-		Short: "Who holds the card, and which VMs exist",
-		Args:  cobra.NoArgs,
+		Use:     "status",
+		GroupID: "vm",
+		Short:   "Who holds the card, and which VMs exist",
+		Args:    cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			instances, err := a.c.Instances()
 			if err != nil {
@@ -353,9 +458,15 @@ func (a *app) statusCmd() *cobra.Command {
 				if holders == nil {
 					holders = []gpu.Holder{}
 				}
+				// "card" is the address the next claim would use, discovered
+				// even when nothing holds it, so callers need not re-implement
+				// the lookup.
+				card, _ := gpu.DiscoverPCI(a.c, a.cfg)
 				enc := json.NewEncoder(os.Stdout)
 				enc.SetIndent("", "  ")
-				return enc.Encode(map[string]any{"holders": holders, "instances": rows})
+				return enc.Encode(map[string]any{
+					"card": card, "holders": holders, "instances": rows,
+				})
 			}
 
 			switch len(holders) {
@@ -365,7 +476,7 @@ func (a *app) statusCmd() *cobra.Command {
 				fmt.Printf("GPU held by %s (%s) at %s\n", holders[0].Instance, holders[0].Status, holders[0].PCI)
 			default:
 				fmt.Println("!! GPU device is configured on MULTIPLE instances — starting a second")
-				fmt.Println("   one will hot-unplug the card from the first. Fix with `gpuctl release`.")
+				fmt.Println("   one will hot-unplug the card from the first. Fix with `rig release`.")
 			}
 			fmt.Println()
 			for _, r := range rows {
@@ -390,9 +501,10 @@ func (a *app) statusCmd() *cobra.Command {
 // does not depend on remembering six checks in the right order.
 func (a *app) doctorCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "doctor <name>",
-		Short: "Check a VM is what you think it is",
-		Args:  cobra.ExactArgs(1),
+		Use:     "doctor <name>",
+		GroupID: "vm",
+		Short:   "Check a VM is what you think it is",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			name := args[0]
 			if err := a.requireInstance(name); err != nil {
@@ -458,9 +570,10 @@ func (a *app) doctorCmd() *cobra.Command {
 
 func (a *app) logsCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "logs <name>",
-		Short: "Console log, for when a VM never comes up",
-		Args:  cobra.ExactArgs(1),
+		Use:     "logs <name>",
+		GroupID: "vm",
+		Short:   "Console log, for when a VM never comes up",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if err := a.requireInstance(args[0]); err != nil {
 				return err
@@ -482,14 +595,15 @@ func (a *app) execCmd() *cobra.Command {
 	var stdin bool
 	var timeout time.Duration
 	cmd := &cobra.Command{
-		Use:   "exec <name> <command>...",
-		Short: "Run a command in the guest",
+		Use:     "exec <name> <command>...",
+		GroupID: "guest",
+		Short:   "Run a command in the guest",
 		Long: "Run a command in the guest through a login shell, so the guest's own\n" +
 			"PATH applies.\n\n" +
 			"rig's own flags must come before the instance name, because everything\n" +
 			"after it belongs to the guest command:\n" +
 			"  rig exec --dir /work/foo myvm ls -la",
-		Args:               cobra.MinimumNArgs(2),
+		Args:                  cobra.MinimumNArgs(2),
 		DisableFlagsInUseLine: true,
 		RunE: func(_ *cobra.Command, args []string) error {
 			if err := a.requireInstance(args[0]); err != nil {
@@ -511,9 +625,10 @@ func (a *app) execCmd() *cobra.Command {
 
 func (a *app) shellCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "shell <name>",
-		Short: "Interactive login shell in the guest",
-		Args:  cobra.ExactArgs(1),
+		Use:     "shell <name>",
+		GroupID: "guest",
+		Short:   "Interactive login shell in the guest",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if err := a.requireInstance(args[0]); err != nil {
 				return err
@@ -526,8 +641,9 @@ func (a *app) shellCmd() *cobra.Command {
 func (a *app) pushCmd() *cobra.Command {
 	var dest string
 	cmd := &cobra.Command{
-		Use:   "push <name> <src-dir>",
-		Short: "Copy a host directory's contents into the guest",
+		Use:     "push <name> <src-dir>",
+		GroupID: "guest",
+		Short:   "Copy a host directory's contents into the guest",
 		Long: "Copies the *contents* of <src-dir> to <dest>, which defaults to\n" +
 			"/work/<basename>. Unlike `incus file push -r`, the destination is\n" +
 			"exactly the destination — no directory named after the source appears.",
@@ -560,9 +676,10 @@ func (a *app) pushCmd() *cobra.Command {
 func (a *app) pullCmd() *cobra.Command {
 	var out string
 	cmd := &cobra.Command{
-		Use:   "pull <name> <guest-path>",
-		Short: "Read a file out of the guest",
-		Args:  cobra.ExactArgs(2),
+		Use:     "pull <name> <guest-path>",
+		GroupID: "guest",
+		Short:   "Read a file out of the guest",
+		Args:    cobra.ExactArgs(2),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if err := a.requireInstance(args[0]); err != nil {
 				return err

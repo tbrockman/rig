@@ -124,8 +124,8 @@ Before creating any project — isolation is inherited from the `default` profil
 so getting it right once covers every VM after it.
 
 ```bash
-./gpuctl apply --dry-run
-./gpuctl apply
+./rig apply --dry-run
+./rig apply
 ```
 
 Then prove it against a running VM rather than trusting the config:

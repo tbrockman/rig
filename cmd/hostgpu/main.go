@@ -108,7 +108,7 @@ func (c *conf) toDesktop() error {
 	// with Incus and both sides lose.
 	if instances, err := c.client.Instances(); err == nil {
 		if holders := gpu.Holders(instances); len(holders) > 0 {
-			return fmt.Errorf("%s still holds the GPU. Run:  rig stop %s && gpuctl release",
+			return fmt.Errorf("%s still holds the GPU. Run:  rig stop %s && rig release",
 				holders[0].Instance, holders[0].Instance)
 		}
 	}

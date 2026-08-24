@@ -22,7 +22,7 @@ import (
 const (
 	DefaultDevice = "gpu0"
 	DefaultACL    = "vm-isolate"
-	DefaultLock   = "/var/lock/gpuctl.lock"
+	DefaultLock   = "/var/lock/rig.lock"
 )
 
 type Config struct {
@@ -34,10 +34,10 @@ type Config struct {
 
 func ConfigFromEnv() Config {
 	return Config{
-		Device: envOr("GPUCTL_DEVICE", DefaultDevice),
-		PCI:    os.Getenv("GPUCTL_PCI"),
-		ACL:    envOr("GPUCTL_ACL", DefaultACL),
-		Lock:   envOr("GPUCTL_LOCK", DefaultLock),
+		Device: envOr("RIG_DEVICE", DefaultDevice),
+		PCI:    os.Getenv("RIG_PCI"),
+		ACL:    envOr("RIG_ACL", DefaultACL),
+		Lock:   envOr("RIG_LOCK", DefaultLock),
 	}
 }
 
@@ -135,10 +135,10 @@ func DiscoverPCI(c *incus.Client, cfg Config) (string, error) {
 		return found[0], nil
 	case 0:
 		return "", fmt.Errorf("no NVIDIA display controller on the PCI bus.\n" +
-			"  Set it explicitly:  export GPUCTL_PCI=0000:04:00.0")
+			"  Set it explicitly:  export RIG_PCI=0000:04:00.0")
 	default:
 		return "", fmt.Errorf("found %d NVIDIA display controllers (%s); this tool assumes one.\n"+
-			"  Set it explicitly:  export GPUCTL_PCI=%s",
+			"  Set it explicitly:  export RIG_PCI=%s",
 			len(found), strings.Join(found, ", "), found[0])
 	}
 }
@@ -205,7 +205,7 @@ func claimLocked(c *incus.Client, cfg Config, name string) error {
 
 	holders := Holders(instances)
 	if len(holders) > 1 {
-		return fmt.Errorf("GPU is configured on multiple instances; run `gpuctl release` first")
+		return fmt.Errorf("GPU is configured on multiple instances; run `rig release` first")
 	}
 	if len(holders) == 1 && holders[0].Instance == name {
 		fmt.Printf("%s already holds the GPU.\n", name)
@@ -298,8 +298,8 @@ func Start(c *incus.Client, cfg Config, name string, allowUnisolated bool, timeo
 		return fmt.Errorf("%s has no network isolation: NIC %s does not carry the %q ACL.\n"+
 			"An unisolated guest reaches this host's sshd on every address the host holds, "+
 			"plus the LAN and the tailnet.\n"+
-			"Fix it for every instance:  gpuctl apply\n"+
-			"To start anyway:  gpuctl start --allow-unisolated %s",
+			"Fix it for every instance:  rig apply\n"+
+			"To start anyway:  rig start --allow-unisolated %s",
 			name, strings.Join(unisolated, ", "), cfg.ACL, name)
 	}
 	for _, nic := range noEgress {
@@ -363,7 +363,7 @@ func FileLock(path string) (func(), error) {
 		return nil, fmt.Errorf("cannot open lock %s: %w", path, err)
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		fmt.Fprintln(os.Stderr, "waiting for gpuctl lock...")
+		fmt.Fprintln(os.Stderr, "waiting for the rig lock...")
 		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 			f.Close()
 			return nil, err
