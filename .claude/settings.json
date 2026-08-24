@@ -1,9 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(./gpu)",
-      "Bash(./gpu *)",
-      "Bash(./gpu:*)",
+      "Bash(./rig)",
+      "Bash(./rig *)",
+      "Bash(./rig:*)",
+      "Bash(./test-invariants.sh *)",
+      "Bash(./test-network-acl.sh *)",
       "Bash(incus list)",
       "Bash(incus list *)",
       "Bash(incus list:*)",
@@ -11,12 +13,20 @@
       "Bash(incus info:*)",
       "Bash(incus exec *)",
       "Bash(incus exec:*)",
+      "Bash(incus file push *)",
+      "Bash(incus file pull *)",
       "Bash(incus image list*)",
       "Bash(incus storage info*)",
       "Bash(incus config show *)",
       "Bash(incus config device show *)"
     ],
     "deny": [
+      "Bash(incus init *)",
+      "Bash(incus init:*)",
+      "Bash(incus launch *)",
+      "Bash(incus launch:*)",
+      "Bash(incus copy *)",
+      "Bash(incus copy:*)",
       "Bash(incus start *)",
       "Bash(incus start:*)",
       "Bash(incus stop *)",

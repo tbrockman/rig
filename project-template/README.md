@@ -5,11 +5,21 @@ the project (not by the base image) and one test worth keeping: a GPU
 correctness check that fails when the GPU is broken, missing, or lying.
 
 ```bash
-incus copy nixos-gpu-base proj-foo --vm -d root,size=40GiB
-./gpuctl start proj-foo
-incus file push -r project-template/. proj-foo/work/foo/
+./rig new proj-foo --env secrets/foo.env
+./rig start proj-foo
+mkdir -p /srv/projects/foo && cp -r project-template/. /srv/projects/foo/
+incus file push -r /srv/projects/foo proj-foo/work/   # -> /work/foo/ (see below)
 incus exec proj-foo -- bash -lc 'cd /work/foo && nix develop "path:." -c make run'
 ```
+
+`incus file push -r` names the guest directory after the *source* directory and
+ignores a trailing `/.` — `push -r template/. vm/work/foo/` lands in
+`/work/foo/template/`. Name the host directory after the project.
+
+The devShell carries the CUDA toolchain **and the agent** (`pkgs.claude-code`),
+launched by `./run-agent`, which sources the credentials `rig start` injected at
+`/run/rig/env`. Both live here for the same reason: a project that wants a
+different CUDA or agent version should not need a new base image.
 
 ## Why the toolchain is here and not in the image
 

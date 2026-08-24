@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# rig — create and run isolated project VMs with the GPU attached.
+#
+#   rig new <name> [--env FILE]   create a project VM (isolated, GPU-ready)
+#   rig start <name>              claim the card, start it, inject credentials
+#   rig stop <name>               stop it (the card stays attached to it)
+#   rig status                    who holds the card, and which VMs exist
+#   rig claim <name>              move the card without starting
+#   rig rm <name>                 delete a stopped VM that rig created
+#
+# This is the whole surface. It covers the entire lifecycle on purpose: the
+# earlier version could start and stop but not create or delete, so anyone using
+# it had to drop to raw `incus` for half the job — which is the surface it exists
+# to avoid, and which left orphaned instances behind on a failed attempt.
+#
+# Deliberately absent: `gpuctl release`, `--force`, `gpuctl apply`, and
+# `start --allow-unisolated`. Those can break the one-card invariant or take a
+# guest's network isolation off, so they need a human. `rig rm` only touches
+# instances rig created (it checks a marker), so it cannot delete something you
+# built by hand.
+#
+# Honest scope: this restricts nothing by itself, since `incus` is still on PATH.
+# .claude/settings.json makes rig the path of least resistance, and even that is
+# a guardrail rather than a sandbox. The real boundary is the VM and the network
+# ACL — see CLAUDE.md.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+GPUCTL="$HERE/gpuctl"
+
+IMAGE="${RIG_IMAGE:-nixos-gpu-base}"
+CPUS="${RIG_CPUS:-8}"
+MEMORY="${RIG_MEMORY:-16GiB}"
+DISK="${RIG_DISK:-40GiB}"
+
+# Credentials land here. /run is tmpfs, so stopping the VM destroys them and a
+# restart re-injects from the host — nothing secret is ever written into the
+# instance's disk or its Incus config.
+GUEST_ENV_PATH="/run/rig/env"
+
+die() { printf 'rig: %s\n' "$*" >&2; exit 1; }
+note() { printf 'rig: %s\n' "$*"; }
+
+usage() {
+  cat <<'EOF'
+rig — isolated project VMs with the GPU attached
+
+  rig new <name> [--env FILE]   create a project VM (isolated, GPU-ready)
+  rig start <name>              claim the card, start it, inject credentials
+  rig stop <name>               stop it (the card stays attached to it)
+  rig status                    who holds the card, and which VMs exist
+  rig claim <name>              move the card without starting
+  rig rm <name>                 delete a stopped VM that rig created
+
+Sizing (env overrides): RIG_IMAGE, RIG_CPUS, RIG_MEMORY, RIG_DISK.
+Privileged operations — release, apply, --force — are in gpuctl, not here.
+See CLAUDE.md.
+EOF
+}
+
+# Instance names Incus accepts: letters, digits, hyphens.
+valid_name() { [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}$ ]]; }
+
+require_name() {
+  valid_name "$1" || die "not a valid instance name: $1"
+}
+
+exists() { incus info "$1" >/dev/null 2>&1; }
+
+state_of() { incus list "$1" -c s -f csv 2>/dev/null | head -1; }
+
+# --- the PCI address ------------------------------------------------------
+# Not hardcoded. Preference order:
+#   1. GPUCTL_PCI, if the operator set it
+#   2. whoever currently holds the card, via gpuctl (Incus as source of truth)
+#   3. the hardware itself — the sole NVIDIA display controller on the bus
+#
+# (3) exists because (2) cannot work on a fresh host or straight after a
+# release: there is no holder to ask, and the first claim of a new project is
+# exactly when that happens.
+resolve_pci() {
+  [ -n "${GPUCTL_PCI:-}" ] && return 0
+
+  local pci
+  pci=$("$GPUCTL" status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    holders = json.load(sys.stdin).get("holders") or []
+except Exception:
+    sys.exit(1)
+if len(holders) != 1 or holders[0].get("pci", "?") == "?":
+    sys.exit(1)
+print(holders[0]["pci"])
+' 2>/dev/null) || pci=""
+
+  if [ -z "$pci" ]; then
+    # Class 0300 = VGA controller, vendor 10de = NVIDIA. One card by design;
+    # refuse to guess if that ever stops being true.
+    local found
+    found=$(lspci -D -n -d 10de::0300 2>/dev/null | awk '{print $1}')
+    local count
+    count=$(printf '%s\n' "$found" | grep -c . || true)
+    [ "$count" = "1" ] || die "cannot tell which card to use: found ${count:-0} \
+NVIDIA display controllers.
+  Set it explicitly:  export GPUCTL_PCI=0000:04:00.0"
+    pci="$found"
+  fi
+
+  export GPUCTL_PCI="$pci"
+}
+
+# --- credentials ---------------------------------------------------------
+# Scoping is the operator's job: rig injects whatever the file contains and
+# makes no attempt to judge whether a key is narrow enough. It does refuse a
+# file other users can read, because that is a mistake rather than a choice.
+check_env_file() {
+  local f="$1"
+  [ -f "$f" ] || die "no such env file: $f"
+  local mode
+  mode=$(stat -c '%a' "$f")
+  if [ "$(( 8#$mode & 8#077 ))" -ne 0 ]; then
+    die "env file $f is mode $mode — readable by other users.
+  It holds credentials:  chmod 600 $f"
+  fi
+  # KEY=VALUE per line, so a stray shell construct is caught before it reaches
+  # the guest.
+  local bad
+  bad=$(grep -vnE '^[[:space:]]*($|#|[A-Za-z_][A-Za-z0-9_]*=)' "$f" || true)
+  [ -z "$bad" ] || die "env file $f has lines that are not KEY=VALUE:
+$bad"
+}
+
+inject_env() {
+  local name="$1"
+  local envfile
+  envfile=$(incus config get "$name" user.rig.env 2>/dev/null || true)
+  [ -n "$envfile" ] || return 0
+
+  if [ ! -f "$envfile" ]; then
+    note "WARNING: $name expects credentials at $envfile, which is missing."
+    note "         The guest will start without them."
+    return 0
+  fi
+  check_env_file "$envfile"
+
+  incus exec "$name" -- mkdir -p "$(dirname "$GUEST_ENV_PATH")" </dev/null
+  incus file push "$envfile" "$name$GUEST_ENV_PATH" \
+    --mode 0600 --uid 0 --gid 0 >/dev/null
+  note "injected $(grep -cE '^[A-Za-z_]' "$envfile") credential(s) into \
+$GUEST_ENV_PATH (tmpfs; gone on stop)"
+}
+
+# Wait for the Incus guest agent. Never a fixed sleep: the agent takes variable
+# time, and a hung `incus exec` ignores SIGTERM, hence timeout -s KILL.
+wait_for_agent() {
+  local name="$1" i
+  for i in $(seq 1 90); do
+    if timeout -s KILL 10 incus exec "$name" -- true </dev/null 2>/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# --- verbs ---------------------------------------------------------------
+
+cmd_new() {
+  local name="" envfile=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --env) [ $# -ge 2 ] || die "--env needs a file"; envfile="$2"; shift 2 ;;
+      -*)    die "unknown option for new: $1" ;;
+      *)     [ -z "$name" ] || die "new takes one name"; name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "new needs a name"
+  require_name "$name"
+  exists "$name" && die "$name already exists"
+
+  if [ -n "$envfile" ]; then
+    envfile="$(cd "$(dirname "$envfile")" && pwd)/$(basename "$envfile")"
+    check_env_file "$envfile"
+  fi
+
+  incus image info "$IMAGE" >/dev/null 2>&1 \
+    || die "no such image: $IMAGE (build it with ./01-build-image.sh)"
+
+  # `incus init`, not `incus copy`: copy clones an *instance*, and this is an
+  # image. The old runbook had this wrong and the command simply failed.
+  incus init "$IMAGE" "$name" --vm \
+    -c security.secureboot=false \
+    -c "limits.cpu=$CPUS" \
+    -c "limits.memory=$MEMORY" \
+    -d "root,size=$DISK" >/dev/null
+  incus config set "$name" user.rig.managed=true
+  [ -n "$envfile" ] && incus config set "$name" user.rig.env="$envfile"
+
+  # The isolation comes from the default profile. Verify it actually landed
+  # rather than assuming — a new VM with no ACL is the failure this whole
+  # project exists to prevent, and it is silent.
+  if ! "$GPUCTL" status --json | python3 -c '
+import json, sys
+name = sys.argv[1]
+for i in json.load(sys.stdin)["instances"]:
+    if i["name"] == name:
+        sys.exit(0 if i.get("isolated") else 1)
+sys.exit(1)
+' "$name"; then
+    note "WARNING: $name did NOT inherit network isolation."
+    note "         Fix the profile:  ./gpuctl apply"
+    note "         rig start will refuse it until then."
+  fi
+
+  note "created $name (image $IMAGE, ${CPUS} cpus, $MEMORY, $DISK disk)"
+  [ -n "$envfile" ] && note "credentials will be injected from $envfile"
+  note "next:  cp -r project-template/. <your project>/ && rig start $name"
+  return 0
+}
+
+cmd_rm() {
+  local name="$1"
+  require_name "$name"
+  exists "$name" || die "no such instance: $name"
+
+  # Only delete what rig created. Anything built by hand is someone else's.
+  [ "$(incus config get "$name" user.rig.managed 2>/dev/null)" = "true" ] \
+    || die "$name was not created by rig (no user.rig.managed marker).
+  Delete it deliberately with incus if that is what you want."
+
+  [ "$(state_of "$name")" = "STOPPED" ] \
+    || die "$name is not stopped. Stop it first:  rig stop $name"
+
+  note "deleting $name and its disk (including /work)"
+  incus delete "$name"
+  note "deleted $name"
+}
+
+cmd_start() {
+  local name="$1"
+  require_name "$name"
+  exists "$name" || die "no such instance: $name"
+  resolve_pci
+  "$GPUCTL" start "$name"
+
+  if wait_for_agent "$name"; then
+    inject_env "$name"
+  else
+    note "WARNING: the guest agent never came up; credentials not injected."
+    note "         Look at:  incus console $name --show-log"
+    return 1
+  fi
+}
+
+[ -x "$GPUCTL" ] || die "$GPUCTL is missing or not executable"
+
+verb="${1:-}"
+[ $# -gt 0 ] && shift
+
+case "$verb" in
+  status)
+    [ $# -eq 0 ] || die "status takes no arguments"
+    exec "$GPUCTL" status
+    ;;
+  new)
+    cmd_new "$@"
+    ;;
+  rm)
+    [ $# -eq 1 ] || die "rm takes exactly one instance name"
+    cmd_rm "$1"
+    ;;
+  start)
+    [ $# -eq 1 ] || die "start takes exactly one instance name"
+    cmd_start "$1"
+    ;;
+  claim)
+    # Exactly one argument, so gpuctl's escape hatches cannot be leaked through.
+    [ $# -eq 1 ] || die "claim takes exactly one instance name"
+    require_name "$1"
+    resolve_pci
+    exec "$GPUCTL" claim "$1"
+    ;;
+  stop)
+    [ $# -eq 1 ] || die "stop takes exactly one instance name"
+    require_name "$1"
+    exec "$GPUCTL" stop "$1"
+    ;;
+  ""|-h|--help|help)
+    usage
+    exit 0
+    ;;
+  *)
+    printf 'rig: unknown verb %q\n\n' "$verb" >&2
+    usage >&2
+    exit 64
+    ;;
+esac

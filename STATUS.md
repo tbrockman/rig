@@ -15,6 +15,10 @@ One VM active at a time, roughly one per project, stopped when unused. Remote
 paid models power the agent — the GPU is for the software being built, not for
 running models locally.
 
+All three boxes now exist: `rig` on the host, the `nixos-gpu-base` image with
+the driver, and `project-template/run-agent` in the guest. **Start at
+`CLAUDE.md`** — it says which tool does what and how to stand up a project.
+
 ## Hardware
 
 - AMD Ryzen 7 7800X3D, 60 GiB RAM, Ubuntu 26.04, kernel 7.0.0-29
@@ -98,7 +102,10 @@ If the card moves, its PCI address changes — update `GPUCTL_PCI` and re-claim.
 ## Current state — what works
 
 - ZFS pool `fast` (loop-backed, 500 GiB, on the LUKS root so encrypted at rest).
-  ARC capped at 8 GiB via `/etc/modprobe.d/zfs.conf`.
+  ARC capped at 8 GiB via `/etc/modprobe.d/zfs.conf`. CoW clones measured
+  2026-08-24: `rig new` takes **1.5 s and adds no pool usage**. That claim is the
+  justification for this pool and had never actually been tested — the runbook's
+  check used `incus copy <image>`, which cannot work at all.
 - Host headless (`multi-user.target`), console on iGPU/HDMI, `getty@tty1` active.
   `boot_vga=1` on `0f:00.0`, `fb0` on the iGPU. `amdgpu` added to initramfs.
 - `./01-build-image.sh` builds and imports `nixos-gpu-base` successfully.
@@ -111,6 +118,9 @@ If the card moves, its PCI address changes — update `GPUCTL_PCI` and re-claim.
   `--allow-unisolated`), the check runs before the claim so a refusal does not
   move the card, and `status` marks unisolated instances. The isolation is now
   on the `default` profile too, so new instances inherit it.
+- **The new-project path works end to end and is now one command each step:**
+  `rig new` → `rig start` (GPU claimed, credentials injected) → `gpu-check` →
+  CUDA test → `test-network-acl.sh` → `run-agent`. Verified on `proj-demo`.
 - **CUDA compute verified end to end, not just `nvidia-smi`.** `project-template`
   builds in a guest devShell and `vectoradd` reports all 4,194,304 elements
   bit-exact under two launch geometries, with the poison and negative-control
@@ -190,26 +200,66 @@ from nothing, and repair an ACL missing four of five ranges.
 
 ## Agent surface
 
-`gpu` is the whole control surface: `status`, `start`, `stop`, `claim`. No
-`release`, no `--force`, no `apply`, no `--allow-unisolated`, and it rejects
-extra arguments so `gpu start foo --allow-unisolated` cannot leak `gpuctl`'s
-escape hatch through it. It does not hardcode the PCI address — it asks
-`gpuctl status --json` who holds the card, so there is no second place to update
-when the card moves slots.
+`rig` is the whole control surface: `new`, `start`, `stop`, `status`, `claim`,
+`rm`. Not `gpu` any more — the tool creates VMs, injects credentials and manages
+lifecycle, so naming it after one device it attaches was wrong, and `gpu` /
+`gpuctl` were one letter apart with very different power.
 
-`.claude/settings.json` allows `./gpu` and denies the `incus` verbs that can
-break the one-card invariant or remove a guest's isolation (`start`, `stop`,
-`restart`, `delete`, `config device add/set/unset/remove/override`, `profile`,
-`network`), leaving `list`/`info`/`exec`/`show` usable. Each deny is written in
-both wildcard syntaxes (`incus profile *` and `incus profile:*`) because a deny
-rule that silently fails to match is worse than no rule.
+It covers the **entire** lifecycle deliberately. The first version had only
+start/stop/status/claim, which meant anyone using it dropped to raw `incus` for
+creation and deletion — the surface it exists to avoid — and since `incus init`
+was allowed while `incus delete` was denied, a failed attempt stranded an orphan
+that could not be cleaned up. Create-without-delete is not a safe subset.
+
+Also absent by design: `release`, `--force`, `apply`, `--allow-unisolated`. It
+rejects extra arguments so `rig start foo --allow-unisolated` cannot leak
+`gpuctl`'s escape hatch, and `rig rm` refuses anything lacking the
+`user.rig.managed` marker, so it cannot delete a hand-built instance.
+
+**The PCI address is derived, in three steps:** `GPUCTL_PCI` if set, else the
+current holder via `gpuctl status --json`, else the sole NVIDIA display
+controller on the PCI bus. The third was missing and made `rig claim` fail on a
+fresh host or straight after a `release` — which is exactly the first claim of a
+new project. Still no second copy of the address to go stale.
+
+`.claude/settings.json` allows `./rig` and denies the `incus` verbs that can
+break the one-card invariant or remove a guest's isolation (`init`, `launch`,
+`copy`, `start`, `stop`, `restart`, `delete`, `config device
+add/set/unset/remove/override`, `profile`, `network`), leaving
+`list`/`info`/`exec`/`file`/`show` usable. Each deny is written in both wildcard
+syntaxes (`incus profile *` and `incus profile:*`) because a deny rule that
+silently fails to match is worse than no rule.
 
 **Be honest about what that buys.** Deny rules are prefix matches on the command
-string. `bash -c 'incus start x'` sidesteps them, and `./test-invariants.sh`
-calls `incus init` internally without tripping anything. This makes `gpu` the
-path of least resistance and makes an invariant-breaking command an explicit act
-rather than an easy one. The actual security boundary is the VM and the network
-ACL, not this file.
+string. `bash -c 'incus start x'` sidesteps them, and the test scripts call
+`incus` internally without tripping anything. This makes `rig` the path of least
+resistance and an invariant-breaking command an explicit act rather than a
+convenient one. The actual security boundary is the VM and the network ACL, not
+this file.
+
+## Credentials for the unattended agent
+
+Decided 2026-08-24: **inject as environment variables, scoping is the
+operator's job.**
+
+`rig new <name> --env FILE` records the *path* on the instance
+(`user.rig.env`) — never the secret. `rig start` waits for the guest agent, then
+pushes that file to `/run/rig/env` (mode 0600, root). `/run` is tmpfs, so the
+credentials never reach the instance's disk or its Incus config, and they are
+gone when the VM stops; a restart re-injects them. `project-template/run-agent`
+sources the file and execs the agent.
+
+`rig` refuses an env file that other users can read, and refuses lines that are
+not `KEY=VALUE` — the first is a mistake rather than a choice, the second stops
+shell constructs reaching the guest. It makes no judgement about whether a key is
+narrowly enough scoped. That is the operator's call, and it is the one part of
+this design that tooling cannot check.
+
+`secrets/` in the repo is gitignored.
+
+The agent binary itself comes from the **project flake**
+(`pkgs.claude-code`), for the same reason the CUDA toolchain does: a project
+wanting a different version should not require a new base image.
 
 ## Immediate next steps
 
@@ -260,19 +310,28 @@ generalisation, any scheduler. The constraint is one card, one active project.
 
 | File | Purpose |
 |---|---|
-| `RUNBOOK.md` | Ordered setup procedure |
-| `gpuctl` | GPU arbitration. Stdlib Python over the Incus REST socket. |
-| `gpu` | Four-verb agent surface over `gpuctl`. Auditable at a glance, on purpose. |
-| `.claude/settings.json` | Allows `./gpu`, denies the `incus` verbs that break the invariants |
+| `CLAUDE.md` | Which tool for what, and how to start a project. Read before touching anything. |
+| `STATUS.md` | This file: state, decisions, verified Incus behaviours, open work |
+| `RUNBOOK.md` | Ordered host setup procedure |
+| `rig` | The control surface: `new/start/stop/status/claim/rm`. Auditable at a glance, on purpose. |
+| `gpuctl` | GPU arbitration + `apply`. Stdlib Python over the Incus REST socket. |
+| `.claude/settings.json` | Allows `./rig`, denies the `incus` verbs that break the invariants |
 | `hostgpu` | Move the card between host desktop and VM use |
 | `base/flake.nix` | Declarative image definition |
-| `guest/gpu-dev.nix` | Guest module: driver, agent, `gpu-present` unit, `gpu-check` |
+| `base/gpu-dev.nix` | Guest module: driver, Incus agent, `gpu-present` unit, `gpu-check` |
 | `01-build-image.sh` | Build + import the image |
 | `test-invariants.sh` | Invariant tests against real Incus |
 | `test-network-acl.sh` | Proves the isolation ACL empirically; skips, never passes, unprovable tests |
-| `project-template/flake.nix` | Per-project devShell template (CUDA toolchain) |
+| `project-template/flake.nix` | Per-project devShell: CUDA toolchain + the agent |
 | `project-template/vectoradd.cu` | GPU correctness test: poisoned buffers, bit-exact, negative control |
+| `project-template/run-agent` | Sources `/run/rig/env` and launches the unattended agent |
 | `project-template/README.md` | How to use the template, and why the toolchain is not in the image |
+| `secrets/` | Gitignored. Per-project env files holding credentials. |
+
+Removed 2026-08-24: `00-spike.sh` (phase 0, served its purpose),
+`task-network-acl-verify.md` (done; findings are in this file), `guest/` (a
+committed copy of `base/gpu-dev.nix` that a build step kept in sync — two files
+waiting to drift), `gpu` (renamed to `rig`).
 | `00-spike.sh` | Phase 0 verification. Served its purpose; kept for reference. |
 
 ## Gotchas

@@ -38,6 +38,13 @@
             cuda.cuda_cuobjdump
             cuda.cuda_nvdisasm
             pkgs.gnumake
+            pkgs.git
+
+            # The unattended agent itself, pinned by the project like every
+            # other tool. Same reasoning as the CUDA version: the base image
+            # should not need rebuilding because a project wants a different
+            # agent build. Launch it with ./run-agent.
+            pkgs.claude-code
           ];
 
           shellHook = ''

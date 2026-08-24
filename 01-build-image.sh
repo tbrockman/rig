@@ -9,7 +9,9 @@ set -euo pipefail
 ALIAS="${1:-nixos-gpu-base}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-cp "$HERE/guest/gpu-dev.nix" "$HERE/base/gpu-dev.nix"
+# The guest module lives in base/ alongside the flake that imports it. It used
+# to be kept in guest/ and copied here on every build, which meant two committed
+# copies of the same file waiting to drift apart.
 
 echo "=== building qcow2 disk (slow the first time) ==="
 DISK=$(nix build --no-link --print-out-paths \
@@ -40,10 +42,8 @@ incus image list "$ALIAS"
 cat <<EOF
 
 Smoke test:
-  incus init $ALIAS smoke --vm -c security.secureboot=false \\
-    -c limits.cpu=8 -c limits.memory=16GiB
-  export GPUCTL_PCI=0000:04:00.0
-  ./gpuctl start smoke && sleep 30
+  ./rig new smoke
+  ./rig start smoke
   incus exec smoke -- gpu-check
-  ./gpuctl stop smoke && ./gpuctl release && incus delete -f smoke
+  ./rig stop smoke && ./rig rm smoke
 EOF

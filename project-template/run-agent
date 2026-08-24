@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Launch the unattended agent inside the guest.
+#
+#   nix develop "path:." -c ./run-agent
+#
+# Credentials come from /run/rig/env, which `rig start` injects from a host file
+# at boot. /run is tmpfs, so they exist only while the VM is up and are never
+# written to the instance's disk or its Incus config.
+#
+# Scoping those credentials is the operator's job. Nothing here can tell whether
+# a key is narrow enough, and this script deliberately does not try.
+
+set -euo pipefail
+
+ENV_FILE=/run/rig/env
+
+if [ ! -r "$ENV_FILE" ]; then
+  cat >&2 <<EOF
+No credentials at $ENV_FILE.
+
+On the host:
+  printf 'ANTHROPIC_API_KEY=sk-ant-...\\n' > secrets/<project>.env
+  chmod 600 secrets/<project>.env
+  ./rig new <project> --env secrets/<project>.env     # or set it on an
+  ./rig start <project>                               # existing VM, see CLAUDE.md
+EOF
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
+: "${ANTHROPIC_API_KEY:?$ENV_FILE does not define ANTHROPIC_API_KEY}"
+
+# --dangerously-skip-permissions is the point of this VM, not a shortcut around
+# it. The agent is unattended, so there is nobody to answer a prompt; the
+# containment is the VM boundary and the network ACL, which is why it is safe
+# here and would not be on the host. Verify before trusting that:
+#   incus exec <vm> -- gpu-check          # the GPU is really attached
+#   ./test-network-acl.sh <vm>            # the guest cannot reach host or LAN
+exec claude --dangerously-skip-permissions "$@"
