@@ -34,10 +34,20 @@ set +a
 
 : "${ANTHROPIC_API_KEY:?$ENV_FILE does not define ANTHROPIC_API_KEY}"
 
+# claude refuses --dangerously-skip-permissions when it is running as root, and
+# in this guest everything is: `rig exec` and `rig shell` both land as root, and
+# the base image declares no login user besides the nixbld* build accounts. So
+# without this the launch fails on its very last line, after the whole devShell
+# has been built — which reads like a broken image and is not one.
+#
+# IS_SANDBOX is how you say "root here is not the hazard that check guards
+# against". That claim is exactly the claim below, and it is checkable.
+export IS_SANDBOX=1
+
 # --dangerously-skip-permissions is the point of this VM, not a shortcut around
 # it. The agent is unattended, so there is nobody to answer a prompt; the
 # containment is the VM boundary and the network ACL, which is why it is safe
 # here and would not be on the host. Verify before trusting that:
-#   incus exec <vm> -- gpu-check          # the GPU is really attached
-#   ./test-network-acl.sh <vm>            # the guest cannot reach host or LAN
+#   ./rig doctor <vm>     # the GPU is really attached, isolation is configured
+#   ./rig verify <vm>     # the guest really cannot reach this host or the LAN
 exec claude --dangerously-skip-permissions "$@"

@@ -65,8 +65,9 @@ Scoping the key is your call. `rig` refuses a file others can read, and refuses
 lines that are not `KEY=VALUE`, but it cannot judge whether a key is narrow
 enough.
 
-To change them on an existing VM: `incus config set <vm> user.rig.env=/abs/path`
-then `./rig restart <vm>`. `secrets/` is gitignored.
+To change them on an existing VM: `./rig restart <vm> --env secrets/other.env`.
+`start` takes `--env` too. Either one records the path on the instance, so it
+sticks — the next plain `rig start` uses it. `secrets/` is gitignored.
 
 ## Notes
 

@@ -110,6 +110,41 @@ func (a *app) requireInstance(name string) error {
 
 // --- lifecycle -----------------------------------------------------------
 
+// absEnvFile resolves and validates a --env argument. Empty in, empty out: not
+// passing --env is not an error anywhere, it just means "leave it alone".
+func absEnvFile(envFile string) (string, error) {
+	if envFile == "" {
+		return "", nil
+	}
+	abs, err := filepath.Abs(envFile)
+	if err != nil {
+		return "", err
+	}
+	if err := creds.Validate(abs); err != nil {
+		return "", err
+	}
+	return abs, nil
+}
+
+// setEnvFile points an existing instance at a credential file.
+//
+// It records the *path*, never the secret — same as `rig new --env`, and the
+// same key, so where credentials come from does not depend on which verb
+// attached them. The file is validated before it is recorded: storing a path
+// that `start` will later refuse turns a clear error into a confusing one two
+// commands later.
+func (a *app) setEnvFile(name, envFile string) error {
+	abs, err := absEnvFile(envFile)
+	if err != nil || abs == "" {
+		return err
+	}
+	if err := a.c.SetConfigKey(name, creds.InstanceKey, abs); err != nil {
+		return err
+	}
+	note("credentials for %s now come from %s", name, abs)
+	return nil
+}
+
 func (a *app) newCmd() *cobra.Command {
 	var (
 		envFile, image, memory, disk string
@@ -133,15 +168,9 @@ func (a *app) newCmd() *cobra.Command {
 				return fmt.Errorf("no such image: %s\n  Build it:  rig image build", image)
 			}
 
-			var absEnv string
-			if envFile != "" {
-				var err error
-				if absEnv, err = filepath.Abs(envFile); err != nil {
-					return err
-				}
-				if err := creds.Validate(absEnv); err != nil {
-					return err
-				}
+			absEnv, err := absEnvFile(envFile)
+			if err != nil {
+				return err
 			}
 
 			config := map[string]string{managedKey: "true"}
@@ -191,6 +220,7 @@ func (a *app) newCmd() *cobra.Command {
 
 func (a *app) startCmd() *cobra.Command {
 	var timeout time.Duration
+	var envFile string
 	var noWait, allowUnisolated bool
 	cmd := &cobra.Command{
 		Use:     "start <name>",
@@ -201,9 +231,14 @@ func (a *app) startCmd() *cobra.Command {
 			if err := a.requireInstance(args[0]); err != nil {
 				return err
 			}
+			if err := a.setEnvFile(args[0], envFile); err != nil {
+				return err
+			}
 			return a.start(args[0], timeout, !noWait, allowUnisolated)
 		},
 	}
+	cmd.Flags().StringVar(&envFile, "env", "",
+		"host file of KEY=VALUE credentials; replaces this VM's for good, not just this start")
 	cmd.Flags().DurationVar(&timeout, "timeout", 3*time.Minute, "how long to wait for the guest to come up")
 	cmd.Flags().BoolVar(&noWait, "no-wait", false, "return as soon as Incus reports it started")
 	cmd.Flags().BoolVar(&allowUnisolated, "allow-unisolated", false,
@@ -277,6 +312,7 @@ func (a *app) stopCmd() *cobra.Command {
 
 func (a *app) restartCmd() *cobra.Command {
 	var timeout time.Duration
+	var envFile string
 	cmd := &cobra.Command{
 		Use:     "restart <name>",
 		GroupID: "vm",
@@ -286,12 +322,19 @@ func (a *app) restartCmd() *cobra.Command {
 			if err := a.requireInstance(args[0]); err != nil {
 				return err
 			}
+			// Before the stop, so a bad path costs nothing: the VM is still up
+			// and the operator still has a shell in it.
+			if err := a.setEnvFile(args[0], envFile); err != nil {
+				return err
+			}
 			if err := gpu.Stop(a.c, a.cfg, args[0], int(timeout.Seconds())); err != nil {
 				return err
 			}
 			return a.startInstance(args[0], timeout, true)
 		},
 	}
+	cmd.Flags().StringVar(&envFile, "env", "",
+		"host file of KEY=VALUE credentials; replaces this VM's for good, not just this restart")
 	cmd.Flags().DurationVar(&timeout, "timeout", 3*time.Minute, "how long to wait for the guest to come up")
 	return cmd
 }
