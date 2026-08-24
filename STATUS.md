@@ -90,7 +90,12 @@ If the card moves, its PCI address changes — update `GPUCTL_PCI` and re-claim.
 - **Passthrough verified from inside the guest:** RTX 4080 SUPER, 16376 MiB,
   driver 595.71.05, CUDA 13.2. `hardware.nvidia.open = true` works on Ada.
 - `incus exec` works against the built image (agent is fine).
-- `gpuctl claim/start/stop/release` all working; `./test-invariants.sh` 7/7.
+- `gpuctl claim/start/stop/release` all working; `./test-invariants.sh` 11/11.
+- **`gpuctl` enforces network isolation as well as GPU exclusivity.** `start`
+  refuses an instance whose NIC lacks the isolation ACL (escape hatch:
+  `--allow-unisolated`), the check runs before the claim so a refusal does not
+  move the card, and `status` marks unisolated instances. The isolation is now
+  on the `default` profile too, so new instances inherit it.
 - **CUDA compute verified end to end, not just `nvidia-smi`.** `project-template`
   builds in a guest devShell and `vectoradd` reports all 4,194,304 elements
   bit-exact under two launch geometries, with the poison and negative-control
@@ -156,23 +161,20 @@ What is proven, and what is not:
   DHCP/DNS rules ahead of ACL rules). Confirmed scoped, not a hole: tcp/22 on
   the same address is blocked.
 
+Both halves of "make it non-forgettable" are now done: the three settings are on
+the `default` profile so new instances inherit them, and `gpuctl start` refuses
+an instance whose NIC lacks the ACL. Note this is the opposite of the GPU rule —
+a NIC ACL in a profile is correct; a GPU device in a profile never is.
+
 ## Immediate next steps
 
-1. **Decide how the ACL gets onto every instance.** It is currently on
-   `cuda-smoke` only, via `incus config device override`. A new instance is
-   **unisolated** until someone remembers — a silent failure of exactly the kind
-   `gpuctl` exists to prevent. Two options:
-   - put the three settings on the `default` profile's `eth0`, so every instance
-     inherits them (note this is the opposite of the GPU rule: a NIC ACL in a
-     profile is correct, a GPU device in a profile is not);
-   - have `gpuctl start` refuse an instance whose NIC lacks `vm-isolate`, which
-     fits its existing "refuse to operate on a misconfigured instance" stance.
-   Recommend both: the profile makes it work, `gpuctl` makes it non-forgettable.
-2. **ACL reconcile pass** in whatever `apply` verb gets written, since preseed
+1. **ACL reconcile pass** in whatever `apply` verb gets written, since preseed
    does not cover ACLs. It should assert the two default-action settings too —
-   the ACL object alone is not the policy.
-3. **Agent-facing wrapper**: expose only `status`, `start`, `stop`, `claim` — not
+   the ACL object alone is not the policy, as finding #4 above shows.
+2. **Agent-facing wrapper**: expose only `status`, `start`, `stop`, `claim` — not
    the 204-operation Incus MCP server.
+3. **Slot 1 diagnostic** (see Hardware) — worth doing before several projects
+   have `0000:04:00.0` baked in.
 
 ## Parked — IPv6 (do not re-investigate without new information)
 
@@ -260,6 +262,11 @@ generalisation, any scheduler. The constraint is one card, one active project.
   started VM can fail with a DNS error that means nothing. Poll for the address,
   not for the agent, before assuming the network is broken.
 - **Never put a GPU device in a profile.** Every instance would then be configured
-  to grab the same card. `gpuctl` refuses to operate if it finds one.
+  to grab the same card. `gpuctl` refuses to operate if it finds one — and it now
+  checks the profiles directly. The old check scanned instances' *expanded*
+  devices, where an instance-level `gpu0` (exactly what `gpuctl` creates) masks
+  the profile's `gpu0`, so it reported all-clear on a poisoned profile and could
+  not see one that no instance used yet. The test that covered this passed only
+  because of which way an earlier race went; it now asserts both cases.
 - **Watch root filesystem usage.** The ZFS pool file is under
   `/var/lib/incus/disks/`. A full root means write errors on a ZFS vdev.

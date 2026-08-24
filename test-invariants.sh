@@ -99,17 +99,63 @@ fi
 
 # ---------------------------------------------------------------------------
 hdr "6. a GPU in a profile is rejected outright"
+# Give gputest-a a local device named gpu0 first. This is the case that used to
+# slip through: an instance-level gpu0 masks the profile's gpu0, so scanning
+# instances' expanded devices reports all-clear. Claiming before the bad profile
+# exists also keeps the test deterministic — after test 5 the winner is a race.
+$GPUCTL claim gputest-a >/dev/null 2>&1
 incus profile create gputest-bad 2>/dev/null || true
 incus profile device add gputest-bad gpu0 gpu gputype=physical \
   pci="$GPUCTL_PCI" >/dev/null 2>&1
+
+# No instance uses the profile yet. It is still primed to misconfigure the next
+# instance created, so it must be rejected on its own.
+if $GPUCTL status >/dev/null 2>&1; then
+  fail "poisoned profile not detected while unused"
+else
+  pass "poisoned profile rejected while unused"
+fi
+
 incus profile add gputest-a gputest-bad >/dev/null 2>&1
 if $GPUCTL status >/dev/null 2>&1; then
-  fail "profile-borne GPU was not detected"
+  fail "profile-borne GPU not detected (masked by the instance's own gpu0)"
 else
-  pass "profile-borne GPU rejected"
+  pass "profile-borne GPU rejected even when masked by a local gpu0"
 fi
 incus profile remove gputest-a gputest-bad >/dev/null 2>&1 || true
 incus profile delete gputest-bad >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+hdr "7. start refuses an instance with no network isolation"
+# The ACL is expected to come from the default profile. Override the NIC onto
+# the instance and drop the ACL key to simulate someone creating an instance
+# before the profile was fixed.
+$GPUCTL release >/dev/null 2>&1
+incus config device override gputest-a eth0 >/dev/null 2>&1
+incus config device unset gputest-a eth0 security.acls >/dev/null 2>&1
+
+if $GPUCTL start gputest-a >/dev/null 2>&1; then
+  fail "start SUCCEEDED on an instance with no isolation ACL"
+else
+  pass "start refused an unisolated instance"
+fi
+
+# The isolation check runs before the claim, so a refusal must not have moved
+# the card. Otherwise a refused start still perturbs GPU ownership.
+HOLDERS=$($GPUCTL status --json | python3 -c \
+  'import json,sys; print(len(json.load(sys.stdin)["holders"]))')
+if [ "$HOLDERS" = "0" ]; then
+  pass "refused start did not claim the GPU"
+else
+  fail "refused start left the GPU attached ($HOLDERS holders)"
+fi
+
+if $GPUCTL start gputest-a --allow-unisolated >/dev/null 2>&1; then
+  pass "--allow-unisolated overrides the refusal"
+  $GPUCTL stop gputest-a >/dev/null 2>&1
+else
+  fail "--allow-unisolated did not start the instance"
+fi
 
 # ---------------------------------------------------------------------------
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"

@@ -10,6 +10,10 @@ derived from `GET /1.0/instances`. The only persistent artefact is a lock file,
 because "check then act" is a race and flock is the smallest thing that fixes
 it.
 
+It also refuses to start an instance with no network isolation, for the same
+reason: an unisolated guest reaches this host's sshd and the whole LAN, and
+nothing else notices.
+
 Verbs:
     status              show who holds the GPU
     claim   <instance>  move the GPU to <instance>
@@ -20,6 +24,7 @@ Verbs:
 Config via environment:
     GPUCTL_PCI      PCI address, e.g. 0000:04:00.0   (required for claim)
     GPUCTL_DEVICE   device name on the instance      (default: gpu0)
+    GPUCTL_ACL      required NIC isolation ACL       (default: vm-isolate)
     INCUS_SOCKET    default: /var/lib/incus/unix.socket
     GPUCTL_LOCK     default: /var/lock/gpuctl.lock
 """
@@ -37,6 +42,7 @@ SOCKET = os.environ.get("INCUS_SOCKET", "/var/lib/incus/unix.socket")
 LOCKFILE = os.environ.get("GPUCTL_LOCK", "/var/lock/gpuctl.lock")
 DEVICE = os.environ.get("GPUCTL_DEVICE", "gpu0")
 PCI = os.environ.get("GPUCTL_PCI", "")
+ACL = os.environ.get("GPUCTL_ACL", "vm-isolate")
 
 
 class Fail(Exception):
@@ -120,18 +126,67 @@ def gpu_devices(inst):
             if d.get("type") == "gpu"}
 
 
+def profiles():
+    doc, _ = api("GET", "/1.0/profiles?recursion=1")
+    return doc["metadata"]
+
+
 def check_no_profile_gpu(insts):
-    """A GPU in a profile means every instance has it. That is the double-attach
-    condition, so refuse to operate at all until it is removed."""
-    for i in insts:
-        local = i.get("devices") or {}
-        for n, d in (i.get("expanded_devices") or {}).items():
-            if d.get("type") == "gpu" and n not in local:
-                raise Fail(
-                    f"instance {i['name']!r} inherits GPU device {n!r} from a "
-                    f"profile. Remove it: a GPU in a profile means every "
-                    f"instance is configured to grab the same card."
-                )
+    """A GPU in a profile means every instance using it is configured to grab
+    the same card. That is the double-attach condition, so refuse to operate at
+    all until it is removed.
+
+    Checked against the profiles themselves rather than against instances'
+    expanded devices. An instance-level device of the same name (`gpu0`, which
+    is exactly what this tool creates) masks the profile's copy, so scanning
+    inherited devices reports all-clear while the profile stays primed to do
+    damage to the next instance created — and misses a poisoned profile that no
+    instance uses yet entirely.
+    """
+    for p in profiles():
+        gpus = sorted(n for n, d in (p.get("devices") or {}).items()
+                      if d.get("type") == "gpu")
+        if not gpus:
+            continue
+        users = sorted(i["name"] for i in insts
+                       if p["name"] in (i.get("profiles") or []))
+        used = f" Currently used by: {', '.join(users)}." if users else ""
+        raise Fail(
+            f"profile {p['name']!r} defines GPU device(s) {', '.join(gpus)}."
+            f"{used}\n"
+            f"Every instance using this profile is configured to grab the same "
+            f"card.\n"
+            f"Remove it:  incus profile device remove {p['name']} {gpus[0]}"
+        )
+
+
+def isolation_report(inst):
+    """(unisolated, no_egress) NIC names for one instance.
+
+    unisolated  the NIC does not carry the isolation ACL, so the guest can
+                reach this host and the LAN. Worth refusing to start over —
+                it is the same class of failure as the silent hot-unplug:
+                nothing looks wrong from the outside.
+    no_egress   the ACL is attached but the egress default is not `allow`.
+                Attaching any ACL makes Incus default to *reject* in both
+                directions, which turns a denylist into a blackout. Broken
+                rather than unsafe, so this only warns.
+
+    Uses expanded_devices: the ACL is expected to come from a profile. That is
+    the opposite of the GPU rule, and correct — every instance should have the
+    same NIC policy, and no instance should have the same GPU.
+    """
+    unisolated, no_egress = [], []
+    for name, dev in (inst.get("expanded_devices") or {}).items():
+        if dev.get("type") != "nic":
+            continue
+        acls = [a.strip() for a in (dev.get("security.acls") or "").split(",")
+                if a.strip()]
+        if ACL not in acls:
+            unisolated.append(name)
+        elif dev.get("security.acls.default.egress.action") != "allow":
+            no_egress.append(name)
+    return unisolated, no_egress
 
 
 def find_holders(insts):
@@ -195,7 +250,8 @@ def cmd_status(args):
     if args.json:
         print(json.dumps({
             "holders": holders,
-            "instances": [{"name": i["name"], "status": i["status"]}
+            "instances": [{"name": i["name"], "status": i["status"],
+                           "isolated": not isolation_report(i)[0]}
                           for i in insts],
         }, indent=2))
         return
@@ -215,7 +271,13 @@ def cmd_status(args):
     print()
     for i in sorted(insts, key=lambda x: x["name"]):
         mark = "*" if any(h["instance"] == i["name"] for h in holders) else " "
-        print(f" {mark} {i['name']:<20} {i['status']}")
+        unisolated, no_egress = isolation_report(i)
+        note = ""
+        if unisolated:
+            note = f"  !! NO ISOLATION on {', '.join(sorted(unisolated))}"
+        elif no_egress:
+            note = f"  !! no egress on {', '.join(sorted(no_egress))}"
+        print(f" {mark} {i['name']:<20} {i['status']:<10}{note}")
 
 
 def cmd_claim(args):
@@ -293,6 +355,30 @@ def cmd_release(args):
 
 
 def cmd_start(args):
+    # Checked before the claim so a refusal does not leave the GPU moved.
+    inst, _ = instance(args.instance)
+    unisolated, no_egress = isolation_report(inst)
+    if unisolated and not args.allow_unisolated:
+        nics = ", ".join(sorted(unisolated))
+        raise Fail(
+            f"{args.instance} has no network isolation: NIC {nics} does not "
+            f"carry the {ACL!r} ACL.\n"
+            f"An unisolated guest reaches this host's sshd on every address the "
+            f"host holds, plus the LAN and the tailnet.\n"
+            f"Fix it for every instance:\n"
+            f"  incus profile device set default eth0 security.acls={ACL} \\\n"
+            f"    security.acls.default.egress.action=allow \\\n"
+            f"    security.acls.default.ingress.action=reject\n"
+            f"Then verify:  ./test-network-acl.sh {args.instance}\n"
+            f"To start anyway:  gpuctl start --allow-unisolated "
+            f"{args.instance}"
+        )
+    for nic in sorted(no_egress):
+        print(f"warning: NIC {nic} has {ACL} attached but its egress default "
+              f"is not 'allow'. Attaching an ACL makes Incus default to "
+              f"reject, so this guest will have no internet at all.",
+              file=sys.stderr)
+
     cmd_claim(args)
     with locked():
         inst, _ = instance(args.instance)
@@ -328,6 +414,8 @@ def main():
     s.set_defaults(func=cmd_release)
 
     s = sub.add_parser("start");   s.add_argument("instance")
+    s.add_argument("--allow-unisolated", action="store_true",
+                   help="start even if the NIC has no isolation ACL")
     s.set_defaults(func=cmd_start)
 
     s = sub.add_parser("stop");    s.add_argument("instance")

@@ -251,14 +251,20 @@ is the chipset **x2** slot, not a fault. Anything much lower is worth chasing.
 
 ## Step 5 — Isolate the guest network
 
-Three settings, all on the NIC. The ACL alone is **not** the policy:
+Three settings on the NIC — the ACL alone is **not** the policy. They are on the
+`default` profile, so a new instance inherits them and this step is normally
+already done:
 
 ```bash
-incus config device override proj-foo eth0 \
+incus profile device set default eth0 \
   security.acls=vm-isolate \
   security.acls.default.egress.action=allow \
   security.acls.default.ingress.action=reject
 ```
+
+Use `incus config device override <instance> eth0 ...` with the same keys if one
+instance needs to differ. `gpuctl start` refuses an instance whose NIC has no
+ACL, so a missed one surfaces at start rather than silently.
 
 `egress.action=allow` is the one that looks wrong and is not. Attaching any ACL
 flips the NIC to **default-reject in both directions**, which turns a denylist
@@ -306,8 +312,4 @@ action is the first thing to check.
   once the rest is stable, and have it assert the two default-action settings —
   the ACL object on its own does not express the policy. Remember
   `100.64.0.0/10` for Tailscale.
-- **Getting the ACL onto every instance.** Step 5 is per-instance and easy to
-  forget, and forgetting it fails silently. Put it on the `default` profile's
-  `eth0`, and/or have `gpuctl start` refuse an instance whose NIC lacks it. Note
-  a NIC ACL in a profile is correct — unlike a GPU device, which never is.
 - **Agent-facing wrapper.** Expose only `status`, `start`, `stop`, `claim`.
