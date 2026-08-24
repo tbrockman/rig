@@ -79,6 +79,21 @@ If the card moves, its PCI address changes — update `GPUCTL_PCI` and re-claim.
    requires setting `security.acls.default.egress.action=allow` explicitly.
 5. **ACL default-action changes apply live.** Setting them on a running VM's NIC
    took effect with no restart. *Attaching* the ACL to the NIC was done stopped.
+6. **An ACL's rules cannot be edited while the ACL is attached to anything.**
+   Any rule add/remove/rewrite on an ACL with `USED BY` > 0 fails with:
+
+       Failed to run: nft -f -: flush chain inet incus acl.incusbr0
+       Error: No such file or directory; did you mean chain 'fwd.incusbr0'?
+
+   Incus flushes a chain named `acl.<bridge>` that this version never creates —
+   it uses `fwd.<bridge>`. Not a "no running instance" problem: it fails with a
+   consuming VM up, and succeeds the moment `USED BY` reaches 0. The failure is
+   clean, the ACL is left unchanged. Another one to report upstream.
+
+   Consequence for changing the policy later: do not edit `vm-isolate` in place.
+   Create `vm-isolate-v2` with the new rules, point the NIC at it, delete the
+   old one. `gpuctl apply` can create an ACL and fix NIC settings on an in-use
+   ACL, but a *rule* rewrite on one will hit this and fail loudly.
 
 ## Current state — what works
 
@@ -166,14 +181,18 @@ the `default` profile so new instances inherit them, and `gpuctl start` refuses
 an instance whose NIC lacks the ACL. Note this is the opposite of the GPU rule —
 a NIC ACL in a profile is correct; a GPU device in a profile never is.
 
+`gpuctl apply` is the reconcile pass preseed cannot do. It declares the five
+reject ranges and the three NIC keys in `gpuctl` itself, creates or rewrites the
+ACL, sets the keys on the profile NIC, and reports instances whose own NIC
+override leaves them uncovered without touching them (an override may be
+deliberate). `--dry-run` prints the diff. Exercised in both directions: create
+from nothing, and repair an ACL missing four of five ranges.
+
 ## Immediate next steps
 
-1. **ACL reconcile pass** in whatever `apply` verb gets written, since preseed
-   does not cover ACLs. It should assert the two default-action settings too —
-   the ACL object alone is not the policy, as finding #4 above shows.
-2. **Agent-facing wrapper**: expose only `status`, `start`, `stop`, `claim` — not
+1. **Agent-facing wrapper**: expose only `status`, `start`, `stop`, `claim` — not
    the 204-operation Incus MCP server.
-3. **Slot 1 diagnostic** (see Hardware) — worth doing before several projects
+2. **Slot 1 diagnostic** (see Hardware) — worth doing before several projects
    have `0000:04:00.0` baked in.
 
 ## Parked — IPv6 (do not re-investigate without new information)

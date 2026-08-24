@@ -20,11 +20,13 @@ Verbs:
     release             detach the GPU from whoever holds it
     start   <instance>  claim, then start
     stop    <instance>  stop (GPU stays attached to the stopped instance)
+    apply               reconcile the isolation ACL and the profile NIC
 
 Config via environment:
     GPUCTL_PCI      PCI address, e.g. 0000:04:00.0   (required for claim)
     GPUCTL_DEVICE   device name on the instance      (default: gpu0)
     GPUCTL_ACL      required NIC isolation ACL       (default: vm-isolate)
+    GPUCTL_PROFILE  profile `apply` reconciles       (default: default)
     INCUS_SOCKET    default: /var/lib/incus/unix.socket
     GPUCTL_LOCK     default: /var/lock/gpuctl.lock
 """
@@ -43,6 +45,36 @@ LOCKFILE = os.environ.get("GPUCTL_LOCK", "/var/lock/gpuctl.lock")
 DEVICE = os.environ.get("GPUCTL_DEVICE", "gpu0")
 PCI = os.environ.get("GPUCTL_PCI", "")
 ACL = os.environ.get("GPUCTL_ACL", "vm-isolate")
+PROFILE = os.environ.get("GPUCTL_PROFILE", "default")
+
+# --------------------------------------------------------------------------
+# Declared intent
+# --------------------------------------------------------------------------
+# `incus admin init --preseed` does not cover network_acls, so the isolation
+# policy is declared here and reconciled by `gpuctl apply`. This is the one
+# thing this tool declares rather than derives: Incus stays the source of truth
+# for state, and this is the source of truth for intent.
+
+# IPv4 only, by decision. The bridge runs ipv6.address=none because the ISP
+# delegates no prefix — read the "Parked" section of STATUS.md before adding
+# v6 rules, which need a different posture (default-deny plus an allowlist).
+ISOLATION_REJECT = [
+    "10.0.0.0/8",      # RFC1918. Includes the Incus bridge itself.
+    "172.16.0.0/12",   # RFC1918. Includes both docker bridges on this host.
+    "192.168.0.0/16",  # RFC1918. The LAN.
+    "169.254.0.0/16",  # Link-local, and every cloud metadata address.
+    "100.64.0.0/10",   # CGNAT — the Tailscale range. NOT covered by RFC1918.
+]
+
+# All three keys matter. Attaching an ACL makes Incus default to *reject* in
+# both directions, so a denylist ACL without egress.action=allow is a blackout,
+# not a denylist — and a quiet one, since the bridge resolver keeps working and
+# DNS still resolves.
+NIC_ISOLATION = {
+    "security.acls": ACL,
+    "security.acls.default.egress.action": "allow",
+    "security.acls.default.ingress.action": "reject",
+}
 
 
 class Fail(Exception):
@@ -399,6 +431,108 @@ def cmd_stop(args):
         print(f"stopped {args.instance} (GPU still attached to it)")
 
 
+def desired_acl():
+    return {
+        "name": ACL,
+        "description": "Guest isolation: public internet only (IPv4 denylist)",
+        "ingress": [],
+        "egress": [{"action": "reject", "destination": d, "state": "enabled"}
+                   for d in ISOLATION_REJECT],
+        "config": {},
+    }
+
+
+def _rule_key(rules):
+    """Order-insensitive comparison key. Incus may return rules in any order,
+    and a reordered list is not a change."""
+    return sorted(
+        (r.get("action", ""), r.get("destination", ""), r.get("source", ""),
+         r.get("protocol", ""), r.get("destination_port", ""),
+         r.get("state", "enabled"))
+        for r in rules or []
+    )
+
+
+def cmd_apply(args):
+    changes = []
+    act = not args.dry_run
+
+    # --- the ACL object --------------------------------------------------
+    listing, _ = api("GET", "/1.0/network-acls")
+    want = desired_acl()
+    if f"/1.0/network-acls/{ACL}" not in (listing.get("metadata") or []):
+        changes.append(f"create ACL {ACL!r} "
+                       f"({len(want['egress'])} egress rejects)")
+        if act:
+            wait(api("POST", "/1.0/network-acls", want)[0])
+    else:
+        doc, etag = api("GET", f"/1.0/network-acls/{ACL}")
+        cur = doc["metadata"]
+        if (_rule_key(cur.get("egress")) != _rule_key(want["egress"])
+                or _rule_key(cur.get("ingress")) != _rule_key(want["ingress"])):
+            have = {r.get("destination") for r in cur.get("egress") or []}
+            missing = [d for d in ISOLATION_REJECT if d not in have]
+            extra = sorted(have - set(ISOLATION_REJECT))
+            detail = []
+            if missing:
+                detail.append(f"missing {', '.join(missing)}")
+            if extra:
+                detail.append(f"unexpected {', '.join(str(e) for e in extra)}")
+            changes.append(f"rewrite ACL {ACL!r} rules"
+                           + (f" ({'; '.join(detail)})" if detail else ""))
+            if act:
+                wait(api("PUT", f"/1.0/network-acls/{ACL}", want, etag=etag)[0])
+
+    # --- the profile NIC -------------------------------------------------
+    doc, etag = api("GET", f"/1.0/profiles/{PROFILE}")
+    prof = doc["metadata"]
+    devices = json.loads(json.dumps(prof.get("devices") or {}))
+    nics = sorted(n for n, d in devices.items() if d.get("type") == "nic")
+    if not nics:
+        changes.append(f"WARNING: profile {PROFILE!r} has no NIC device, so "
+                       f"nothing inherits the isolation")
+    dirty = False
+    for nic in nics:
+        for key, val in NIC_ISOLATION.items():
+            if devices[nic].get(key) != val:
+                changes.append(
+                    f"profile {PROFILE}/{nic}: {key} "
+                    f"{devices[nic].get(key, '<unset>')!r} -> {val!r}")
+                devices[nic][key] = val
+                dirty = True
+    if dirty and act:
+        wait(api("PUT", f"/1.0/profiles/{PROFILE}",
+                 {"config": prof.get("config") or {},
+                  "description": prof.get("description", ""),
+                  "devices": devices}, etag=etag)[0])
+
+    # --- report ----------------------------------------------------------
+    if not changes:
+        print("already reconciled; nothing to do.")
+    else:
+        print("dry run, nothing applied:" if args.dry_run else "applied:")
+        for c in changes:
+            print(f"  {c}")
+
+    # Instance-level NIC overrides win over the profile, so reconciling the
+    # profile does not necessarily isolate everything. Those are not touched:
+    # an override may be deliberate. Report them and let a human decide.
+    stragglers = []
+    for i in instances():
+        unisolated, no_egress = isolation_report(i)
+        if unisolated:
+            stragglers.append((i["name"], "no ACL", unisolated))
+        elif no_egress:
+            stragglers.append((i["name"], "no egress", no_egress))
+    if stragglers:
+        print("\ninstances not covered (instance-level NIC overrides win over "
+              "the profile; not changed):")
+        for name, why, nics_ in stragglers:
+            print(f"  {name}: {why} on {', '.join(sorted(nics_))}")
+        print("Fix one with:  incus config device override <instance> <nic> \\")
+        print("  " + " \\\n  ".join(f"{k}={v}" for k, v in NIC_ISOLATION.items()))
+
+
 def main():
     p = argparse.ArgumentParser(prog="gpuctl", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -420,6 +554,11 @@ def main():
 
     s = sub.add_parser("stop");    s.add_argument("instance")
     s.set_defaults(func=cmd_stop)
+
+    s = sub.add_parser("apply")
+    s.add_argument("--dry-run", action="store_true",
+                   help="report what would change without changing it")
+    s.set_defaults(func=cmd_apply)
 
     args = p.parse_args()
     try:

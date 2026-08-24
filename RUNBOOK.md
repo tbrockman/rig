@@ -251,9 +251,18 @@ is the chipset **x2** slot, not a fault. Anything much lower is worth chasing.
 
 ## Step 5 — Isolate the guest network
 
-Three settings on the NIC — the ACL alone is **not** the policy. They are on the
-`default` profile, so a new instance inherits them and this step is normally
-already done:
+```bash
+./gpuctl apply --dry-run     # what would change
+./gpuctl apply               # reconcile the ACL and the profile NIC
+```
+
+`apply` declares the policy (the five reject ranges, the three NIC keys) and
+reconciles Incus to it, because `incus admin init --preseed` does not cover
+`network_acls`. It is idempotent, and it reports any instance whose own NIC
+override leaves it uncovered rather than overwriting it.
+
+The equivalent by hand — three settings on the NIC, since the ACL alone is
+**not** the policy:
 
 ```bash
 incus profile device set default eth0 \
@@ -307,9 +316,8 @@ action is the first thing to check.
   problem is card-in-slot-1 specific — then try forcing Gen4/Gen3 for that slot.
   Do this before several projects have `0000:04:00.0` baked in; if the card
   moves, update `GPUCTL_PCI` and re-`claim` each instance.
-- **ACL reconcile.** `incus admin init --preseed` does not cover `network_acls`,
-  so the ACL still gets applied by hand. Add a reconcile pass to `gpuctl apply`
-  once the rest is stable, and have it assert the two default-action settings —
-  the ACL object on its own does not express the policy. Remember
-  `100.64.0.0/10` for Tailscale.
+- **Changing the ACL rules later.** Do not edit `vm-isolate` in place: Incus
+  refuses any rule change on an ACL with `USED BY` > 0, with an `nft` error about
+  a missing `acl.incusbr0` chain. Create `vm-isolate-v2`, point the NIC at it,
+  delete the old one. See known behaviour #6 in `STATUS.md`.
 - **Agent-facing wrapper.** Expose only `status`, `start`, `stop`, `claim`.
