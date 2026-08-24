@@ -215,17 +215,37 @@ a refused claim, not merely that the claim was refused.
 ## Step 4 — Create a project
 
 ```bash
-incus copy nixos-gpu-base proj-foo --vm      # CoW clone, near-instant on zfs
+incus copy nixos-gpu-base proj-foo --vm -d root,size=40GiB   # CoW clone
 incus config set proj-foo user.project=foo
-incus config device add proj-foo work disk \
-  source=/srv/projects/foo path=/work/foo
 
 ./gpuctl start proj-foo
-incus exec proj-foo -- bash -lc 'cd /work/foo && nix develop'
+incus file push -r project-template/. proj-foo/work/foo/
+incus exec proj-foo -- bash -lc 'cd /work/foo && nix develop "path:."'
 ```
 
-Drop `project-template/flake.nix` into each project repo and pin its toolchain
-there.
+The base image carries the driver; the toolchain is per-project, in
+`project-template/flake.nix`. Copy that directory into each project repo and pin
+its CUDA version there. See `project-template/README.md`.
+
+Size the root disk explicitly. The default volume is 10 GiB and the base system
+plus a CUDA toolchain is 6.2 GiB — it fits, but not with room to work in.
+
+### Step 4.5 — Prove the GPU actually computes
+
+`gpu-check` proves the card is *attached*. It does not prove a kernel produces
+correct results. Run the real test once per new project VM:
+
+```bash
+incus exec proj-foo -- bash -lc 'cd /work/foo && nix develop "path:." -c make run'
+```
+
+Expect `PASS: 4194304 elements bit-exact under 2 launch geometries`. Exit 2 with
+"No CUDA device" means the GPU is not attached or `libcuda.so.1` is not on the
+library path — see the template's README, which explains why those two failures
+look identical and how to tell them apart.
+
+The test also prints H2D/D2H bandwidth. On this host expect ~3.1–3.3 GB/s: that
+is the chipset **x2** slot, not a fault. Anything much lower is worth chasing.
 
 ---
 

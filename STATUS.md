@@ -1,6 +1,6 @@
 # STATUS
 
-Context for picking this work up. Written 2026-08-23.
+Context for picking this work up. Written 2026-08-23, updated 2026-08-24.
 
 ## Goal
 
@@ -80,27 +80,30 @@ If the card moves, its PCI address changes — update `GPUCTL_PCI` and re-claim.
 - **Passthrough verified from inside the guest:** RTX 4080 SUPER, 16376 MiB,
   driver 595.71.05, CUDA 13.2. `hardware.nvidia.open = true` works on Ada.
 - `incus exec` works against the built image (agent is fine).
-- `gpuctl claim/start/stop/release` all working.
+- `gpuctl claim/start/stop/release` all working; `./test-invariants.sh` 7/7.
+- **CUDA compute verified end to end, not just `nvidia-smi`.** `project-template`
+  builds in a guest devShell and `vectoradd` reports all 4,194,304 elements
+  bit-exact under two launch geometries, with the poison and negative-control
+  checks passing. Measured 3.11 GB/s H2D, 3.24 GB/s D2H from inside the guest —
+  consistent with the host-side x2 measurement, so passthrough costs nothing
+  measurable on top of the narrow link.
 
 ## Immediate next steps
 
-1. **Rebuild the image** with the fixed `gpu-check` (it lacked a PATH — bare
-   `grep` failed, producing a misleading "no NVIDIA device" message).
-   `./01-build-image.sh nixos-gpu-base`, then recreate `smoke`.
-2. **Run `./test-invariants.sh nixos-gpu-base`.** Test 3 is the important one:
-   it asserts the *victim* VM is still healthy after a refused claim, not merely
-   that the claim was refused.
-3. **CUDA correctness test.** Port `vectoradd.cu` (poisoned output buffer,
-   independently computed expectations, all 4.2M elements checked) into a project
-   flake devShell and confirm bit-exact results.
-4. **Network ACL (IPv4 only).** `vm-isolate` rejecting RFC1918 +
+1. **Network ACL (IPv4 only).** `vm-isolate` rejecting RFC1918 +
    `169.254.0.0/16` **and `100.64.0.0/10`** — the Tailscale range was a real gap
    found earlier and is not covered by RFC1918. Keep bridge IPv6 disabled
    (`ipv6.address=none`); see "Parked" below.
-5. **ACL reconcile pass** in whatever `apply` verb gets written, since preseed
+2. **ACL reconcile pass** in whatever `apply` verb gets written, since preseed
    does not cover ACLs.
-6. **Agent-facing wrapper**: expose only `status`, `start`, `stop`, `claim` — not
+3. **Agent-facing wrapper**: expose only `status`, `start`, `stop`, `claim` — not
    the 204-operation Incus MCP server.
+
+Note for the ACL work: `cuda-smoke` is left in place, stopped, holding the GPU
+device. It is a ready-made subject — it has the CUDA toolchain in its store
+already, so `nix develop` there is offline-fast and will keep working once egress
+is restricted. Re-running `vectoradd` after applying the ACL is a cheap check
+that the rules did not break anything the guest actually needs.
 
 ## Parked — IPv6 (do not re-investigate without new information)
 
@@ -152,7 +155,9 @@ generalisation, any scheduler. The constraint is one card, one active project.
 | `guest/gpu-dev.nix` | Guest module: driver, agent, `gpu-present` unit, `gpu-check` |
 | `01-build-image.sh` | Build + import the image |
 | `test-invariants.sh` | Invariant tests against real Incus |
-| `project-template/flake.nix` | Per-project devShell template |
+| `project-template/flake.nix` | Per-project devShell template (CUDA toolchain) |
+| `project-template/vectoradd.cu` | GPU correctness test: poisoned buffers, bit-exact, negative control |
+| `project-template/README.md` | How to use the template, and why the toolchain is not in the image |
 | `00-spike.sh` | Phase 0 verification. Served its purpose; kept for reference. |
 
 ## Gotchas
@@ -164,6 +169,20 @@ generalisation, any scheduler. The constraint is one card, one active project.
   This bug produced a false "no NVIDIA device" report.
 - **Guest PCI address differs from host** (guest sees `06:00.0`, host `04:00.0`).
   Expected — the guest has its own PCI topology.
+- **`libcuda.so.1` comes from the driver, not the toolkit.** Nothing in
+  `cudaPackages` provides it. On NixOS it is in `/run/opengl-driver/lib`, which
+  the template's `shellHook` adds to `LD_LIBRARY_PATH`. Without it you get a
+  binary that compiles and links cleanly and then fails at runtime with
+  `cudaErrorInsufficientDriver` — which reads like a driver problem and is not.
+- **Toolkit and driver versions do not have to match.** Verified: a CUDA 12.9
+  toolkit against the guest's 13.2 driver. Drivers are backward compatible with
+  older runtimes; that is what lets the toolchain live in the project.
+- **Give project instances more than the default 10 GiB root.** The base system
+  plus a CUDA toolchain is 6.2 GiB of `/nix/store`. Use `-d root,size=40GiB`.
+- **DHCP is not up when the agent is.** `incus exec` succeeded several seconds
+  before the guest had an IPv4 address, so the first network call in a freshly
+  started VM can fail with a DNS error that means nothing. Poll for the address,
+  not for the agent, before assuming the network is broken.
 - **Never put a GPU device in a profile.** Every instance would then be configured
   to grab the same card. `gpuctl` refuses to operate if it finds one.
 - **Watch root filesystem usage.** The ZFS pool file is under
