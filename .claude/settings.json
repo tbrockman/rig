@@ -1,0 +1,44 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gpu)",
+      "Bash(./gpu *)",
+      "Bash(./gpu:*)",
+      "Bash(incus list)",
+      "Bash(incus list *)",
+      "Bash(incus list:*)",
+      "Bash(incus info *)",
+      "Bash(incus info:*)",
+      "Bash(incus exec *)",
+      "Bash(incus exec:*)",
+      "Bash(incus image list*)",
+      "Bash(incus storage info*)",
+      "Bash(incus config show *)",
+      "Bash(incus config device show *)"
+    ],
+    "deny": [
+      "Bash(incus start *)",
+      "Bash(incus start:*)",
+      "Bash(incus stop *)",
+      "Bash(incus stop:*)",
+      "Bash(incus restart *)",
+      "Bash(incus restart:*)",
+      "Bash(incus delete *)",
+      "Bash(incus delete:*)",
+      "Bash(incus config device add *)",
+      "Bash(incus config device add:*)",
+      "Bash(incus config device set *)",
+      "Bash(incus config device set:*)",
+      "Bash(incus config device unset *)",
+      "Bash(incus config device unset:*)",
+      "Bash(incus config device remove *)",
+      "Bash(incus config device remove:*)",
+      "Bash(incus config device override *)",
+      "Bash(incus config device override:*)",
+      "Bash(incus profile *)",
+      "Bash(incus profile:*)",
+      "Bash(incus network *)",
+      "Bash(incus network:*)"
+    ]
+  }
+}

@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# gpu — the whole GPU/VM control surface an agent gets. Four verbs:
+#
+#   gpu status              who holds the card, and which instances exist
+#   gpu start <instance>    claim the card and start it
+#   gpu stop <instance>     stop it (the card stays attached to it)
+#   gpu claim <instance>    move the card without starting
+#
+# Everything else is deliberately absent. Creating instances, adding devices,
+# editing profiles, touching network config, `release --force`, and
+# `start --allow-unisolated` are the operations that can break the one-card
+# invariant or quietly take a guest's network isolation off. They need a human,
+# so they are not reachable through here.
+#
+# Kept short on purpose: a wrapper whose job is to restrict a surface is only
+# worth having if you can audit it at a glance.
+#
+# Note on what this does and does not do: on its own it restricts nothing, since
+# `incus` is still on PATH. It is the allowlist/denylist in .claude/settings.json
+# that makes it the path of least resistance, and even that is a guardrail rather
+# than a sandbox — prefix-matched denials do not survive a determined
+# `bash -c`. The real boundary is the VM, not this script.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+GPUCTL="$HERE/gpuctl"
+
+die() { printf 'gpu: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+gpu — the whole GPU/VM control surface. Four verbs:
+
+  gpu status              who holds the card, and which instances exist
+  gpu start <instance>    claim the card and start it
+  gpu stop <instance>     stop it (the card stays attached to it)
+  gpu claim <instance>    move the card without starting
+
+Anything else — creating instances, adding devices, editing profiles or network
+config, forcing a release, starting an unisolated instance — needs a human and
+is not reachable through here. See RUNBOOK.md.
+EOF
+}
+
+# Instance names Incus itself accepts: letters, digits, hyphens. Anything else
+# is a mistake or an attempt to smuggle something into an argument.
+valid_name() {
+  [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}$ ]]
+}
+
+# The PCI address is not hardcoded here. gpuctl already treats Incus as the
+# source of truth, so ask it who holds the card rather than adding a second
+# place that goes stale when the card moves slots.
+resolve_pci() {
+  [ -n "${GPUCTL_PCI:-}" ] && return 0
+  GPUCTL_PCI=$("$GPUCTL" status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    holders = json.load(sys.stdin).get("holders") or []
+except Exception:
+    sys.exit(1)
+if len(holders) != 1 or holders[0].get("pci", "?") == "?":
+    sys.exit(1)
+print(holders[0]["pci"])
+') || die "cannot tell which card to use: no instance currently holds one.
+  A human needs to set it once:  export GPUCTL_PCI=0000:04:00.0"
+  export GPUCTL_PCI
+}
+
+[ -x "$GPUCTL" ] || die "$GPUCTL is missing or not executable"
+
+verb="${1:-}"
+[ $# -gt 0 ] && shift
+
+case "$verb" in
+  status)
+    [ $# -eq 0 ] || die "status takes no arguments"
+    exec "$GPUCTL" status
+    ;;
+  start|claim)
+    # Exactly one argument, so `gpu start foo --allow-unisolated` cannot leak
+    # gpuctl's escape hatch through this wrapper.
+    [ $# -eq 1 ] || die "$verb takes exactly one instance name"
+    valid_name "$1" || die "not a valid instance name: $1"
+    resolve_pci
+    exec "$GPUCTL" "$verb" "$1"
+    ;;
+  stop)
+    [ $# -eq 1 ] || die "stop takes exactly one instance name"
+    valid_name "$1" || die "not a valid instance name: $1"
+    exec "$GPUCTL" stop "$1"
+    ;;
+  ""|-h|--help|help)
+    usage
+    exit 0
+    ;;
+  *)
+    printf 'gpu: unknown verb %q\n\n' "$verb" >&2
+    usage >&2
+    exit 64
+    ;;
+esac

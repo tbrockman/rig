@@ -302,10 +302,14 @@ action is the first thing to check.
 ## Daily use
 
 ```bash
-./gpuctl status              # who has the card
-./gpuctl stop proj-foo
-./gpuctl start proj-bar      # claims + starts; refuses if foo were running
+./gpu status                 # who has the card
+./gpu stop proj-foo
+./gpu start proj-bar         # claims + starts; refuses if foo were running
 ```
+
+`gpu` is the four-verb surface and the one to reach for. `gpuctl` underneath it
+adds `release`, `apply`, `--force`, and `--allow-unisolated` — the operations
+that can break an invariant, which is exactly why they are not in `gpu`.
 
 ---
 

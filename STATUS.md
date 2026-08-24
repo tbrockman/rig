@@ -188,12 +188,34 @@ override leaves them uncovered without touching them (an override may be
 deliberate). `--dry-run` prints the diff. Exercised in both directions: create
 from nothing, and repair an ACL missing four of five ranges.
 
+## Agent surface
+
+`gpu` is the whole control surface: `status`, `start`, `stop`, `claim`. No
+`release`, no `--force`, no `apply`, no `--allow-unisolated`, and it rejects
+extra arguments so `gpu start foo --allow-unisolated` cannot leak `gpuctl`'s
+escape hatch through it. It does not hardcode the PCI address — it asks
+`gpuctl status --json` who holds the card, so there is no second place to update
+when the card moves slots.
+
+`.claude/settings.json` allows `./gpu` and denies the `incus` verbs that can
+break the one-card invariant or remove a guest's isolation (`start`, `stop`,
+`restart`, `delete`, `config device add/set/unset/remove/override`, `profile`,
+`network`), leaving `list`/`info`/`exec`/`show` usable. Each deny is written in
+both wildcard syntaxes (`incus profile *` and `incus profile:*`) because a deny
+rule that silently fails to match is worse than no rule.
+
+**Be honest about what that buys.** Deny rules are prefix matches on the command
+string. `bash -c 'incus start x'` sidesteps them, and `./test-invariants.sh`
+calls `incus init` internally without tripping anything. This makes `gpu` the
+path of least resistance and makes an invariant-breaking command an explicit act
+rather than an easy one. The actual security boundary is the VM and the network
+ACL, not this file.
+
 ## Immediate next steps
 
-1. **Agent-facing wrapper**: expose only `status`, `start`, `stop`, `claim` — not
-   the 204-operation Incus MCP server.
-2. **Slot 1 diagnostic** (see Hardware) — worth doing before several projects
-   have `0000:04:00.0` baked in.
+1. **Slot 1 diagnostic** (see Hardware) — worth doing before several projects
+   have `0000:04:00.0` baked in. Physical work: monitor on the iGPU, card in
+   slot 1, check for POST, then try forcing Gen4/Gen3.
 
 ## Parked — IPv6 (do not re-investigate without new information)
 
@@ -240,6 +262,8 @@ generalisation, any scheduler. The constraint is one card, one active project.
 |---|---|
 | `RUNBOOK.md` | Ordered setup procedure |
 | `gpuctl` | GPU arbitration. Stdlib Python over the Incus REST socket. |
+| `gpu` | Four-verb agent surface over `gpuctl`. Auditable at a glance, on purpose. |
+| `.claude/settings.json` | Allows `./gpu`, denies the `incus` verbs that break the invariants |
 | `hostgpu` | Move the card between host desktop and VM use |
 | `base/flake.nix` | Declarative image definition |
 | `guest/gpu-dev.nix` | Guest module: driver, agent, `gpu-present` unit, `gpu-check` |
