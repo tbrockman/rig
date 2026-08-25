@@ -23,6 +23,32 @@ starts or stops the desktop.
 `rig` covers the whole lifecycle, so raw `incus` should not be needed. If you
 reach for it, that is a gap in `rig` — say so rather than working around it.
 
+`rig push` will not overwrite a guest file that rig did not itself write. It
+records what it wrote (hashes, in the guest at `/var/lib/rig/push.json`) and
+refuses anything that changed underneath — naming each file, so you can look
+before deciding. Re-pushing an edited staging directory still works; that is the
+normal case and the guard is invisible to it. `--force` overrides, and is worth
+hesitating over: `/work` and `/seed` live inside the instance, so the guest's
+copy is often the only one. `rig pull --out` refuses to clobber a host file for
+the same reason. An instance created before the manifest existed has no record,
+so its first push asks for `--force` once.
+
+`rig agent` runs an unattended agent in the guest and keeps a channel to it.
+It is a systemd unit, so it outlives your shell; its session UUID is fixed and
+stored on the instance, so a crash **resumes the conversation** rather than
+restarting the brief and redoing finished work. `rig agent send` queues a
+message as a file — delivered at the next restart, and at the next turn if the
+brief tells the agent to poll it. A file, not a pipe: it survives a crash and
+neither process can hang waiting for the other. `rig agent status` and
+`rig agent log` are bounded reads, so checking often is cheap; `log` prints only
+what the agent said, not the megabytes of tool calls around it.
+
+The unit caps its own memory and sets `OOMPolicy=continue`, so a runaway child
+— a geometry sidecar, a compiler — is killed alone instead of taking the agent
+down with it. That combination is not decoration: without the cap the guest
+reaches a global OOM and the kernel picks a victim by heuristic, and without the
+policy systemd tears down the whole unit when it does.
+
 `doctor` and `verify` answer different questions. `doctor` reads configuration:
 is this VM set up right? `verify` sends real packets from inside the guest: is
 that setup actually true? Configuration has been right here while the effect was

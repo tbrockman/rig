@@ -58,6 +58,27 @@ card needs no config change.
   `verify` is something you run on a VM before handing it over. The invariants
   are something you run after changing `rig`, and they need to build states
   `rig` exists to refuse, so they are build-tagged out of `go test ./...`.
+- **`rig push` refuses to destroy guest-side work.** It hashes what it writes
+  into a manifest in the guest and refuses to overwrite anything that changed
+  since. The alternative — requiring `--force` for any overwrite — was rejected:
+  re-pushing an edited staging directory is the normal workflow, so that rule
+  would be forced off within a day and protect nothing. The distinction that
+  matters is not "does this exist" but "did anyone but rig touch it". Learned
+  the expensive way: a stale staging directory silently destroyed an unattended
+  agent's decision log, and `/work` is the only copy of anything.
+- **The unattended agent is a job, not a conversation.** `rig agent` runs it as
+  a systemd unit writing to files, and the operator pulls from those files on
+  demand — nothing streams into the operator's context by default. The session
+  UUID is fixed by rig and stored on the instance, which is what makes
+  `Restart=on-failure` correct rather than destructive: a restart resumes the
+  transcript instead of re-reading the brief from the top. Learned by losing a
+  run to an OOM and cold-restarting it, where only the agent's git discipline
+  saved the work.
+- **Transcripts live on disk, credentials on tmpfs.** These were conflated at
+  first — the whole config dir sat on `/run`, so a VM stop would have destroyed
+  every transcript and with it any chance of `--resume`. `projects/` is now a
+  symlink to `/var/lib/rig-agent/projects`; the credential still dies with the
+  VM.
 - **Credentials are env vars in a host file**, injected to tmpfs at start.
   Scoping them is the operator's job; nothing else can judge it.
 

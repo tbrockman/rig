@@ -26,6 +26,7 @@ import (
 	"rig/internal/gpu"
 	"rig/internal/incus"
 	"rig/internal/policy"
+	"rig/internal/pushguard"
 )
 
 // managedKey marks instances rig created. rm refuses anything without it, so it
@@ -68,7 +69,7 @@ func main() {
 	root.AddCommand(
 		a.newCmd(), a.startCmd(), a.stopCmd(), a.restartCmd(), a.rmCmd(),
 		a.statusCmd(), a.doctorCmd(), a.verifyCmd(), a.logsCmd(),
-		a.execCmd(), a.shellCmd(), a.pushCmd(), a.pullCmd(),
+		a.execCmd(), a.shellCmd(), a.pushCmd(), a.pullCmd(), a.agentCmd(),
 		a.claimCmd(), a.releaseCmd(), a.applyCmd(), a.imageCmd(),
 	)
 
@@ -720,6 +721,7 @@ func (a *app) shellCmd() *cobra.Command {
 
 func (a *app) pushCmd() *cobra.Command {
 	var dest string
+	var force bool
 	cmd := &cobra.Command{
 		Use:     "push <name> <src-dir>",
 		GroupID: "guest",
@@ -741,20 +743,50 @@ func (a *app) pushCmd() *cobra.Command {
 				}
 				target = path.Join("/work", filepath.Base(abs))
 			}
+			// Refuse to destroy anything rig did not itself write. /work lives
+			// inside the instance, so a clobbered guest file may have been the
+			// only copy.
+			if !force {
+				conflicts, err := pushguard.Check(a.c, name, src, target)
+				if err != nil {
+					return err
+				}
+				if len(conflicts) > 0 {
+					return pushguard.Error(conflicts, name, target)
+				}
+			}
+
 			n, err := a.c.PushDir(name, src, target)
 			if err != nil {
 				return err
 			}
+
+			// Record what we wrote, so the next push can tell our own writes
+			// from someone else's. A failure here is not fatal — the push
+			// already happened — but it must be visible, because the next push
+			// will refuse rather than clobber and that needs explaining.
+			contents, readErr := pushguard.ReadAll(src)
+			if readErr == nil {
+				readErr = pushguard.Record(a.c, name, src, target, contents)
+			}
+			if readErr != nil {
+				note("WARNING: pushed, but could not record what was written: %v", readErr)
+				note("         The next push to %s will ask for --force.", target)
+			}
+
 			note("pushed %d file(s) to %s:%s", n, name, target)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&dest, "dest", "", "guest directory (default /work/<source basename>)")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"overwrite guest files rig did not write — read them first, the guest copy may be the only one")
 	return cmd
 }
 
 func (a *app) pullCmd() *cobra.Command {
 	var out string
+	var force bool
 	cmd := &cobra.Command{
 		Use:     "pull <name> <guest-path>",
 		GroupID: "guest",
@@ -772,10 +804,18 @@ func (a *app) pullCmd() *cobra.Command {
 				_, err = os.Stdout.Write(content)
 				return err
 			}
+			// Same hazard in the other direction, and cheaper to guard: --out
+			// names one file, so an accidental overwrite is a whole host file.
+			if _, err := os.Stat(out); err == nil && !force {
+				return fmt.Errorf("%s already exists.\n"+
+					"  Look at it first, then:  rig pull --force --out %s %s %s",
+					out, out, args[0], args[1])
+			}
 			return os.WriteFile(out, content, 0o644)
 		},
 	}
 	cmd.Flags().StringVar(&out, "out", "", "write to this file instead of stdout")
+	cmd.Flags().BoolVar(&force, "force", false, "overwrite --out if it already exists")
 	return cmd
 }
 
