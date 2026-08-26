@@ -41,6 +41,7 @@ func TestSystemdRunCarriesTheSurvivalProperties(t *testing.T) {
 		{"--property=StartLimitBurst=5", "a flapping run must escalate rather than loop"},
 		{"--setenv=RIG_AGENT_SESSION=sid", "the session must be fixed so a restart resumes"},
 		{"--working-directory=/work/p", "claude scopes session lookup to the project dir"},
+		{"/root/.nix-profile/bin", "a nix-profile-installed agent is not on a transient unit's PATH"},
 	} {
 		if !strings.Contains(got, want.flag) {
 			t.Errorf("missing %s — %s", want.flag, want.why)
@@ -118,6 +119,9 @@ func TestRunnerIsEmbeddedAndPlausible(t *testing.T) {
 	for _, want := range []string{
 		"--resume", "--session-id", "RIG_AGENT_SESSION",
 		"IS_SANDBOX=1", "inbox", "projects", "last_exit",
+		// Resume must be decided from the transcript on disk, never from a
+		// marker set before claude has actually created the session.
+		"compgen -G", "$SID.jsonl",
 	} {
 		if !strings.Contains(r, want) {
 			t.Errorf("embedded runner is missing %q", want)

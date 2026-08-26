@@ -94,7 +94,12 @@ func SystemdRun(o UnitOpts) []string {
 		"--property=StartLimitBurst=" + strconv.Itoa(o.Restarts),
 		"--setenv=HOME=/root",
 		"--setenv=TERM=dumb",
-		"--setenv=PATH=/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/bin",
+		// The nix profile comes first: an agent binary installed with
+		// `nix profile install` lands there, and a transient unit does not
+		// inherit a login shell's PATH. Leaving it out fails as
+		// "failed to run command 'claude': No such file or directory",
+		// which reads like a broken image rather than a missing entry.
+		"--setenv=PATH=/root/.nix-profile/bin:/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/bin",
 		"--setenv=RIG_AGENT_WORKDIR=" + o.Workdir,
 		"--setenv=RIG_AGENT_SESSION=" + o.Session,
 		"--setenv=RIG_AGENT_TIMEOUT=" + o.Timeout,

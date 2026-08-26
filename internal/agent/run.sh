@@ -78,7 +78,18 @@ $(cat "$D/inbox")
 fi
 
 # --- resume or start ------------------------------------------------------
-if [ -f "$D/started" ]; then
+# Decide from evidence, not from a marker we set ourselves. An earlier version
+# touched a "started" file before exec'ing claude, so a launch that failed for
+# any reason — the binary not on PATH, say — left the state claiming a session
+# existed. Every later run then asked to --resume a conversation that was never
+# created and died with "No conversation found with session ID", which is a
+# self-inflicted wound that no amount of restarting can heal.
+#
+# The transcript is the evidence: claude writes one per session, and we keep
+# projects/ on disk precisely so it survives. If it is there, resume; if not,
+# start. That is self-correcting — a failed first run leaves nothing behind and
+# the next attempt simply starts cleanly.
+if compgen -G "$D/projects/*/$SID.jsonl" > /dev/null; then
   MODE=(--resume "$SID")
   RESTARTS=$(( $(cat "$D/restarts" 2>/dev/null || echo 0) + 1 ))
   echo "$RESTARTS" > "$D/restarts"
@@ -92,7 +103,6 @@ you believe you had done."
 else
   MODE=(--session-id "$SID")
   : > "$D/restarts"
-  touch "$D/started"
 fi
 
 timeout "$TIMEOUT" claude -p "$PROMPT" "${MODE[@]}" \
