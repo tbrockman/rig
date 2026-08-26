@@ -122,6 +122,8 @@ func TestRunnerIsEmbeddedAndPlausible(t *testing.T) {
 		// Resume must be decided from the transcript on disk, never from a
 		// marker set before claude has actually created the session.
 		"compgen -G", "$SID.jsonl",
+		// All three credential shapes, so none is dropped by a later tidy-up.
+		"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CREDENTIALS_B64",
 	} {
 		if !strings.Contains(r, want) {
 			t.Errorf("embedded runner is missing %q", want)

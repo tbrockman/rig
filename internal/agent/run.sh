@@ -41,11 +41,37 @@ set +a
 
 export CLAUDE_CONFIG_DIR="${RIG_AGENT_CONFIG_DIR:-/run/rig/claude}"
 install -d -m 700 "$CLAUDE_CONFIG_DIR"
-if [ -n "${CLAUDE_CREDENTIALS_B64:-}" ]; then
+# Three ways to authenticate, ordered by how well they survive an unattended
+# run. Whichever the operator supplied wins.
+#
+#   CLAUDE_CODE_OAUTH_TOKEN  long-lived, from `claude setup-token`. Preferred:
+#                            it does not expire in hours and nothing else
+#                            rotates it behind our back.
+#   ANTHROPIC_API_KEY        an API key. Same property.
+#   CLAUDE_CREDENTIALS_B64   a snapshot of ~/.claude/.credentials.json. Works,
+#                            but is FRAGILE: refreshing an OAuth session
+#                            ROTATES its refresh token, so any other consumer of
+#                            that credential — a Claude Code session on the host,
+#                            say — kills this copy the moment it refreshes. It
+#                            fails as "OAuth session expired and could not be
+#                            refreshed", and claude then rewrites the credential
+#                            file with both tokens blanked, so retrying cannot
+#                            help.
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ] \
+   && [ -z "${CLAUDE_CREDENTIALS_B64:-}" ]; then
+  echo "no credentials in $ENV_FILE. Define one of CLAUDE_CODE_OAUTH_TOKEN" >&2
+  echo "(preferred), ANTHROPIC_API_KEY, or CLAUDE_CREDENTIALS_B64." >&2
+  exit 78
+fi
+
+# Materialise the snapshot only when it is the only credential on offer: a token
+# in the environment is what claude prefers anyway, and a stale credential file
+# sitting beside one invites the refresh failure described above.
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
   printf '%s' "$CLAUDE_CREDENTIALS_B64" | base64 -d > "$CLAUDE_CONFIG_DIR/.credentials.json"
   chmod 600 "$CLAUDE_CONFIG_DIR/.credentials.json"
-  unset CLAUDE_CREDENTIALS_B64
 fi
+unset CLAUDE_CREDENTIALS_B64
 
 # Transcripts are work product, not secrets. They belong on disk, or --resume
 # has nothing to resume from after a VM stop. A directory symlink is safe where
