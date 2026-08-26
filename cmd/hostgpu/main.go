@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -123,10 +124,34 @@ func (c *conf) toDesktop() error {
 		for _, addr := range []string{c.gpuPCI, c.audioPCI} {
 			writeSysfs(sysfs(addr, "driver_override"), "\n")
 		}
+
+		// Reset before the driver loads, not after. With no driver bound this
+		// is the only moment the card can be cleared of what the guest left in
+		// it, and on Ada the GSP firmware will not boot without it.
+		fmt.Println("resetting the card...")
+		if err := resetDevice(c.gpuPCI); err != nil {
+			return fmt.Errorf("%w\n"+
+				"Without a reset the driver will bind but the adapter will not "+
+				"initialise, which looks like a working card with no display.\n"+
+				"A reboot clears it.", err)
+		}
+
 		if out := run("modprobe", "nvidia"); out != "" {
 			fmt.Println(out)
 		}
 		writeSysfs("/sys/bus/pci/drivers_probe", c.audioPCI)
+
+		// Binding is not working. Check the thing a display actually needs.
+		if !waitAdapter(c.gpuPCI, 15*time.Second) {
+			msg := fmt.Sprintf("the nvidia driver bound to %s but the adapter did "+
+				"not come up: no DRM node, so nothing will appear on DisplayPort.",
+				c.gpuPCI)
+			if why := nvrmComplaint(); why != "" {
+				msg += "\n\nThe kernel said:\n" + why
+			}
+			msg += "\n\nA reboot clears a GPU that FLR could not."
+			return fmt.Errorf("%s", msg)
+		}
 	}
 
 	fmt.Println("starting desktop...")
@@ -153,7 +178,72 @@ func (c *conf) toHeadless() error {
 
 // --- sysfs helpers -------------------------------------------------------
 
-func sysfs(pci, leaf string) string { return filepath.Join("/sys/bus/pci/devices", pci, leaf) }
+// sysfsRoot is a variable so tests can point the reset and readiness checks at
+// a fake tree. Nothing but a test ever changes it.
+var sysfsRoot = "/sys/bus/pci/devices"
+
+func sysfs(pci, leaf string) string { return filepath.Join(sysfsRoot, pci, leaf) }
+
+// resetDevice issues a function-level reset.
+//
+// This is the step whose absence cost a working display: a card handed back
+// from a guest still holds the state that guest's driver left in it, and on Ada
+// the GSP firmware will not boot on top of that. The nvidia module binds
+// anyway, so every surface-level check looks healthy — sysfs says
+// "driver: nvidia", /dev/nvidia0 exists — while RmInitAdapter has failed and
+// there is no usable adapter behind any of it.
+//
+// Must be called with no driver bound, or the reset races whatever is.
+func resetDevice(pci string) error {
+	node := sysfs(pci, "reset")
+	if _, err := os.Stat(node); err != nil {
+		return fmt.Errorf("%s has no reset node; this card cannot be reset "+
+			"without a reboot: %w", pci, err)
+	}
+	if err := os.WriteFile(node, []byte("1"), 0o200); err != nil {
+		return fmt.Errorf("resetting %s: %w", pci, err)
+	}
+	return nil
+}
+
+// adapterReady reports whether the driver actually brought the GPU up, rather
+// than merely bound to it. A DRM node is the right signal because it is exactly
+// what a display needs: no node, no DisplayPort output, whatever lspci says.
+func adapterReady(pci string) bool {
+	cards, _ := filepath.Glob(sysfs(pci, "drm/card*"))
+	return len(cards) > 0
+}
+
+// waitAdapter polls, because the DRM node appears a moment after the module
+// loads rather than with it.
+func waitAdapter(pci string, within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for {
+		if adapterReady(pci) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// nvrmComplaint returns what the kernel said about the GPU, so a failure to
+// initialise explains itself instead of leaving the operator to find it.
+func nvrmComplaint() string {
+	out := run("journalctl", "-k", "--no-pager", "--since", "-2 minutes")
+	var keep []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "NVRM:") {
+			keep = append(keep, "  "+strings.TrimSpace(line))
+		}
+	}
+	if len(keep) > 4 {
+		keep = keep[len(keep)-4:]
+	}
+	return strings.Join(keep, "\n")
+}
 
 func driver(pci string) string {
 	target, err := os.Readlink(sysfs(pci, "driver"))

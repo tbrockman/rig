@@ -18,7 +18,15 @@ invariant, so reach for it deliberately.
 
 `./hostgpu` is separate because it is the only thing that touches the host
 itself: it needs root, rebinds the card between `vfio-pci` and `nvidia`, and
-starts or stops the desktop.
+starts or stops the desktop. Reclaiming the card **resets it** before the driver
+loads, and then checks a DRM node appeared rather than trusting that the driver
+bound — see STATUS.md, behaviour 6. Both matter: without the reset the desktop
+comes back with no display, and without the check `hostgpu` says it succeeded.
+
+`rig new --no-gpu` makes a VM that never claims the card. Use it for CPU-only
+work: without it every `rig start` claims the GPU, so on a host whose desktop is
+driving that card, starting any project VM kills the display. The choice is
+recorded on the instance, so later starts honour it without the flag.
 
 `rig` covers the whole lifecycle, so raw `incus` should not be needed. If you
 reach for it, that is a gap in `rig` — say so rather than working around it.

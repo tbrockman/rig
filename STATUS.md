@@ -105,6 +105,22 @@ What remains:
    and reattaches, and refuses while a consumer is running. See
    `policy.rewriteACL`.
 
+6. **A card handed back from a guest must be reset, or the driver binds to a
+   dead adapter.** Incus does not reset on release, and the guest's driver
+   leaves state the host's cannot boot on top of. On Ada the GSP firmware
+   fails: `kgspWaitForGfwBootOk_TU102 ... (the GPU may be in a bad state and
+   may need to be reset)`, then `RmInitAdapter failed! (0x62:0x65:2028)`.
+   Everything shallow still looks healthy — `lspci` reports
+   `driver in use: nvidia`, `/dev/nvidia0` exists — while `nvidia-smi` finds no
+   devices, no DRM node appears, and the DisplayPort stays dark. The card also
+   keeps issuing DMA against the guest's old mappings: 120 `AMD-Vi
+   IO_PAGE_FAULT` events a minute until it is reset. An FLR
+   (`reset_method: flr bus`) clears all of it without a reboot. `hostgpu
+   desktop` now resets between unbind and modprobe, and verifies a DRM node
+   appears, because binding is not working. Diagnosed 2026-08-25 after the
+   first real reclaim; the fault was silent in exactly the way this project
+   exists to prevent.
+
 ## Current state
 
 - ZFS pool `fast` (loop-backed, 500 GiB, on the LUKS root, so encrypted at rest),

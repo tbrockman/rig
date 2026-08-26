@@ -288,7 +288,7 @@ func Release(c *incus.Client, cfg Config, force bool) error {
 
 // Start claims the card and starts the instance. The isolation check runs
 // before the claim so a refusal does not leave the card moved.
-func Start(c *incus.Client, cfg Config, name string, allowUnisolated bool, timeoutSec int) error {
+func Start(c *incus.Client, cfg Config, name string, allowUnisolated, withGPU bool, timeoutSec int) error {
 	inst, _, err := c.Instance(name)
 	if err != nil {
 		return err
@@ -308,14 +308,20 @@ func Start(c *incus.Client, cfg Config, name string, allowUnisolated bool, timeo
 			"no internet at all.\n", nic, cfg.ACL)
 	}
 
-	unlock, err := FileLock(cfg.Lock)
-	if err != nil {
-		return err
-	}
-	defer unlock()
+	// A VM that does not want the card must not take it. Without this every
+	// start claims the GPU, which on a host whose desktop is driving it means
+	// starting any project VM kills the display — an expensive surprise for a
+	// project that never needed the card in the first place.
+	if withGPU {
+		unlock, err := FileLock(cfg.Lock)
+		if err != nil {
+			return err
+		}
+		defer unlock()
 
-	if err := claimLocked(c, cfg, name); err != nil {
-		return err
+		if err := claimLocked(c, cfg, name); err != nil {
+			return err
+		}
 	}
 	if inst, _, err = c.Instance(name); err != nil {
 		return err

@@ -111,6 +111,13 @@ func (a *app) requireInstance(name string) error {
 
 // --- lifecycle -----------------------------------------------------------
 
+// GPUKey records whether this VM wants the card. Absent means yes, so every
+// instance created before this flag existed keeps its old behaviour.
+const gpuKey = "user.rig.gpu"
+
+// wantsGPU reports whether an instance should claim the card on start.
+func wantsGPU(inst *incus.Instance) bool { return inst.Config[gpuKey] != "false" }
+
 // absEnvFile resolves and validates a --env argument. Empty in, empty out: not
 // passing --env is not an error anywhere, it just means "leave it alone".
 func absEnvFile(envFile string) (string, error) {
@@ -150,7 +157,7 @@ func (a *app) newCmd() *cobra.Command {
 	var (
 		envFile, image, memory, disk string
 		cpus                         int
-		start                        bool
+		start, noGPU                 bool
 	)
 	cmd := &cobra.Command{
 		Use:     "new <name>",
@@ -175,6 +182,9 @@ func (a *app) newCmd() *cobra.Command {
 			}
 
 			config := map[string]string{managedKey: "true"}
+			if noGPU {
+				config[gpuKey] = "false"
+			}
 			if absEnv != "" {
 				config[creds.InstanceKey] = absEnv
 			}
@@ -198,7 +208,11 @@ func (a *app) newCmd() *cobra.Command {
 				note("         rig start will refuse it until then.")
 			}
 
-			note("created %s (image %s, %d cpus, %s, %s disk)", name, image, cpus, memory, disk)
+			gpuNote := ""
+			if noGPU {
+				gpuNote = ", no GPU"
+			}
+			note("created %s (image %s, %d cpus, %s, %s disk%s)", name, image, cpus, memory, disk, gpuNote)
 			if absEnv != "" {
 				note("credentials will be injected from %s", absEnv)
 			}
@@ -216,6 +230,8 @@ func (a *app) newCmd() *cobra.Command {
 	f.StringVar(&memory, "memory", envOr("RIG_MEMORY", "16GiB"), "RAM")
 	f.StringVar(&disk, "disk", envOr("RIG_DISK", "40GiB"), "root disk size")
 	f.BoolVar(&start, "start", false, "start it once created")
+	f.BoolVar(&noGPU, "no-gpu", false,
+		"never claim the GPU for this VM — for CPU-only work, and so starting it cannot take the card from this host's desktop")
 	return cmd
 }
 
@@ -252,7 +268,15 @@ func (a *app) startInstance(name string, timeout time.Duration, wait bool) error
 }
 
 func (a *app) start(name string, timeout time.Duration, wait, allowUnisolated bool) error {
-	if err := gpu.Start(a.c, a.cfg, name, allowUnisolated, int(timeout.Seconds())); err != nil {
+	inst, _, err := a.c.Instance(name)
+	if err != nil {
+		return err
+	}
+	withGPU := wantsGPU(inst)
+	if !withGPU {
+		note("%s is a no-gpu VM; leaving the card where it is", name)
+	}
+	if err := gpu.Start(a.c, a.cfg, name, allowUnisolated, withGPU, int(timeout.Seconds())); err != nil {
 		return err
 	}
 	if !wait {
@@ -272,7 +296,8 @@ func (a *app) start(name string, timeout time.Duration, wait, allowUnisolated bo
 		note("up at %s", addr)
 	}
 
-	inst, _, err := a.c.Instance(name)
+	// Re-read: the instance changed when it started.
+	inst, _, err = a.c.Instance(name)
 	if err != nil {
 		return err
 	}

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"rig/internal/incus"
 )
 
 func envFileAt(t *testing.T, content string, mode os.FileMode) string {
@@ -85,5 +87,32 @@ func TestAbsEnvFileRejectsAMissingFile(t *testing.T) {
 	_, err := absEnvFile(filepath.Join(t.TempDir(), "nope.env"))
 	if err == nil {
 		t.Fatal("a nonexistent env file was accepted")
+	}
+}
+
+// A VM created before --no-gpu existed has no marker, and must keep claiming
+// the card. Defaulting the other way would silently strip the GPU from every
+// existing project.
+func TestWantsGPUDefaultsToYes(t *testing.T) {
+	for name, cfg := range map[string]map[string]string{
+		"no config at all": nil,
+		"unrelated keys":   {"user.rig.env": "/x"},
+		"explicit true":    {gpuKey: "true"},
+	} {
+		if !wantsGPU(&incus.Instance{Config: cfg}) {
+			t.Errorf("%s: should claim the card", name)
+		}
+	}
+}
+
+// Only the exact marker opts out, so a typo cannot quietly disable the GPU.
+func TestWantsGPUOptsOutOnlyOnTheExactMarker(t *testing.T) {
+	if wantsGPU(&incus.Instance{Config: map[string]string{gpuKey: "false"}}) {
+		t.Error("an explicit false must not claim the card")
+	}
+	for _, v := range []string{"False", "FALSE", "0", "no", ""} {
+		if !wantsGPU(&incus.Instance{Config: map[string]string{gpuKey: v}}) {
+			t.Errorf("%q is not the marker; it must not disable the GPU", v)
+		}
 	}
 }
