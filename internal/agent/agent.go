@@ -129,6 +129,53 @@ type Status struct {
 	Events   int    // lines in events.jsonl
 }
 
+// LastError returns the most recent error the agent reported, from a tail of
+// the event stream.
+//
+// It exists because an agent that cannot authenticate looks identical to one
+// that crashed: the unit restart-loops, `last exit` is 1, and the reason is
+// buried in a megabyte of JSON. Surfacing it turns "why did it stop" into one
+// command.
+func LastError(streamJSON string) string {
+	var last string
+	for _, line := range strings.Split(streamJSON, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var ev struct {
+			Type   string   `json:"type"`
+			Errors []string `json:"errors"`
+			Result string   `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if ev.Type != "result" {
+			continue
+		}
+		if len(ev.Errors) > 0 {
+			last = ev.Errors[len(ev.Errors)-1]
+		} else if strings.Contains(strings.ToLower(ev.Result), "failed") {
+			last = ev.Result
+		}
+	}
+	return last
+}
+
+// ExplainError adds the fix to errors whose cause is not obvious from the text.
+func ExplainError(msg string) string {
+	if strings.Contains(msg, "OAuth session expired") {
+		return msg + "\n" +
+			"      The credential snapshot is stale. Refreshing an OAuth session rotates\n" +
+			"      its refresh token, so another consumer of the same credential — a\n" +
+			"      Claude Code session on the host — invalidates this copy when it\n" +
+			"      refreshes. Re-snapshot it, then `rig restart` and start again.\n" +
+			"      A token from `claude setup-token` avoids this entirely."
+	}
+	return msg
+}
+
 // AssistantText pulls the agent's own words out of a stream-json tail, dropping
 // tool calls and everything else. This is what makes reading progress cheap:
 // the raw event log is megabytes, and almost none of it is worth an operator's

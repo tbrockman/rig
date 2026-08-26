@@ -130,3 +130,43 @@ func TestRunnerIsEmbeddedAndPlausible(t *testing.T) {
 		}
 	}
 }
+
+const failedRun = `{"type":"system","subtype":"init","session_id":"abc"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}
+{"type":"result","subtype":"success","result":"Failed to authenticate: OAuth session expired and could not be refreshed","errors":["Failed to authenticate: OAuth session expired and could not be refreshed"]}`
+
+// An agent that cannot authenticate looks exactly like one that crashed: the
+// unit restart-loops and last exit is 1. The reason must be reachable without
+// knowing that events.jsonl exists.
+func TestLastErrorFindsTheReasonARunStopped(t *testing.T) {
+	got := LastError(failedRun)
+	if !strings.Contains(got, "OAuth session expired") {
+		t.Fatalf("did not surface the failure, got %q", got)
+	}
+}
+
+// A healthy run must not be reported as an error.
+func TestLastErrorIsSilentOnSuccess(t *testing.T) {
+	ok := `{"type":"result","subtype":"success","result":"done","errors":[]}`
+	if got := LastError(ok); got != "" {
+		t.Fatalf("reported an error for a clean run: %q", got)
+	}
+}
+
+// "OAuth session expired" does not say what to do, and the cause — that another
+// consumer rotated the refresh token — is not guessable from the text.
+func TestExplainErrorAddsTheCauseAndTheFix(t *testing.T) {
+	got := ExplainError("Failed to authenticate: OAuth session expired and could not be refreshed")
+	for _, want := range []string{"rotates", "rig restart", "setup-token"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("explanation should mention %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestExplainErrorLeavesOtherErrorsAlone(t *testing.T) {
+	msg := "disk full"
+	if ExplainError(msg) != msg {
+		t.Error("an error it has nothing to add to must pass through unchanged")
+	}
+}

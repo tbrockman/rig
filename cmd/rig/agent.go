@@ -198,6 +198,16 @@ func (a *app) agentStatusCmd() *cobra.Command {
 			}
 			row("queued msgs", strconv.Itoa(pending))
 
+			// Why it stopped, if it stopped badly. Reading it here means the
+			// operator does not have to know events.jsonl exists.
+			if strings.TrimSpace(active) != "active" {
+				if raw, err := a.exec(name, "tail -c 20000 "+agent.Dir+"/events.jsonl 2>/dev/null || true"); err == nil {
+					if e := agent.LastError(raw); e != "" {
+						fmt.Printf("\n  last error   %s\n", agent.ExplainError(e))
+					}
+				}
+			}
+
 			if s := get(agent.Dir + "/STATUS.md"); s != "" {
 				fmt.Printf("\n--- STATUS.md (the agent's own words) ---\n%s\n", s)
 			} else {
