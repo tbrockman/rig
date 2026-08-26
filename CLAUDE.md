@@ -57,6 +57,16 @@ down with it. That combination is not decoration: without the cap the guest
 reaches a global OOM and the kernel picks a victim by heuristic, and without the
 policy systemd tears down the whole unit when it does.
 
+`rig mount` gives you a live view of a guest directory on this host, without
+copying anything out and without opening the isolation. Every network route in
+is closed on purpose — the NIC rejects ingress, so ssh, vnc and network sshfs
+are all refused — but the Incus API socket is a unix socket, not a network path,
+which is why `rig exec` keeps working and why this can too. It needs `sshfs`
+(`nix shell nixpkgs#sshfs --command rig mount <vm>`), it blocks while it holds
+the mount, and the tree is root-owned so git wants a `safe.directory` line —
+`rig mount` prints it when the directory is a repo. Treat it as read-only:
+writing into a tree an agent is editing races that agent.
+
 `doctor` and `verify` answer different questions. `doctor` reads configuration:
 is this VM set up right? `verify` sends real packets from inside the guest: is
 that setup actually true? Configuration has been right here while the effect was

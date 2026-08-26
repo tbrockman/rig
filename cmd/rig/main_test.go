@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -114,5 +115,25 @@ func TestWantsGPUOptsOutOnlyOnTheExactMarker(t *testing.T) {
 		if !wantsGPU(&incus.Instance{Config: map[string]string{gpuKey: v}}) {
 			t.Errorf("%q is not the marker; it must not disable the GPU", v)
 		}
+	}
+}
+
+// The sshfs error has to name the fix. A bare "not found" sends the reader to
+// a search engine for a dependency they were never told about.
+func TestSshfsHintNamesBothRoutes(t *testing.T) {
+	msg := fmt.Sprintf(sshfsHint, "myvm")
+	for _, want := range []string{"nix shell nixpkgs#sshfs", "rig mount myvm", "apt install sshfs"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("hint should contain %q, got:\n%s", want, msg)
+		}
+	}
+}
+
+// Guest files are root-owned, so git refuses the tree. That failure is opaque
+// unless you have hit it before, so the path must be spelled out ready to paste.
+func TestGitSafeHintIsPasteable(t *testing.T) {
+	msg := gitSafeHint("/home/theo/dev/vm-live")
+	if !strings.Contains(msg, "git config --global --add safe.directory /home/theo/dev/vm-live") {
+		t.Errorf("hint must be a runnable command, got:\n%s", msg)
 	}
 }

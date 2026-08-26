@@ -70,6 +70,7 @@ func main() {
 		a.newCmd(), a.startCmd(), a.stopCmd(), a.restartCmd(), a.rmCmd(),
 		a.statusCmd(), a.doctorCmd(), a.verifyCmd(), a.logsCmd(),
 		a.execCmd(), a.shellCmd(), a.pushCmd(), a.pullCmd(), a.agentCmd(),
+		a.mountCmd(), a.unmountCmd(),
 		a.claimCmd(), a.releaseCmd(), a.applyCmd(), a.imageCmd(),
 	)
 
