@@ -23,6 +23,25 @@ import (
 // wraps it for the two things that are not obvious: sshfs is required and is
 // usually not installed, and git refuses a tree whose files are root-owned.
 
+// isMounted answers from /proc/mounts rather than from a command's exit code.
+// Both verbs care about the same thing — is this path a mount right now — and
+// asking the kernel is more honest than inferring it from fusermount's opinion.
+func isMounted(path string) bool {
+	b, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return false
+	}
+	// /proc/mounts escapes spaces as \040; compare against the same encoding.
+	want := strings.ReplaceAll(path, " ", `\040`)
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) > 1 && f[1] == want {
+			return true
+		}
+	}
+	return false
+}
+
 // sshfsHint is the error for a missing sshfs. It names the nix route because
 // this host has nix and installing a system package for one command is a poor
 // trade.
@@ -100,7 +119,21 @@ func (a *app) mountCmd() *cobra.Command {
 			target := name + strings.TrimSuffix(guestPath, "/")
 			c := exec.Command("incus", "file", "mount", target, abs)
 			c.Stdout, c.Stderr, c.Stdin = os.Stdout, os.Stderr, os.Stdin
-			return c.Run()
+			runErr := c.Run()
+
+			// Ctrl-C is the documented way to stop this, so it is not a
+			// failure. The interrupt reaches the whole process group, sshfs
+			// disconnects, and the command we wrapped exits non-zero — which
+			// would otherwise be reported as "Error: exit status 1" directly
+			// after telling the operator to press Ctrl-C.
+			//
+			// Judge the outcome instead of the exit code: if the path is no
+			// longer a mount, the unmount is exactly what was asked for.
+			if !isMounted(abs) {
+				note("unmounted %s", abs)
+				return nil
+			}
+			return runErr
 		},
 	}
 	cmd.Flags().StringVar(&guestPath, "guest", "/work", "directory inside the guest")
@@ -119,8 +152,14 @@ func (a *app) unmountCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			out, err := exec.Command("fusermount", "-u", abs).CombinedOutput()
-			if err != nil {
+			// Idempotent. A mount released by Ctrl-C is the normal case, and
+			// reporting fusermount's "not found in /etc/mtab" for it turns a
+			// tidy-up into something that looks broken.
+			if !isMounted(abs) {
+				note("%s is not mounted; nothing to do", abs)
+				return nil
+			}
+			if out, err := exec.Command("fusermount", "-u", abs).CombinedOutput(); err != nil {
 				return fmt.Errorf("unmounting %s: %w\n%s", abs, err, out)
 			}
 			note("unmounted %s", abs)

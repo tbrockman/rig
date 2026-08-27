@@ -137,3 +137,17 @@ func TestGitSafeHintIsPasteable(t *testing.T) {
 		t.Errorf("hint must be a runnable command, got:\n%s", msg)
 	}
 }
+
+// Ctrl-C is how `rig mount` is meant to end, so the verbs must judge the
+// outcome — is this still a mount — rather than the exit code of the command
+// they wrapped, which is non-zero for an interrupt that did exactly what was
+// asked.
+func TestIsMountedReadsProcMounts(t *testing.T) {
+	if isMounted("/definitely/not/a/mount/point/xyzzy") {
+		t.Error("reported a nonexistent path as mounted")
+	}
+	// / is always a mount on Linux; if this fails the parser is wrong.
+	if !isMounted("/") {
+		t.Error("did not recognise / as a mount; /proc/mounts parsing is broken")
+	}
+}
