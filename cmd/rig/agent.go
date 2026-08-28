@@ -42,6 +42,7 @@ func (a *app) agentCmd() *cobra.Command {
 func (a *app) agentStartCmd() *cobra.Command {
 	var promptFile, workdir, memMax, timeout string
 	var restarts int
+	var newSession bool
 	cmd := &cobra.Command{
 		Use:   "start <name>",
 		Short: "Start the unattended agent",
@@ -73,8 +74,25 @@ func (a *app) agentStartCmd() *cobra.Command {
 			// A session that already exists is resumed, not replaced. Losing a
 			// transcript to a re-run of `agent start` would be exactly the
 			// mistake this command exists to prevent.
+			//
+			// `--new-session` is the deliberate exception: a *second* mission in
+			// a VM that already earned its warm nix store and its checkout wants
+			// the machine, not the conversation. Resuming there would hand the
+			// agent a finished brief and a transcript of work it must not redo.
+			// The old transcript stays on disk under ~/.claude/projects, so this
+			// abandons a conversation rather than destroying one.
 			session := inst.Config[agent.SessionKey]
-			if session == "" {
+			switch {
+			case session != "" && newSession:
+				previous := session
+				if session, err = agent.NewSessionID(); err != nil {
+					return err
+				}
+				if err := a.c.SetConfigKey(name, agent.SessionKey, session); err != nil {
+					return err
+				}
+				note("new session %s (leaving %s on disk, unresumed)", session, previous)
+			case session == "":
 				if session, err = agent.NewSessionID(); err != nil {
 					return err
 				}
@@ -82,7 +100,7 @@ func (a *app) agentStartCmd() *cobra.Command {
 					return err
 				}
 				note("new session %s", session)
-			} else {
+			default:
 				note("resuming session %s", session)
 			}
 
@@ -119,6 +137,7 @@ func (a *app) agentStartCmd() *cobra.Command {
 	f.StringVar(&memMax, "memory-max", "80%", "systemd MemoryMax for the unit; a runaway child is killed before the guest OOMs")
 	f.StringVar(&timeout, "timeout", "6h", "kill a single agent run after this long; it restarts and resumes")
 	f.IntVar(&restarts, "max-restarts", 5, "restarts allowed per hour before systemd gives up and waits for a human")
+	f.BoolVar(&newSession, "new-session", false, "start a fresh conversation instead of resuming; for a second mission in the same VM")
 	_ = cmd.MarkFlagRequired("prompt-file")
 	return cmd
 }
@@ -142,14 +161,16 @@ func (a *app) agentSendCmd() *cobra.Command {
 			if updated != "" && !strings.HasSuffix(updated, "\n") {
 				updated += "\n"
 			}
-			updated += msg + "\n"
+			// Each message opens with a delimiter, so a message of several
+			// lines still counts as one.
+			updated += agent.Delimiter + "\n" + msg + "\n"
 			if err := a.c.Mkdir(name, agent.Dir, 0o700); err != nil {
 				return err
 			}
 			if err := a.c.WriteFile(name, agent.InboxPath, []byte(updated), 0o600); err != nil {
 				return err
 			}
-			note("queued for %s (%d message(s) pending)", name, strings.Count(updated, "\n"))
+			note("queued for %s (%d message(s) pending)", name, agent.Pending(updated))
 			return nil
 		},
 	}
@@ -191,12 +212,7 @@ func (a *app) agentStatusCmd() *cobra.Command {
 			row("restarts", strings.TrimSpace(nrestart))
 			row("last exit", get(agent.Dir+"/last_exit"))
 
-			inbox := get(agent.InboxPath)
-			pending := 0
-			if inbox != "" {
-				pending = len(strings.Split(inbox, "\n"))
-			}
-			row("queued msgs", strconv.Itoa(pending))
+			row("queued msgs", strconv.Itoa(agent.Pending(get(agent.InboxPath))))
 
 			// Why it stopped, if it stopped badly. Reading it here means the
 			// operator does not have to know events.jsonl exists.

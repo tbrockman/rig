@@ -42,6 +42,28 @@ const (
 	Unit       = "rig-agent"
 )
 
+// Delimiter opens each queued message in the inbox file.
+//
+// The inbox is plain text, appended to and read whole, so without a marker
+// there is nothing to count by but newlines — and a queued message is usually
+// several lines, which is how "one message" came to be reported as eleven. It
+// reads as a heading in the brief the agent is handed, which is where the file
+// ends up.
+const Delimiter = "--- operator message ---"
+
+// Pending counts the messages in an inbox file.
+//
+// An inbox written before delimiters existed has none, and is one message.
+func Pending(inbox string) int {
+	if strings.TrimSpace(inbox) == "" {
+		return 0
+	}
+	if n := strings.Count(inbox, Delimiter); n > 0 {
+		return n
+	}
+	return 1
+}
+
 // NewSessionID returns a UUIDv4. Claude requires a UUID for --session-id, and
 // rig generates it rather than letting the guest do it, because rig is what has
 // to remember it across a crash.

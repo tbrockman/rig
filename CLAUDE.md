@@ -46,7 +46,10 @@ It is a systemd unit, so it outlives your shell; its session UUID is fixed and
 stored on the instance, so a crash **resumes the conversation** rather than
 restarting the brief and redoing finished work. `rig agent send` queues a
 message as a file — delivered at the next restart, and at the next turn if the
-brief tells the agent to poll it. A file, not a pipe: it survives a crash and
+brief tells the agent to poll it. A second mission in the same VM wants the
+machine, not the conversation, so `start --new-session` mints a fresh UUID and
+leaves the old transcript on disk; without it the agent resumes a finished brief
+and is told to redo work it has already done. A file, not a pipe: it survives a crash and
 neither process can hang waiting for the other. `rig agent status` and
 `rig agent log` are bounded reads, so checking often is cheap; `log` prints only
 what the agent said, not the megabytes of tool calls around it.

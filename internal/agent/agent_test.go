@@ -170,3 +170,20 @@ func TestExplainErrorLeavesOtherErrorsAlone(t *testing.T) {
 		t.Error("an error it has nothing to add to must pass through unchanged")
 	}
 }
+
+func TestPendingCountsMessagesNotLines(t *testing.T) {
+	one := Delimiter + "\nline one\nline two\nline three\n"
+	if got := Pending(one); got != 1 {
+		t.Fatalf("a three-line message is one message, got %d", got)
+	}
+	if got := Pending(one + Delimiter + "\nanother\n"); got != 2 {
+		t.Fatalf("two messages, got %d", got)
+	}
+	if got := Pending(""); got != 0 {
+		t.Fatalf("an empty inbox has nothing pending, got %d", got)
+	}
+	// Written before delimiters existed: one message, not four.
+	if got := Pending("a\nb\nc\nd\n"); got != 1 {
+		t.Fatalf("a legacy inbox is one message, got %d", got)
+	}
+}
