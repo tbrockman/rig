@@ -70,6 +70,7 @@ func main() {
 		a.newCmd(), a.startCmd(), a.stopCmd(), a.restartCmd(), a.rmCmd(),
 		a.statusCmd(), a.doctorCmd(), a.verifyCmd(), a.logsCmd(),
 		a.execCmd(), a.shellCmd(), a.pushCmd(), a.pullCmd(), a.agentCmd(),
+		a.credsCmd(),
 		a.mountCmd(), a.unmountCmd(),
 		a.claimCmd(), a.releaseCmd(), a.applyCmd(), a.imageCmd(),
 	)
@@ -317,6 +318,82 @@ func (a *app) start(name string, timeout time.Duration, wait, allowUnisolated bo
 	}
 	note("injected %d credential(s) into %s (tmpfs; gone on stop)", n, creds.GuestPath)
 	return nil
+}
+
+// credsCmd re-injects credentials into a running VM.
+//
+// The gap this fills: /run/rig/env is written on start, and until now the only
+// way to change it was `rig start --env` or `rig restart --env`, both of which
+// cycle the VM. That is a heavy instrument for the failure this project hits
+// most — an OAuth snapshot going stale because something on the host refreshed
+// the session and rotated the refresh token. The credential is wrong, nothing
+// else is, and restarting the VM to fix it kills whatever the guest was doing.
+//
+// An unattended agent makes that cost concrete. It survives its own crashes by
+// design — the session UUID is fixed, so systemd restarts it and the
+// conversation resumes — but a VM restart takes the whole machine out from
+// under it mid-edit. Re-injecting leaves the running process alone: its next
+// restart sources the new file and authenticates, and if it is still working
+// on an unexpired token it never notices.
+//
+// Deliberately does not restart the agent. Re-injecting a credential and
+// deciding a running agent should be interrupted are two different judgements,
+// and this verb only makes the first.
+func (a *app) credsCmd() *cobra.Command {
+	var envFile string
+	cmd := &cobra.Command{
+		Use:     "creds <name>",
+		GroupID: "guest",
+		Short:   "Re-inject credentials into a running VM, without restarting it",
+		Long: "Writes the env file to " + creds.GuestPath + " in a running guest.\n\n" +
+			"For a credential that went stale under a VM that is otherwise fine —\n" +
+			"an OAuth snapshot invalidated by a refresh on the host, most often.\n" +
+			"Without --env the file already recorded on the instance is re-read,\n" +
+			"which is what you want after re-running a snapshot in place.\n\n" +
+			"A running agent is left alone: it picks the new credential up when it\n" +
+			"next restarts. Nothing here reads or logs the secret itself.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			name := args[0]
+			if err := a.requireInstance(name); err != nil {
+				return err
+			}
+			inst, _, err := a.c.Instance(name)
+			if err != nil {
+				return err
+			}
+			// Injecting into a stopped guest would write to a tmpfs that is
+			// about to be discarded, and report success for a credential that
+			// will not exist a moment later.
+			if inst.Status != "Running" {
+				return fmt.Errorf("%s is %s; credentials live on tmpfs and only exist while it runs.\n"+
+					"  rig start %s --env <file>", name, strings.ToLower(inst.Status), name)
+			}
+			if envFile != "" {
+				if err := a.setEnvFile(name, envFile); err != nil {
+					return err
+				}
+				if inst, _, err = a.c.Instance(name); err != nil {
+					return err
+				}
+			}
+			recorded := inst.Config[creds.InstanceKey]
+			if recorded == "" {
+				return fmt.Errorf("%s has no credential file recorded.\n"+
+					"  rig creds %s --env <file>", name, name)
+			}
+			n, err := creds.Inject(a.c, name, recorded)
+			if err != nil {
+				return err
+			}
+			note("injected %d credential(s) from %s into %s (tmpfs; gone on stop)",
+				n, recorded, creds.GuestPath)
+			note("a running agent keeps its current process; it authenticates fresh on its next restart")
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&envFile, "env", "", "credential file to record and inject; default is the one already recorded")
+	return cmd
 }
 
 func (a *app) stopCmd() *cobra.Command {

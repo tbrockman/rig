@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"rig/internal/creds"
 	"rig/internal/incus"
 )
 
@@ -149,5 +150,31 @@ func TestIsMountedReadsProcMounts(t *testing.T) {
 	// / is always a mount on Linux; if this fails the parser is wrong.
 	if !isMounted("/") {
 		t.Error("did not recognise / as a mount; /proc/mounts parsing is broken")
+	}
+}
+
+// `rig creds` exists so a stale credential does not cost a VM restart. Its
+// flags and help are the contract an operator reads under time pressure, with
+// an agent already failing to authenticate, so pin them.
+func TestCredsCmdIsWiredForTheStaleSnapshotCase(t *testing.T) {
+	c := (&app{}).credsCmd()
+
+	if c.GroupID != "guest" {
+		t.Errorf("belongs with the verbs that work inside a guest, got %q", c.GroupID)
+	}
+	f := c.Flags().Lookup("env")
+	if f == nil {
+		t.Fatal("must take --env to point at a new credential file")
+	}
+	// The default matters: after re-running a snapshot in place, the recorded
+	// path is already right and requiring --env again would be noise.
+	if f.DefValue != "" {
+		t.Errorf("--env must default to the recorded file, got %q", f.DefValue)
+	}
+	if !strings.Contains(c.Long, creds.GuestPath) {
+		t.Error("help must name where the credential lands")
+	}
+	if !strings.Contains(c.Long, "next restarts") {
+		t.Error("help must say a running agent is not interrupted — that is the point of the verb")
 	}
 }
