@@ -115,20 +115,48 @@ fi
 # projects/ on disk precisely so it survives. If it is there, resume; if not,
 # start. That is self-correcting — a failed first run leaves nothing behind and
 # the next attempt simply starts cleanly.
+#
+# Resuming is not the same as crashing, and the difference belongs in the brief.
+# rig used to count restarts in a file here, which outlived reboots, missions
+# and new sessions: a deliberate `rig agent start` after a three-day-old pair of
+# credential failures opened with "this process was restarted (restart #2), the
+# previous process exited unexpectedly", and the agent spent its first turn
+# reconciling a crash that never happened. systemd already knows — NRestarts
+# belongs to this unit invocation and is zero unless systemd itself restarted
+# us — so ask it rather than keeping a second, wronger answer.
+rm -f "$D/restarts"   # remove the counter that caused this; nothing reads it now
+
 if compgen -G "$D/projects/*/$SID.jsonl" > /dev/null; then
   MODE=(--resume "$SID")
-  RESTARTS=$(( $(cat "$D/restarts" 2>/dev/null || echo 0) + 1 ))
-  echo "$RESTARTS" > "$D/restarts"
-  PROMPT="$PROMPT
 
---- NOTE: this process was restarted (restart #$RESTARTS) ---
-The previous process exited unexpectedly. Your conversation is resumed, but any
-tool call in flight at that moment did not finish. Before doing anything else,
+  NR="$(systemctl show "${RIG_AGENT_UNIT:-rig-agent}" -p NRestarts --value 2>/dev/null)"
+  case "$NR" in ''|*[!0-9]*) NR=0 ;; esac
+
+  # Both notes ask for the same reconciliation — a tool call in flight is lost
+  # either way — but only one of them asserts a crash.
+  if [ "$NR" -gt 0 ]; then
+    PROMPT="$PROMPT
+
+--- NOTE: this process was restarted after a failure (restart #$NR) ---
+The previous process exited unexpectedly and systemd restarted it. Your
+conversation is resumed, but any tool call in flight at that moment did not
+finish. Before doing anything else, check the working tree state (git status,
+git log) and reconcile it with what you believe you had done."
+  else
+    PROMPT="$PROMPT
+
+--- NOTE: your conversation was resumed ---
+This process was started deliberately — by the operator, or by the VM booting —
+not by a crash, so treat your transcript as accurate about what you finished. A
+tool call still in flight when the previous process ended did not complete, so
 check the working tree state (git status, git log) and reconcile it with what
-you believe you had done."
+you believe you had done before continuing."
+  fi
 else
   MODE=(--session-id "$SID")
-  : > "$D/restarts"
+  # A new session inherits no history: an exit code from the mission before it
+  # would be read as this one's.
+  rm -f "$D/last_exit"
 fi
 
 timeout "$TIMEOUT" claude -p "$PROMPT" "${MODE[@]}" \

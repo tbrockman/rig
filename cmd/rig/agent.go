@@ -198,8 +198,8 @@ func (a *app) agentStatusCmd() *cobra.Command {
 				}
 				return strings.TrimSpace(string(b))
 			}
-			active, _ := a.exec(name, "systemctl is-active "+agent.Unit)
-			nrestart, _ := a.exec(name, "systemctl show "+agent.Unit+" -p NRestarts --value")
+			raw, _ := a.exec(name, agent.StatusProbe())
+			p := agent.ParseProbe(raw)
 
 			row := func(k, v string) {
 				if v == "" {
@@ -207,17 +207,38 @@ func (a *app) agentStatusCmd() *cobra.Command {
 				}
 				fmt.Printf("  %-14s %s\n", k, v)
 			}
-			row("unit", strings.TrimSpace(active))
+			row("unit", p.Active)
 			row("session", inst.Config[agent.SessionKey])
-			row("restarts", strings.TrimSpace(nrestart))
-			row("last exit", get(agent.Dir+"/last_exit"))
+			row("restarts", p.Restarts)
+
+			// last_exit is written when a run ends, and simply stays there.
+			// Printed bare next to `unit active` it reads as this run's
+			// verdict: a three-day-old 1, left by a credential failure before
+			// a reboot, sent a supervisor looking for a crash that was not
+			// happening. Say which run it belongs to, and how old it is.
+			if code := get(agent.Dir + "/last_exit"); code != "" {
+				age := ""
+				if p.Exited > 0 && p.Now > 0 {
+					age = agent.Age(p.Now - p.Exited)
+				}
+				switch {
+				case p.Started > 0 && p.Exited > 0 && p.Exited < p.Started:
+					row("last exit", fmt.Sprintf("%s (an earlier run, %s ago)", code, age))
+				case age != "":
+					row("last exit", fmt.Sprintf("%s (%s ago)", code, age))
+				default:
+					row("last exit", code)
+				}
+			} else {
+				row("last exit", "")
+			}
 
 			row("queued msgs", strconv.Itoa(agent.Pending(get(agent.InboxPath))))
 
 			// Why it stopped, if it stopped badly. Reading it here means the
 			// operator does not have to know events.jsonl exists.
-			if strings.TrimSpace(active) != "active" {
-				if raw, err := a.exec(name, "tail -c 20000 "+agent.Dir+"/events.jsonl 2>/dev/null || true"); err == nil {
+			if p.Active != "active" {
+				if raw, err := a.exec(name, agent.TailResultsCmd(20000)); err == nil {
 					if e := agent.LastError(raw); e != "" {
 						fmt.Printf("\n  last error   %s\n", agent.ExplainError(e))
 					}
@@ -249,15 +270,25 @@ func (a *app) agentLogCmd() *cobra.Command {
 			if err := a.requireInstance(name); err != nil {
 				return err
 			}
-			// Tail bytes in the guest so a huge log never crosses the wire.
-			out, err := a.exec(name,
-				"tail -c 400000 "+agent.Dir+"/events.jsonl 2>/dev/null || true")
+			// Filter and tail in the guest, so a huge log never crosses the
+			// wire and the window is spent on speech rather than on the tool
+			// output surrounding it.
+			out, err := a.exec(name, agent.TailSpeechCmd(400000))
 			if err != nil {
 				return err
 			}
+			if strings.Contains(out, agent.NoEvents) {
+				note("no event log yet — the agent has not started writing one.\n"+
+					"  rig agent status %s   # is the unit even up", name)
+				return nil
+			}
 			texts := agent.AssistantText(out, lines)
 			if len(texts) == 0 {
-				note("nothing said yet (or no events.jsonl); try: rig agent status %s", name)
+				// Now a real statement about the agent rather than about the
+				// read: the window held only assistant events, and none of
+				// them was speech.
+				note("the agent has written events but said nothing yet; it is working in tools.\n"+
+					"  rig agent status %s   # unit, restarts, and any last error", name)
 				return nil
 			}
 			for _, t := range texts {

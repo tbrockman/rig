@@ -198,6 +198,116 @@ func ExplainError(msg string) string {
 	return msg
 }
 
+// NoEvents is what the guest prints when there is no event log at all. It
+// distinguishes "the agent has not started" from "the agent has not spoken",
+// which look identical from an empty read and want different reactions.
+const NoEvents = "__rig_no_events__"
+
+// TailSpeechCmd reads the agent's own words out of the event log, filtering in
+// the guest *before* the tail rather than after it.
+//
+// Tailing raw bytes and filtering here looks equivalent and is not. A single
+// tool result — a build log, a file read — is routinely hundreds of kilobytes,
+// so a fixed byte window often holds nothing but tool traffic, and `rig agent
+// log` then reported "nothing said yet" about an agent that had been talking
+// for hours. Filtering first means the window holds only assistant events, so
+// it always spans real speech. The grep is a prefilter, not a parser:
+// AssistantText still decides what counts.
+func TailSpeechCmd(limitBytes int) string {
+	return tailCmd("assistant", limitBytes)
+}
+
+// TailResultsCmd reads the run's result events, where a failure reason lives.
+// Same reasoning as TailSpeechCmd: a crash whose last megabyte is tool output
+// would otherwise report no reason at all.
+func TailResultsCmd(limitBytes int) string {
+	return tailCmd("result", limitBytes)
+}
+
+func tailCmd(evType string, limitBytes int) string {
+	log := Dir + "/events.jsonl"
+	return fmt.Sprintf(
+		`test -s %[1]s || { echo %[2]s; exit 0; }; grep -a '"type":"%[3]s"' %[1]s | tail -c %[4]d`,
+		log, NoEvents, evType, limitBytes)
+}
+
+// Probe is the scalar half of `agent status`: what systemd knows about the
+// unit, plus the clock, in one round trip.
+type Probe struct {
+	Active   string
+	Restarts string
+	Started  int64 // unix seconds the current invocation went active
+	Now      int64 // guest clock, so ages are computed in the guest's frame
+	Exited   int64 // mtime of last_exit
+}
+
+// StatusProbe asks the guest for everything status needs that is not a file's
+// contents.
+//
+// It reports the *unit's* restart count rather than a counter rig keeps
+// itself. A file in /var/lib outlives reboots, missions and new sessions, and
+// one did: a three-day-old count of 2 was reported as the current process's
+// second restart. NRestarts belongs to this unit invocation and resets when a
+// human starts it, which is the question being asked.
+func StatusProbe() string {
+	return fmt.Sprintf(`u=%s
+echo "active=$(systemctl is-active $u 2>/dev/null)"
+echo "restarts=$(systemctl show $u -p NRestarts --value 2>/dev/null)"
+echo "started=$(date -d "$(systemctl show $u -p ActiveEnterTimestamp --value 2>/dev/null)" +%%s 2>/dev/null)"
+echo "now=$(date +%%s)"
+echo "exited=$(stat -c %%Y %s/last_exit 2>/dev/null)"`, Unit, Dir)
+}
+
+// ParseProbe reads StatusProbe's output. Anything missing stays zero: a probe
+// that could not answer must not invent a number status will present as fact.
+func ParseProbe(out string) Probe {
+	var p Probe
+	num := func(s string) int64 {
+		n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+		if err != nil {
+			return 0
+		}
+		return n
+	}
+	for _, line := range strings.Split(out, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "active":
+			p.Active = strings.TrimSpace(v)
+		case "restarts":
+			p.Restarts = strings.TrimSpace(v)
+		case "started":
+			p.Started = num(v)
+		case "now":
+			p.Now = num(v)
+		case "exited":
+			p.Exited = num(v)
+		}
+	}
+	return p
+}
+
+// Age renders a duration the way an operator reads one: coarse and short. The
+// point is never the precision, it is whether a number is from this run or from
+// last week.
+func Age(sec int64) string {
+	switch {
+	case sec < 0:
+		return ""
+	case sec < 60:
+		return fmt.Sprintf("%ds", sec)
+	case sec < 3600:
+		return fmt.Sprintf("%dm", sec/60)
+	case sec < 86400:
+		return fmt.Sprintf("%dh %dm", sec/3600, (sec%3600)/60)
+	default:
+		return fmt.Sprintf("%dd %dh", sec/86400, (sec%86400)/3600)
+	}
+}
+
 // AssistantText pulls the agent's own words out of a stream-json tail, dropping
 // tool calls and everything else. This is what makes reading progress cheap:
 // the raw event log is megabytes, and almost none of it is worth an operator's
