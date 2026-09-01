@@ -17,7 +17,7 @@ func (a *app) verifyCmd() *cobra.Command {
 	var bridge string
 
 	cmd := &cobra.Command{
-		Use:     "verify <name>",
+		Use:     "verify <vm>",
 		GroupID: "vm",
 		Short:   "Prove the isolation holds, by probing from inside the guest",
 		Long: "Sends real traffic from the guest and reports what it could and could\n" +

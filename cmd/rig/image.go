@@ -49,8 +49,11 @@ func (a *app) imageBuildCmd() *cobra.Command {
 			"The alias is retargeted only after the import succeeds, so a failed\n" +
 			"build never leaves this host without a base image.",
 		Args: cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			ref, err := flakeRef(flake)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			// RIG_FLAKE counts as naming it: the operator set it deliberately,
+			// and envOr has already folded it into the default.
+			named := cmd.Flags().Changed("flake") || os.Getenv("RIG_FLAKE") != ""
+			ref, err := flakeRef(flake, named)
 			if err != nil {
 				return err
 			}
@@ -132,12 +135,12 @@ func (a *app) imageBuildCmd() *cobra.Command {
 			}
 
 			note("VMs created from now on use this image; existing ones keep theirs")
-			note("check with:  rig doctor <name>")
+			note("check with:  rig doctor <vm>")
 			return nil
 		},
 	}
 	f := cmd.Flags()
-	f.StringVar(&flake, "flake", envOr("RIG_FLAKE", "./base"), "directory or flake ref holding the image definition")
+	f.StringVar(&flake, "flake", envOr("RIG_FLAKE", "./base"), "directory or flake ref holding the image definition (a relative path resolves against your current directory)")
 	f.StringVar(&attr, "attr", envOr("RIG_FLAKE_ATTR", "gpubase"), "nixosConfigurations attribute to build")
 	f.StringVar(&alias, "alias", envOr("RIG_IMAGE", defaultImage), "alias to point at the result")
 	f.BoolVar(&keepPrevious, "keep-previous", false, "keep the image the alias pointed at before (each is gigabytes)")
@@ -203,7 +206,14 @@ func (a *app) imageDrift(inst *incus.Instance, alias string) (drifted bool, deta
 
 // flakeRef turns a directory into a path flake ref, and passes anything that
 // already looks like a ref straight through.
-func flakeRef(in string) (string, error) {
+//
+// named says the operator chose this directory, by --flake or RIG_FLAKE. When
+// they did not, the value is the built-in "./base", which resolves against
+// whatever directory rig happens to be run from — so `rig image build` from
+// anywhere but the rig checkout failed with "no flake.nix in /somewhere/base",
+// naming a path the operator never typed. The default is the assumption worth
+// reporting, not the path it produced.
+func flakeRef(in string, named bool) (string, error) {
 	if strings.Contains(in, ":") {
 		return in, nil
 	}
@@ -212,6 +222,14 @@ func flakeRef(in string) (string, error) {
 		return "", err
 	}
 	if _, err := os.Stat(filepath.Join(abs, "flake.nix")); err != nil {
+		if !named {
+			cwd, _ := os.Getwd()
+			return "", fmt.Errorf("no flake.nix in %s.\n"+
+				"  --flake was not given, so it defaulted to %q, resolved against\n"+
+				"  your current directory (%s).\n"+
+				"  Name the image definition:  rig image build --flake /path/to/base\n"+
+				"  or set RIG_FLAKE.", abs, in, cwd)
+		}
 		return "", fmt.Errorf("no flake.nix in %s\n  Point --flake at the directory holding the image definition.", abs)
 	}
 	return "path:" + abs, nil

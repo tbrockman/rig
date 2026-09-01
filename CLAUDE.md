@@ -116,6 +116,21 @@ To change them on an existing VM: `./rig restart <vm> --env secrets/other.env`.
 `start` takes `--env` too. Either one records the path on the instance, so it
 sticks — the next plain `rig start` uses it. `secrets/` is gitignored.
 
+If the VM is **running** and only the credential is wrong — the usual case,
+since refreshing an OAuth session on this host rotates the refresh token and
+invalidates a `CLAUDE_CREDENTIALS_B64` snapshot — use
+`./rig creds <vm> secrets/myproj.env` instead. It rewrites `/run/rig/env` in
+place and stops there, so an unattended agent is not interrupted: the running
+process keeps its unexpired token, and its next restart authenticates fresh.
+Restarting the VM to fix one environment variable is the thing an agent cannot
+survive.
+
+The env file is always named, never inferred from what the instance last
+recorded, and a relative path resolves against your current directory. Verbs
+that take a VM say `<vm>`; `rig` does not assume it was run from this
+directory, so the only thing tying a command to this checkout is a path you
+type.
+
 ## Notes
 
 `.claude/settings.json` allowlists `./rig` so routine work does not prompt. It is

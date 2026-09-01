@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+
 	"rig/internal/creds"
 	"rig/internal/incus"
 )
@@ -154,27 +156,88 @@ func TestIsMountedReadsProcMounts(t *testing.T) {
 }
 
 // `rig creds` exists so a stale credential does not cost a VM restart. Its
-// flags and help are the contract an operator reads under time pressure, with
-// an agent already failing to authenticate, so pin them.
+// signature and help are the contract an operator reads under time pressure,
+// with an agent already failing to authenticate, so pin them.
 func TestCredsCmdIsWiredForTheStaleSnapshotCase(t *testing.T) {
 	c := (&app{}).credsCmd()
 
 	if c.GroupID != "guest" {
 		t.Errorf("belongs with the verbs that work inside a guest, got %q", c.GroupID)
 	}
-	f := c.Flags().Lookup("env")
-	if f == nil {
-		t.Fatal("must take --env to point at a new credential file")
+	// The credential file is an argument, not a flag over a remembered path.
+	// Defaulting to whatever the instance had recorded meant the command named
+	// neither the file it read nor the directory it read it from.
+	if err := c.Args(c, []string{"vm"}); err == nil {
+		t.Error("must refuse a bare VM name: the credential file has to be named")
 	}
-	// The default matters: after re-running a snapshot in place, the recorded
-	// path is already right and requiring --env again would be noise.
-	if f.DefValue != "" {
-		t.Errorf("--env must default to the recorded file, got %q", f.DefValue)
+	if err := c.Args(c, []string{"vm", "creds.env"}); err != nil {
+		t.Errorf("must accept <vm> <env-file>: %v", err)
+	}
+	if c.Flags().Lookup("env") != nil {
+		t.Error("--env must be gone; the file is a positional argument now")
+	}
+	if !strings.Contains(c.Use, "<vm>") || !strings.Contains(c.Use, "<env-file>") {
+		t.Errorf("usage must name both operands, got %q", c.Use)
 	}
 	if !strings.Contains(c.Long, creds.GuestPath) {
 		t.Error("help must name where the credential lands")
 	}
 	if !strings.Contains(c.Long, "next restarts") {
 		t.Error("help must say a running agent is not interrupted — that is the point of the verb")
+	}
+	if !strings.Contains(c.Long, "current directory") {
+		t.Error("help must say what a relative path resolves against")
+	}
+}
+
+// Every verb that takes a VM says so. `<name>` reads like a free-form label —
+// an instance name is the one thing all of these share, and the placeholder is
+// where an operator learns it.
+func TestVerbsNameTheirVMOperand(t *testing.T) {
+	a := &app{}
+	for _, c := range []*cobra.Command{
+		a.newCmd(), a.startCmd(), a.stopCmd(), a.restartCmd(), a.rmCmd(),
+		a.doctorCmd(), a.verifyCmd(), a.logsCmd(), a.execCmd(), a.shellCmd(),
+		a.pushCmd(), a.pullCmd(), a.credsCmd(), a.mountCmd(), a.claimCmd(),
+	} {
+		if strings.Contains(c.Use, "<name>") {
+			t.Errorf("%q still says <name>; an operand that is a VM should say <vm>", c.Use)
+		}
+	}
+}
+
+// The default --flake is relative, so `rig image build` outside the rig
+// checkout resolved a path the operator never typed. The error has to name the
+// assumption, not just the path it produced.
+func TestFlakeRefExplainsTheDefaultItAssumed(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "base")
+
+	_, err := flakeRef(missing, false)
+	if err == nil {
+		t.Fatal("a directory with no flake.nix must be an error")
+	}
+	for _, want := range []string{"--flake", "current directory", "RIG_FLAKE"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("an unnamed default must explain %q; got: %v", want, err)
+		}
+	}
+
+	// When the operator named it, the path is the whole story.
+	_, err = flakeRef(missing, true)
+	if err == nil {
+		t.Fatal("a named directory with no flake.nix is still an error")
+	}
+	if strings.Contains(err.Error(), "defaulted to") {
+		t.Errorf("a named --flake must not be reported as a default: %v", err)
+	}
+}
+
+// A flake ref is passed through untouched: it is not a path and must not be
+// resolved against the current directory.
+func TestFlakeRefPassesAReferenceThrough(t *testing.T) {
+	got, err := flakeRef("github:owner/repo", false)
+	if err != nil || got != "github:owner/repo" {
+		t.Errorf("flake refs go through unchanged, got %q (%v)", got, err)
 	}
 }

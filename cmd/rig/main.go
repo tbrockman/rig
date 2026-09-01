@@ -162,7 +162,7 @@ func (a *app) newCmd() *cobra.Command {
 		start, noGPU                 bool
 	)
 	cmd := &cobra.Command{
-		Use:     "new <name>",
+		Use:     "new <vm>",
 		GroupID: "vm",
 		Short:   "Create a project VM (isolated, GPU-ready)",
 		Args:    cobra.ExactArgs(1),
@@ -242,7 +242,7 @@ func (a *app) startCmd() *cobra.Command {
 	var envFile string
 	var noWait, allowUnisolated bool
 	cmd := &cobra.Command{
-		Use:     "start <name>",
+		Use:     "start <vm>",
 		Short:   "Claim the card, start the VM, inject credentials",
 		GroupID: "vm",
 		Args:    cobra.ExactArgs(1),
@@ -339,23 +339,40 @@ func (a *app) start(name string, timeout time.Duration, wait, allowUnisolated bo
 // Deliberately does not restart the agent. Re-injecting a credential and
 // deciding a running agent should be interrupted are two different judgements,
 // and this verb only makes the first.
+//
+// The credential file is a required argument rather than an optional flag over
+// a remembered path. Injecting a secret is not the place to guess: the first
+// version defaulted to whatever `user.rig.env` happened to hold, so
+// `rig creds <vm>` named neither the file it read nor the directory it read it
+// from, and would cheerfully report success for a path recorded weeks earlier
+// by someone else. Naming the file costs one word and makes the command say
+// what it did.
 func (a *app) credsCmd() *cobra.Command {
-	var envFile string
 	cmd := &cobra.Command{
-		Use:     "creds <name>",
+		Use:     "creds <vm> <env-file>",
 		GroupID: "guest",
 		Short:   "Re-inject credentials into a running VM, without restarting it",
-		Long: "Writes the env file to " + creds.GuestPath + " in a running guest.\n\n" +
+		Long: "Writes <env-file> to " + creds.GuestPath + " in a running guest, and\n" +
+			"records the path for later starts.\n\n" +
 			"For a credential that went stale under a VM that is otherwise fine —\n" +
-			"an OAuth snapshot invalidated by a refresh on the host, most often.\n" +
-			"Without --env the file already recorded on the instance is re-read,\n" +
-			"which is what you want after re-running a snapshot in place.\n\n" +
+			"an OAuth snapshot invalidated by a refresh on the host, most often.\n\n" +
+			"The file is named explicitly, never inferred from what the instance\n" +
+			"already had recorded: injecting a secret is not a place to guess. A\n" +
+			"relative path resolves against your current directory, and the\n" +
+			"absolute path is what gets recorded and printed.\n\n" +
 			"A running agent is left alone: it picks the new credential up when it\n" +
 			"next restarts. Nothing here reads or logs the secret itself.",
-		Args: cobra.ExactArgs(1),
+		Args: cobra.ExactArgs(2),
 		RunE: func(_ *cobra.Command, args []string) error {
-			name := args[0]
+			name, envFile := args[0], args[1]
 			if err := a.requireInstance(name); err != nil {
+				return err
+			}
+			// Resolve and validate before touching the instance, so a typo in
+			// the path is one clear error rather than a recorded value that
+			// the next `rig start` will choke on.
+			abs, err := absEnvFile(envFile)
+			if err != nil {
 				return err
 			}
 			inst, _, err := a.c.Instance(name)
@@ -367,39 +384,28 @@ func (a *app) credsCmd() *cobra.Command {
 			// will not exist a moment later.
 			if inst.Status != "Running" {
 				return fmt.Errorf("%s is %s; credentials live on tmpfs and only exist while it runs.\n"+
-					"  rig start %s --env <file>", name, strings.ToLower(inst.Status), name)
+					"  rig start %s --env %s", name, strings.ToLower(inst.Status), name, envFile)
 			}
-			if envFile != "" {
-				if err := a.setEnvFile(name, envFile); err != nil {
-					return err
-				}
-				if inst, _, err = a.c.Instance(name); err != nil {
-					return err
-				}
+			if err := a.setEnvFile(name, envFile); err != nil {
+				return err
 			}
-			recorded := inst.Config[creds.InstanceKey]
-			if recorded == "" {
-				return fmt.Errorf("%s has no credential file recorded.\n"+
-					"  rig creds %s --env <file>", name, name)
-			}
-			n, err := creds.Inject(a.c, name, recorded)
+			n, err := creds.Inject(a.c, name, abs)
 			if err != nil {
 				return err
 			}
 			note("injected %d credential(s) from %s into %s (tmpfs; gone on stop)",
-				n, recorded, creds.GuestPath)
+				n, abs, creds.GuestPath)
 			note("a running agent keeps its current process; it authenticates fresh on its next restart")
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&envFile, "env", "", "credential file to record and inject; default is the one already recorded")
 	return cmd
 }
 
 func (a *app) stopCmd() *cobra.Command {
 	var timeout time.Duration
 	cmd := &cobra.Command{
-		Use:     "stop <name>",
+		Use:     "stop <vm>",
 		GroupID: "vm",
 		Short:   "Stop the VM (the card stays attached to it)",
 		Args:    cobra.ExactArgs(1),
@@ -418,7 +424,7 @@ func (a *app) restartCmd() *cobra.Command {
 	var timeout time.Duration
 	var envFile string
 	cmd := &cobra.Command{
-		Use:     "restart <name>",
+		Use:     "restart <vm>",
 		GroupID: "vm",
 		Short:   "Stop and start, re-injecting credentials",
 		Args:    cobra.ExactArgs(1),
@@ -447,7 +453,7 @@ func (a *app) restartCmd() *cobra.Command {
 
 func (a *app) claimCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:     "claim <name>",
+		Use:     "claim <vm>",
 		Short:   "Move the card to a stopped VM without starting it",
 		GroupID: "card",
 		Args:    cobra.ExactArgs(1),
@@ -541,7 +547,7 @@ func (a *app) applyCmd() *cobra.Command {
 func (a *app) rmCmd() *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
-		Use:     "rm <name>",
+		Use:     "rm <vm>",
 		GroupID: "vm",
 		Short:   "Delete a stopped VM that rig created",
 		Args:    cobra.ExactArgs(1),
@@ -667,7 +673,7 @@ func (a *app) statusCmd() *cobra.Command {
 func (a *app) doctorCmd() *cobra.Command {
 	var image string
 	cmd := &cobra.Command{
-		Use:     "doctor <name>",
+		Use:     "doctor <vm>",
 		GroupID: "vm",
 		Short:   "Check a VM is what you think it is",
 		Long: "Reads configuration and asks the guest a few questions. It reports\n" +
@@ -754,7 +760,7 @@ func (a *app) doctorCmd() *cobra.Command {
 
 func (a *app) logsCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:     "logs <name>",
+		Use:     "logs <vm>",
 		GroupID: "vm",
 		Short:   "Console log, for when a VM never comes up",
 		Args:    cobra.ExactArgs(1),
@@ -779,7 +785,7 @@ func (a *app) execCmd() *cobra.Command {
 	var stdin bool
 	var timeout time.Duration
 	cmd := &cobra.Command{
-		Use:     "exec <name> <command>...",
+		Use:     "exec <vm> <command>...",
 		GroupID: "guest",
 		Short:   "Run a command in the guest",
 		Long: "Run a command in the guest through a login shell, so the guest's own\n" +
@@ -809,7 +815,7 @@ func (a *app) execCmd() *cobra.Command {
 
 func (a *app) shellCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:     "shell <name>",
+		Use:     "shell <vm>",
 		GroupID: "guest",
 		Short:   "Interactive login shell in the guest",
 		Args:    cobra.ExactArgs(1),
@@ -826,7 +832,7 @@ func (a *app) pushCmd() *cobra.Command {
 	var dest string
 	var force bool
 	cmd := &cobra.Command{
-		Use:     "push <name> <src-dir>",
+		Use:     "push <vm> <src-dir>",
 		GroupID: "guest",
 		Short:   "Copy a host directory's contents into the guest",
 		Long: "Copies the *contents* of <src-dir> to <dest>, which defaults to\n" +
@@ -891,7 +897,7 @@ func (a *app) pullCmd() *cobra.Command {
 	var out string
 	var force bool
 	cmd := &cobra.Command{
-		Use:     "pull <name> <guest-path>",
+		Use:     "pull <vm> <guest-path>",
 		GroupID: "guest",
 		Short:   "Read a file out of the guest",
 		Args:    cobra.ExactArgs(2),

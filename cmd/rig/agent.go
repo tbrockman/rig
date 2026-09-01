@@ -44,7 +44,7 @@ func (a *app) agentStartCmd() *cobra.Command {
 	var restarts int
 	var newSession bool
 	cmd := &cobra.Command{
-		Use:   "start <name>",
+		Use:   "start <vm>",
 		Short: "Start the unattended agent",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -58,7 +58,7 @@ func (a *app) agentStartCmd() *cobra.Command {
 			}
 			if inst.Config[creds.InstanceKey] == "" {
 				return fmt.Errorf("%s has no credential file.\n"+
-					"  rig start %s --env <file>   # or rig restart --env", name, name)
+					"  rig start %s --env <env-file>   # or rig restart --env", name, name)
 			}
 			if out, _ := a.exec(name, "systemctl is-active "+agent.Unit); strings.TrimSpace(out) == "active" {
 				return fmt.Errorf("%s is already running on %s.\n"+
@@ -144,7 +144,7 @@ func (a *app) agentStartCmd() *cobra.Command {
 
 func (a *app) agentSendCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "send <name> <message>...",
+		Use:   "send <vm> <message>...",
 		Short: "Queue a message for the agent",
 		Long: "Appends to a file in the guest. The agent picks it up at its next turn\n" +
 			"if it is polling, and unconditionally on its next restart. Nothing is\n" +
@@ -179,7 +179,7 @@ func (a *app) agentSendCmd() *cobra.Command {
 
 func (a *app) agentStatusCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "status <name>",
+		Use:   "status <vm>",
 		Short: "Is it alive, how many times has it crashed, what does it say",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -259,7 +259,7 @@ func (a *app) agentStatusCmd() *cobra.Command {
 func (a *app) agentLogCmd() *cobra.Command {
 	var lines int
 	cmd := &cobra.Command{
-		Use:   "log <name>",
+		Use:   "log <vm>",
 		Short: "The agent's recent words, without the tool-call noise",
 		Long: "Reads a bounded tail of the event stream and prints only what the agent\n" +
 			"said. The raw log is megabytes of tool calls; this is the part worth an\n" +
@@ -303,7 +303,7 @@ func (a *app) agentLogCmd() *cobra.Command {
 
 func (a *app) agentStopCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "stop <name>",
+		Use:   "stop <vm>",
 		Short: "Stop the agent (its session is kept, so it can be resumed)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {

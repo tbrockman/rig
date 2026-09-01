@@ -173,6 +173,6 @@ func Error(conflicts []Conflict, instance, guestDir string) error {
 	b.WriteString("\nRead them before you decide — /work exists only inside the instance,\n")
 	b.WriteString("so the guest's copy may be the only one.\n")
 	fmt.Fprintf(&b, "  rig pull %s %s\n      # look first\n", instance, conflicts[0].GuestPath)
-	b.WriteString("  rig push --force <name> <src-dir>\n      # then overwrite deliberately")
+	b.WriteString("  rig push --force <vm> <src-dir>\n      # then overwrite deliberately")
 	return fmt.Errorf("%s", b.String())
 }

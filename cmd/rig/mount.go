@@ -64,7 +64,7 @@ func gitSafeHint(at string) string {
 func (a *app) mountCmd() *cobra.Command {
 	var guestPath, at string
 	cmd := &cobra.Command{
-		Use:     "mount <name>",
+		Use:     "mount <vm>",
 		GroupID: "guest",
 		Short:   "Mount a guest directory on this host, live",
 		Long: "Mounts a directory from the guest onto the host over the Incus API\n" +
@@ -137,7 +137,7 @@ func (a *app) mountCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&guestPath, "guest", "/work", "directory inside the guest")
-	cmd.Flags().StringVar(&at, "at", "", "host directory to mount onto (default ./<name>-live)")
+	cmd.Flags().StringVar(&at, "at", "", "host directory to mount onto (default ./<vm>-live, relative to your current directory)")
 	return cmd
 }
 
