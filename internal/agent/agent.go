@@ -166,9 +166,10 @@ func LastError(streamJSON string) string {
 			continue
 		}
 		var ev struct {
-			Type   string   `json:"type"`
-			Errors []string `json:"errors"`
-			Result string   `json:"result"`
+			Type    string   `json:"type"`
+			IsError bool     `json:"is_error"`
+			Errors  []string `json:"errors"`
+			Result  string   `json:"result"`
 		}
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
 			continue
@@ -176,10 +177,25 @@ func LastError(streamJSON string) string {
 		if ev.Type != "result" {
 			continue
 		}
-		if len(ev.Errors) > 0 {
+		// Whether a run failed is a field, not a word in its prose. This used
+		// to fall back to searching the result text for "failed", which read a
+		// successful mission's own summary — "a diagnosis that a fix failed to
+		// confirm" — and presented it to the operator under "last error". The
+		// run had is_error false and subtype success.
+		//
+		// errors[] is still checked first and independently: the OAuth failure
+		// this function exists for arrives with subtype "success" and a
+		// populated errors[], so trusting is_error alone would miss it.
+		switch {
+		case len(ev.Errors) > 0:
 			last = ev.Errors[len(ev.Errors)-1]
-		} else if strings.Contains(strings.ToLower(ev.Result), "failed") {
+		case ev.IsError:
 			last = ev.Result
+		default:
+			// A clean result is the end of the story: an error from a run that
+			// was later retried successfully is history, not the reason this
+			// one stopped.
+			last = ""
 		}
 	}
 	return last

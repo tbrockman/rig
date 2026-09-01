@@ -274,3 +274,32 @@ func TestRunnerTakesItsRestartCountFromSystemd(t *testing.T) {
 		t.Error("both resume notes must ask the agent to reconcile its tree")
 	}
 }
+
+// The real event that exposed this: a mission that finished cleanly, whose
+// summary happened to contain the word "failed" in ordinary prose. rig printed
+// the whole success report to the operator under "last error".
+const succeededRunMentioningFailure = `{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":410,"result":"Done. Three commits, each at a green make check. A diagnosis that a fix failed to confirm is a diagnosis to re-measure."}`
+
+func TestLastErrorIgnoresTheWordFailedInASuccessfulSummary(t *testing.T) {
+	if got := LastError(succeededRunMentioningFailure); got != "" {
+		t.Errorf("a successful run has no last error; got %q", got)
+	}
+}
+
+// is_error is the other half: a failure with no errors[] must still be named.
+func TestLastErrorReportsAnIsErrorResult(t *testing.T) {
+	const s = `{"type":"result","subtype":"error_during_execution","is_error":true,"result":"the model hit an unrecoverable error"}`
+	if got := LastError(s); !strings.Contains(got, "unrecoverable") {
+		t.Errorf("an is_error result must be surfaced, got %q", got)
+	}
+}
+
+// A failure that was retried and then succeeded must not be reported as the
+// reason the agent stopped — the last result is the one that stopped it.
+func TestLastErrorIsClearedByALaterSuccess(t *testing.T) {
+	s := failedRun + "\n" + `{"type":"result","subtype":"success","is_error":false,"result":"done"}`
+	if got := LastError(s); got != "" {
+		t.Errorf("a later clean result ends the story; got %q", got)
+	}
+}
