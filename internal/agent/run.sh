@@ -179,7 +179,13 @@ else
   rm -f "$D/last_exit"
 fi
 
-timeout "$TIMEOUT" claude -p "$PROMPT" "${MODE[@]}" \
+# An explicit model, when the operator asked for one. Left unset otherwise, so
+# the guest's own default applies and rig does not have an opinion about which
+# model a project should use.
+MODEL=()
+[ -n "${RIG_AGENT_MODEL:-}" ] && MODEL=(--model "$RIG_AGENT_MODEL")
+
+timeout "$TIMEOUT" claude -p "$PROMPT" "${MODE[@]}" "${MODEL[@]}" \
   --dangerously-skip-permissions \
   --verbose \
   --output-format stream-json \

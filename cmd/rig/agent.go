@@ -40,7 +40,7 @@ func (a *app) agentCmd() *cobra.Command {
 }
 
 func (a *app) agentStartCmd() *cobra.Command {
-	var promptFile, workdir, memMax, timeout string
+	var promptFile, workdir, memMax, timeout, model string
 	var restarts int
 	var newSession, untilDone bool
 	cmd := &cobra.Command{
@@ -146,7 +146,7 @@ func (a *app) agentStartCmd() *cobra.Command {
 
 			argv := agent.SystemdRun(agent.UnitOpts{
 				Workdir: workdir, Session: session, Timeout: timeout,
-				MemoryMax: memMax, Restarts: restarts, UntilDone: untilDone,
+				MemoryMax: memMax, Restarts: restarts, UntilDone: untilDone, Model: model,
 			})
 			out, err := a.exec(name, shellQuote(argv))
 			if err != nil {
@@ -154,6 +154,9 @@ func (a *app) agentStartCmd() *cobra.Command {
 			}
 			note("started %s in %s (memory cap %s, %d restarts before it gives up)",
 				agent.Unit, workdir, memMax, restarts)
+			if model != "" {
+				note("model: %s", model)
+			}
 			if untilDone {
 				note("--until-done: a clean exit resumes instead of stopping, until the agent creates %s",
 					agent.DonePath)
@@ -169,6 +172,8 @@ func (a *app) agentStartCmd() *cobra.Command {
 	f.StringVar(&timeout, "timeout", "6h", "kill a single agent run after this long; it restarts and resumes")
 	f.IntVar(&restarts, "max-restarts", 5, "restarts allowed per hour before systemd gives up and waits for a human")
 	f.BoolVar(&newSession, "new-session", false, "start a fresh conversation instead of resuming; for a second mission in the same VM")
+	f.StringVar(&model, "model", "",
+		"model for the agent — an alias like 'fable' or 'opus' takes the latest of that family; empty uses the guest's default")
 	f.BoolVar(&untilDone, "until-done", false,
 		"treat a clean exit as a turn boundary, not a result: resume until the agent creates "+agent.DonePath)
 	_ = cmd.MarkFlagRequired("prompt-file")

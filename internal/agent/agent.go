@@ -124,6 +124,7 @@ type UnitOpts struct {
 	MemoryMax string // systemd syntax; "80%" is a percentage of guest RAM
 	Restarts  int    // burst allowed before systemd gives up
 	UntilDone bool   // keep resuming after a clean exit until the agent says it is finished
+	Model     string // agent model; empty means whatever the guest's default is
 }
 
 // SystemdRun builds the systemd-run invocation.
@@ -166,6 +167,12 @@ func SystemdRun(o UnitOpts) []string {
 	}
 	if o.UntilDone {
 		args = append(args, "--setenv=RIG_AGENT_UNTIL_DONE=1")
+	}
+	// An alias ("fable", "opus") resolves to the latest of that family at the
+	// API, so pinning a version here would go stale on its own. Passed through
+	// untouched either way: rig has no business knowing which models exist.
+	if o.Model != "" {
+		args = append(args, "--setenv=RIG_AGENT_MODEL="+o.Model)
 	}
 	// A login shell so /etc/profile puts nix on PATH; a transient unit is
 	// otherwise handed a PATH with no nix in it and dies instantly.
