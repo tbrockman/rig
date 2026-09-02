@@ -27,9 +27,27 @@
     # only writable directory reachable is /usr/bin, which is on the unit's PATH
     # and not the operator's, so the same command worked for the agent and not
     # for the human watching it.
+    #
+    # No `path:` prefix, and that is the whole point. A `path:` flakeref copies
+    # the WHOLE directory into the store, ignoring .gitignore, on every
+    # invocation — so a project with a 19G `target/` writes 19G to /nix/store
+    # each time you run a build. It fills the disk, and the failure arrives as
+    # ENOSPC from an unrelated command long after the cause. Seen for real: ten
+    # copies of one repo, 163 GiB, on a 197G VM.
+    #
+    # A bare path inside a git working tree is resolved as a git tree instead,
+    # which honours .gitignore. If the directory is NOT a git repo, nix falls
+    # back to copying everything again — so `git init` is load-bearing here.
     (writeShellScriptBin "dev" ''
       set -euo pipefail
-      exec ${pkgs.nix}/bin/nix develop "path:''${PROJECT_DIR:-/work/project}" -c "$@"
+      dir="''${PROJECT_DIR:-/work/project}"
+      if [ ! -e "$dir/.git" ]; then
+        echo "dev: $dir is not a git working tree." >&2
+        echo "  nix would copy the entire directory into /nix/store on every" >&2
+        echo "  build, .gitignore and all. Run: git -C $dir init" >&2
+        exit 78
+      fi
+      exec ${pkgs.nix}/bin/nix develop "$dir" -c "$@"
     '')
   ];
 

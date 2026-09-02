@@ -166,6 +166,17 @@ and that the isolation holds against real traffic.
 `verify` exit 2 is not a pass. It means some check could not tell a blocked
 guest from a broken probe, so it says nothing either way.
 
+**Never put `path:` in front of a project directory in `nix develop`.** A
+`path:` flakeref copies the whole directory into `/nix/store` on every
+invocation, ignoring `.gitignore`, so a project with a large `target/` or
+`node_modules/` writes it to the store again on each build. It fills the disk,
+and the failure surfaces as ENOSPC from something unrelated long afterwards —
+observed here as ten copies of one repo, 163 GiB, on a 197G VM. A bare path
+inside a git working tree is resolved as a git tree and honours `.gitignore`,
+so `git init` in the guest is load-bearing. `path:.` is safe only for a tree
+that never accumulates build output, which is why `project-template` gets away
+with it.
+
 `rig rm myproj` deletes it — stopped only, and only VMs `rig` created.
 
 ## Credentials

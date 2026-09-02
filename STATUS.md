@@ -137,6 +137,24 @@ its own guest image is reported as drifted from a base it was never built from,
 which is the same "reports on something other than what it names" failure as the
 three below.
 
+## `path:` flakerefs fill the disk (found by the agent, 2026-09-02)
+
+The `ogx` wrapper handed to the open-groceries agent ran
+`nix develop "path:/work/open-groceries"`. A `path:` flakeref copies the entire
+directory into `/nix/store`, ignoring `.gitignore`, on every invocation — so
+each build wrote the repo's 19G `target/` to the store again. The VM reached
+191G/197G and every command started failing ENOSPC; `/nix/store` held ten copies
+of one repo, 163 GiB. The agent diagnosed it, switched to a bare flakeref (a git
+tree, which honours `.gitignore`), reclaimed 163.2 GiB, and pinned the devShell
+as a GC root so collection would not then discard the toolchain.
+
+Two things worth keeping from it. The failure arrives as ENOSPC from something
+unrelated, long after the cause, so the symptom points nowhere near the bug. And
+a bare path only helps if the directory is a **git working tree** — otherwise
+nix falls back to copying everything, so `git init` is load-bearing rather than
+incidental. `project-template` uses `path:.` and gets away with it only because
+that tree never accumulates build output.
+
 ## What `verify` could not see (found 2026-09-01, fixed)
 
 Three bugs, all found by adding docker to the base image, and all the same
