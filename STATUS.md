@@ -220,8 +220,20 @@ Relevant to anything that wants a host-side service without opening the ACL.
   one named.
 - This is the transport for a credential-injecting proxy: the guest holds no
   token, and an agent that strips its proxy settings gets a 401 rather than a
-  bypass. Worth knowing that it needs a rig verb — attaching a host channel to a
-  guest is currently raw `socat` on both ends, which is a gap.
+  bypass.
+- **Both directions verified**, and `rig forward` now owns it. Host half is Go
+  on raw AF_VSOCK file descriptors — Go's `net` package cannot wrap one, since
+  `net.FileConn` returns EINVAL for any family but UNIX/INET/INET6 — and the
+  guest half is `socat`, which has to run in the guest and is not worth shipping
+  a binary for. `rig verify` still reports PROVEN with a tunnel up, which is the
+  point: vsock is not IP, so there is nothing for an IP denylist to say about it.
+- The motivating case was a **captcha**, and it exposed a design error of mine:
+  the brief told the agent to screenshot a challenge and ask. That cannot work.
+  Interactive challenges are bound to the session that raised them and expire in
+  under a minute, so a PNG is unsolvable by the time anyone sees it — and
+  screenshotting then tearing down the browser destroys the only thing worth
+  handing over. The agent now keeps the browser alive with CDP exposed, and the
+  operator drives the real page through the tunnel.
 
 ## Known Incus behaviours (verified here)
 

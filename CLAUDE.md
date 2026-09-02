@@ -91,6 +91,30 @@ the mount, and the tree is root-owned so git wants a `safe.directory` line —
 `rig mount` prints it when the directory is a repo. Treat it as read-only:
 writing into a tree an agent is editing races that agent.
 
+`rig forward` carries one TCP port between this host and a guest over **vsock**,
+which is not IP — so the ACL that rejects every private range is untouched, and
+`rig verify` still reports PROVEN with a tunnel up. Same reasoning as `rig
+mount`: the way in is a channel that was never a network path. Incus proxy
+devices cannot do this on a VM (6.0.5 allows only NAT mode there, which is
+host-to-guest through the NIC, where the ACL lives).
+
+```bash
+rig forward og 9222              # guest:9222 -> 127.0.0.1:9222 here
+rig forward og 8787 --to-guest   # here:8787  -> 127.0.0.1:8787 in the guest
+```
+
+It blocks while it holds the tunnel and tears down both ends on Ctrl-C. The
+guest half is `socat`, so the guest needs it — put it in the project's guest
+image rather than installing it by hand.
+
+The case it was built for is a **captcha**. An unattended agent cannot solve an
+interactive challenge, and neither can an operator handed a screenshot: those
+challenges are bound to the browser session that raised them and expire in under
+a minute. Forward the browser's `--remote-debugging-port` instead and drive that
+exact page, in that session, with its cookies. From a third machine, tunnel over
+the ssh you already have (`ssh -L 9222:127.0.0.1:9222 <host>`) rather than
+reaching for `--bind-all`, which hands a guest port to the whole LAN.
+
 `doctor` and `verify` answer different questions. `doctor` reads configuration:
 is this VM set up right? `verify` sends real packets from inside the guest: is
 that setup actually true? Configuration has been right here while the effect was
