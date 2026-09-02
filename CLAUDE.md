@@ -13,15 +13,20 @@ tooling:
 
 `./rig` does everything: the base image, VM lifecycle, working inside a guest,
 and the card and policy verbs. `rig --help` groups them; the third group —
-`release`, `apply`, `start --allow-unisolated` — is the one that can break an
-invariant, so reach for it deliberately.
+`release`, `apply`, `start --allow-unisolated`, `host` — is the one that can
+break an invariant, so reach for it deliberately.
 
-`./hostgpu` is separate because it is the only thing that touches the host
-itself: it needs root, rebinds the card between `vfio-pci` and `nvidia`, and
-starts or stops the desktop. Reclaiming the card **resets it** before the driver
-loads, and then checks a DRM node appeared rather than trusting that the driver
-bound — see STATUS.md, behaviour 6. Both matter: without the reset the desktop
-comes back with no display, and without the check `hostgpu` says it succeeded.
+`rig host` is the only part that touches this host rather than a guest. It needs
+root, so `desktop` and `headless` re-exec themselves under sudo, printing the
+command first; `status` does not. Reclaiming the card **resets it** before the
+driver loads, and then checks a DRM node appeared rather than trusting that the
+driver bound — see STATUS.md, behaviour 6. Both matter: without the reset the
+desktop comes back with no display, and without the check rig says it succeeded.
+
+`rig host headless` ends the desktop **session**, not just its display: on this
+host `gnome-shell` renders on the card even when the monitor is on the iGPU. It
+lists what holds the card before stopping anything, so you can see whose session
+you are about to end.
 
 `rig new --no-gpu` makes a VM that never claims the card. Use it for CPU-only
 work: without it every `rig start` claims the GPU, so on a host whose desktop is
@@ -41,6 +46,12 @@ copy is often the only one. `rig pull --out` refuses to clobber a host file for
 the same reason. An instance created before the manifest existed has no record,
 so its first push asks for `--force` once.
 
+The guest needs an agent binary before `rig agent` can run one. It is a project
+decision, not part of the base image, so a fresh VM has none until you put one
+there: `rig exec <vm> nix profile install nixpkgs#claude-code`. `rig agent
+start` checks before it creates any state, because the alternative is a unit
+that restart-loops with `last exit 127` and says nothing about why.
+
 `rig agent` runs an unattended agent in the guest and keeps a channel to it.
 It is a systemd unit, so it outlives your shell; its session UUID is fixed and
 stored on the instance, so a crash **resumes the conversation** rather than
@@ -53,6 +64,16 @@ and is told to redo work it has already done. A file, not a pipe: it survives a 
 neither process can hang waiting for the other. `rig agent status` and
 `rig agent log` are bounded reads, so checking often is cheap; `log` prints only
 what the agent said, not the megabytes of tool calls around it.
+
+`claude -p` returns when the model stops talking, which for a brief with several
+missions in it is a turn boundary and not a result — the unit then stops, and an
+engagement hours from done sits idle. `--until-done` treats a clean exit as a
+turn boundary and resumes, until the agent itself creates
+`/var/lib/rig-agent/DONE`. Only the agent's own marker ends it; rig does not
+guess. Turn boundaries spend the restart budget, so `--until-done` raises
+`--max-restarts` unless you set it yourself, and `rig agent status` reports the
+marker — otherwise "finished" and "ran out of restarts" both read as
+`unit inactive`.
 
 The unit caps its own memory and sets `OOMPolicy=continue`, so a runaway child
 — a geometry sidecar, a compiler — is killed alone instead of taking the agent
@@ -75,7 +96,13 @@ is this VM set up right? `verify` sends real packets from inside the guest: is
 that setup actually true? Configuration has been right here while the effect was
 absent, so the second is not implied by the first.
 
-Build with `make`. Go 1.26, two binaries from one module.
+The base image carries the NVIDIA driver and, as the one deliberate exception,
+**docker** — socket-activated, so a VM that never speaks docker never runs a
+daemon. A daemon is the one dependency a project flake cannot supply on NixOS,
+which is why it is here and nvcc is not. The trade: containers declaring
+`restart: unless-stopped` do not come back by themselves after a guest reboot.
+
+Build with `make`. Go 1.26, one binary from one module.
 
 ## Starting a new project
 
@@ -87,6 +114,19 @@ chmod 600 secrets/myproj.env
 ./rig push myproj project-template            # -> /work/project-template
 ./rig doctor myproj                           # isolation, GPU, agent, address, creds
 ```
+
+`run-agent` gets the agent from the project flake. `rig agent` does not — it runs
+a systemd unit with a fixed PATH, so the binary has to be in the guest's own nix
+profile:
+
+```bash
+./rig exec myproj NIXPKGS_ALLOW_UNFREE=1 nix profile install --impure nixpkgs#claude-code
+```
+
+Both halves of that are load-bearing. `claude-code` is unfree, and a flake
+reference does not read `~/.config/nixpkgs/config.nix` — flake evaluation is pure
+— so the base image's own `allowUnfree` does not reach it either. Without them
+nix fails with three suggested fixes, all of which are for the non-flake path.
 
 Then prove the two things `doctor` cannot: that a kernel returns correct results,
 and that the isolation holds against real traffic.

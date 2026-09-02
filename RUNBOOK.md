@@ -62,7 +62,7 @@ then confirm nothing holds it: `sudo fuser -v /dev/nvidia*` should be empty.
 
 **Console access.** With the monitor on the 4080's DisplayPort you have a console
 only while no VM is running, and the card stays pinned to `vfio-pci` after a VM
-stops (behaviour #1 in `STATUS.md`), so it stays dark until `hostgpu desktop`. If
+stops (behaviour #1 in `STATUS.md`), so it stays dark until `rig host desktop`. If
 SSH breaks in that window you are locked out. The monitor is on the iGPU's HDMI
 output here, which removes the risk.
 

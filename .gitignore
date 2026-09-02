@@ -1,3 +1,2 @@
-# Built binaries. Anchored, or these also match cmd/rig and cmd/hostgpu.
+# Built binary. Anchored, or this also matches cmd/rig.
 /rig
-/hostgpu

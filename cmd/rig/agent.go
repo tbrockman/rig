@@ -42,12 +42,12 @@ func (a *app) agentCmd() *cobra.Command {
 func (a *app) agentStartCmd() *cobra.Command {
 	var promptFile, workdir, memMax, timeout string
 	var restarts int
-	var newSession bool
+	var newSession, untilDone bool
 	cmd := &cobra.Command{
 		Use:   "start <vm>",
 		Short: "Start the unattended agent",
 		Args:  cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			if err := a.requireInstance(name); err != nil {
 				return err
@@ -64,6 +64,18 @@ func (a *app) agentStartCmd() *cobra.Command {
 				return fmt.Errorf("%s is already running on %s.\n"+
 					"  rig agent status %s   # see what it is doing\n"+
 					"  rig agent stop %s     # stop it first", agent.Unit, name, name, name)
+			}
+
+			// Look for the binary before creating any state. Without this the
+			// unit starts, dies on exec, and restart-loops — and `rig agent
+			// status` reports "last exit 127" and an empty last error, which
+			// says nothing about the one thing that is wrong.
+			if out, err := a.exec(name, agent.ClaudeProbe()); err != nil || strings.TrimSpace(out) == "" {
+				return fmt.Errorf("no `claude` on the agent unit's PATH in %s.\n"+
+					"The agent binary is a project decision, not part of the base image,\n"+
+					"so a fresh VM does not have one until you put it there:\n"+
+					"  rig exec %s %s\n"+
+					"PATH searched: %s", name, name, agent.InstallHint, agent.UnitPATH)
 			}
 
 			prompt, err := os.ReadFile(promptFile)
@@ -117,9 +129,24 @@ func (a *app) agentStartCmd() *cobra.Command {
 			// Clear a stale failure state, or systemd refuses the unit name.
 			_, _ = a.exec(name, "systemctl reset-failed "+agent.Unit+" 2>/dev/null || true")
 
+			// A DONE marker from the previous mission would end this one before
+			// its first turn: --until-done reads it as "already finished". The
+			// turn_boundary note is the same kind of leftover, and would open
+			// this run with a resumption note about a turn that is not this
+			// run's.
+			_, _ = a.exec(name, "rm -f "+agent.DonePath+" "+agent.Dir+"/turn_boundary")
+
+			// Turn boundaries spend the restart budget, and a brief with several
+			// missions in it has many. Five — the right number for crashes —
+			// would stop a healthy agent inside an hour, so raise it unless the
+			// operator picked a number themselves.
+			if untilDone && !cmd.Flags().Changed("max-restarts") {
+				restarts = 20
+			}
+
 			argv := agent.SystemdRun(agent.UnitOpts{
 				Workdir: workdir, Session: session, Timeout: timeout,
-				MemoryMax: memMax, Restarts: restarts,
+				MemoryMax: memMax, Restarts: restarts, UntilDone: untilDone,
 			})
 			out, err := a.exec(name, shellQuote(argv))
 			if err != nil {
@@ -127,6 +154,10 @@ func (a *app) agentStartCmd() *cobra.Command {
 			}
 			note("started %s in %s (memory cap %s, %d restarts before it gives up)",
 				agent.Unit, workdir, memMax, restarts)
+			if untilDone {
+				note("--until-done: a clean exit resumes instead of stopping, until the agent creates %s",
+					agent.DonePath)
+			}
 			note("watch it:  rig agent status %s", name)
 			return nil
 		},
@@ -138,6 +169,8 @@ func (a *app) agentStartCmd() *cobra.Command {
 	f.StringVar(&timeout, "timeout", "6h", "kill a single agent run after this long; it restarts and resumes")
 	f.IntVar(&restarts, "max-restarts", 5, "restarts allowed per hour before systemd gives up and waits for a human")
 	f.BoolVar(&newSession, "new-session", false, "start a fresh conversation instead of resuming; for a second mission in the same VM")
+	f.BoolVar(&untilDone, "until-done", false,
+		"treat a clean exit as a turn boundary, not a result: resume until the agent creates "+agent.DonePath)
 	_ = cmd.MarkFlagRequired("prompt-file")
 	return cmd
 }
@@ -210,6 +243,14 @@ func (a *app) agentStatusCmd() *cobra.Command {
 			row("unit", p.Active)
 			row("session", inst.Config[agent.SessionKey])
 			row("restarts", p.Restarts)
+
+			// Whether the agent thinks it is finished, from the marker it sets
+			// itself. Under --until-done this is the difference between "it
+			// stopped because it is done" and "it stopped because it ran out of
+			// restarts", which otherwise look identical from `unit inactive`.
+			if p.Done {
+				row("mission", "COMPLETE (the agent created "+agent.DonePath+")")
+			}
 
 			// last_exit is written when a run ends, and simply stays there.
 			// Printed bare next to `unit active` it reads as this run's

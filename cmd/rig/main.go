@@ -72,7 +72,7 @@ func main() {
 		a.execCmd(), a.shellCmd(), a.pushCmd(), a.pullCmd(), a.agentCmd(),
 		a.credsCmd(),
 		a.mountCmd(), a.unmountCmd(),
-		a.claimCmd(), a.releaseCmd(), a.applyCmd(), a.imageCmd(),
+		a.claimCmd(), a.releaseCmd(), a.applyCmd(), a.hostCmd(), a.imageCmd(),
 	)
 
 	if err := root.Execute(); err != nil {

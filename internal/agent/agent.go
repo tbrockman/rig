@@ -38,6 +38,7 @@ const (
 	RunnerPath = Dir + "/run"
 	PromptPath = Dir + "/prompt"
 	InboxPath  = Dir + "/inbox"
+	DonePath   = Dir + "/DONE"
 	SessionKey = "user.rig.agent.session"
 	Unit       = "rig-agent"
 )
@@ -78,6 +79,43 @@ func NewSessionID() (string, error) {
 	return fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32]), nil
 }
 
+// UnitPATH is what the unit runs with.
+//
+// The nix profile comes first: an agent binary installed with `nix profile
+// install` lands there, and a transient unit does not inherit a login shell's
+// PATH. Leaving it out fails as "failed to run command 'claude': No such file
+// or directory", which reads like a broken image rather than a missing entry.
+//
+// One constant rather than a literal at the use site, because the preflight
+// check has to look down exactly the PATH the unit will use. A check that
+// searched a login shell's PATH instead would pass for a binary the unit cannot
+// see, which is the failure it exists to catch.
+const UnitPATH = "/root/.nix-profile/bin:/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/bin"
+
+// InstallHint is the command that puts the agent binary where the unit will
+// find it.
+//
+// The unfree opt-in is not decoration. claude-code is unfree, and a flake
+// reference does not read ~/.config/nixpkgs/config.nix — flake evaluation is
+// pure — so the base image's own `nixpkgs.config.allowUnfree` does not apply
+// either. A plain `nix profile install nixpkgs#claude-code` in a rig guest
+// fails with a wall of text whose three suggested fixes are all for the
+// non-flake path.
+const InstallHint = "NIXPKGS_ALLOW_UNFREE=1 nix profile install --impure nixpkgs#claude-code"
+
+// ClaudeProbe asks whether the agent binary is on the unit's PATH.
+//
+// `rig agent` runs bare `claude`, so a guest without it fails in the least
+// legible way rig has: systemd starts the unit, the runner dies instantly,
+// Restart=on-failure tries again, and the operator sees a restart loop with
+// "last exit 127" and no explanation. The binary is a project decision — it
+// comes from a project flake or `nix profile install`, not from the base image —
+// so its absence is an ordinary state to be in, and worth one clear sentence
+// rather than a diagnosis.
+func ClaudeProbe() string {
+	return "PATH=" + UnitPATH + " command -v claude || true"
+}
+
 // UnitOpts are the knobs that decide how the unit survives trouble.
 type UnitOpts struct {
 	Workdir   string
@@ -85,6 +123,7 @@ type UnitOpts struct {
 	Timeout   string // passed to timeout(1) inside the guest
 	MemoryMax string // systemd syntax; "80%" is a percentage of guest RAM
 	Restarts  int    // burst allowed before systemd gives up
+	UntilDone bool   // keep resuming after a clean exit until the agent says it is finished
 }
 
 // SystemdRun builds the systemd-run invocation.
@@ -116,12 +155,7 @@ func SystemdRun(o UnitOpts) []string {
 		"--property=StartLimitBurst=" + strconv.Itoa(o.Restarts),
 		"--setenv=HOME=/root",
 		"--setenv=TERM=dumb",
-		// The nix profile comes first: an agent binary installed with
-		// `nix profile install` lands there, and a transient unit does not
-		// inherit a login shell's PATH. Leaving it out fails as
-		// "failed to run command 'claude': No such file or directory",
-		// which reads like a broken image rather than a missing entry.
-		"--setenv=PATH=/root/.nix-profile/bin:/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/bin",
+		"--setenv=PATH=" + UnitPATH,
 		"--setenv=RIG_AGENT_WORKDIR=" + o.Workdir,
 		"--setenv=RIG_AGENT_SESSION=" + o.Session,
 		"--setenv=RIG_AGENT_TIMEOUT=" + o.Timeout,
@@ -129,6 +163,9 @@ func SystemdRun(o UnitOpts) []string {
 	}
 	if o.MemoryMax != "" {
 		args = append(args, "--property=MemoryMax="+o.MemoryMax)
+	}
+	if o.UntilDone {
+		args = append(args, "--setenv=RIG_AGENT_UNTIL_DONE=1")
 	}
 	// A login shell so /etc/profile puts nix on PATH; a transient unit is
 	// otherwise handed a PATH with no nix in it and dies instantly.
@@ -255,6 +292,7 @@ type Probe struct {
 	Started  int64 // unix seconds the current invocation went active
 	Now      int64 // guest clock, so ages are computed in the guest's frame
 	Exited   int64 // mtime of last_exit
+	Done     bool  // the agent created the DONE marker
 }
 
 // StatusProbe asks the guest for everything status needs that is not a file's
@@ -266,12 +304,13 @@ type Probe struct {
 // second restart. NRestarts belongs to this unit invocation and resets when a
 // human starts it, which is the question being asked.
 func StatusProbe() string {
-	return fmt.Sprintf(`u=%s
+	return fmt.Sprintf(`u=%[1]s
 echo "active=$(systemctl is-active $u 2>/dev/null)"
 echo "restarts=$(systemctl show $u -p NRestarts --value 2>/dev/null)"
 echo "started=$(date -d "$(systemctl show $u -p ActiveEnterTimestamp --value 2>/dev/null)" +%%s 2>/dev/null)"
 echo "now=$(date +%%s)"
-echo "exited=$(stat -c %%Y %s/last_exit 2>/dev/null)"`, Unit, Dir)
+echo "exited=$(stat -c %%Y %[2]s/last_exit 2>/dev/null)"
+echo "done=$(test -e %[2]s/DONE && echo yes)"`, Unit, Dir)
 }
 
 // ParseProbe reads StatusProbe's output. Anything missing stays zero: a probe
@@ -301,6 +340,8 @@ func ParseProbe(out string) Probe {
 			p.Now = num(v)
 		case "exited":
 			p.Exited = num(v)
+		case "done":
+			p.Done = strings.TrimSpace(v) == "yes"
 		}
 	}
 	return p

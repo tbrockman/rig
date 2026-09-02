@@ -25,6 +25,7 @@ import (
 	"net"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"rig/internal/incus"
@@ -110,6 +111,43 @@ type Runner struct {
 	report   Report
 	working  map[Mechanism]bool
 	coverage map[string][]string
+	// guestOwn are addresses the guest holds itself. A probe at one of these
+	// never leaves the guest, so it can neither prove nor disprove isolation.
+	guestOwn map[string]bool
+}
+
+// guestAddresses reads the IPv4 addresses the guest holds on its own
+// interfaces.
+//
+// This exists because "the host's addresses" and "the guest's addresses" can
+// overlap, and when they do a probe silently changes meaning. Docker picks
+// 172.17.0.1/16 for its default bridge on every machine, so a host running
+// docker and a guest running docker hold the same address — and a guest
+// probing "the host at 172.17.0.1:22" reaches its own sshd, one hop, never
+// touching the wire. verify reported that as the guest reaching the host: the
+// single most serious verdict it has, from a probe that proved nothing.
+//
+// Failing loudly was luck rather than design. The same collision on a target
+// whose expectation was Reachable would have produced a comfortable PASS for a
+// path that was never tested.
+func guestAddresses(c *incus.Client, instance string) map[string]bool {
+	out, err := c.Exec(instance, "ip -4 -o addr show", incus.ExecOpts{Timeout: 15 * time.Second})
+	if err != nil {
+		return nil
+	}
+	own := map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		for i, f := range fields {
+			if f != "inet" || i+1 >= len(fields) {
+				continue
+			}
+			if ip, _, ok := strings.Cut(fields[i+1], "/"); ok && ip != "" {
+				own[ip] = true
+			}
+		}
+	}
+	return own
 }
 
 func (r *Runner) logf(format string, args ...any) {
@@ -146,6 +184,7 @@ func (r *Runner) Run() (*Report, error) {
 	r.report.Isolated = len(unisolated) == 0
 
 	targets := discover(r.Bridge)
+	r.guestOwn = guestAddresses(r.C, r.Instance)
 	r.describe(inst, targets, unisolated, noEgress)
 
 	r.logf("\n--- controls: each probe mechanism must be shown to work ---")
@@ -287,29 +326,60 @@ func (r *Runner) allowTargets(t Targets) []Target {
 }
 
 // check runs one target and records the result.
+// acknowledged reports whether an address falls in a reject range the operator
+// has already accepted as unprovable on this host.
+//
+// Such a check may still FAIL — a guest that reaches an acknowledged range has
+// broken out, and that is not something an operator can wave through in
+// advance. What the acknowledgement covers is the *unproven* outcome, which is
+// the exact thing it was written to accept.
+func (r *Runner) acknowledged(ip string) bool {
+	rng := rangeContaining(ip)
+	return rng != "" && slices.Contains(r.AllowGaps, rng)
+}
+
 func (r *Runner) check(t Target) {
+	// An unproven result inside an acknowledged range is the acknowledgement
+	// being used, not a new problem. Counting it anyway made --allow-gap
+	// self-defeating: the run stayed INCONCLUSIVE for precisely the reason the
+	// operator had already accepted, so the flag could never let anything pass.
+	//
+	// This went unnoticed because the acknowledged range had a real proof on the
+	// day the suite was written — something on this host answered on
+	// 169.254.169.254:80 — so the accepting path was never reached. It stopped
+	// answering, and a flag that had always been decoration became visible.
+	advisory := !t.Attributable || r.acknowledged(t.IP)
+
 	if t.IP == "" {
 		r.record(Check{Label: t.Label, Outcome: Unproven, Advisory: !t.Attributable,
 			Detail: "no target could be derived on this host"}, false)
 		return
 	}
+	// An address the guest also holds is not a target. The probe would loop
+	// back inside the guest and report on the guest's own listeners, which says
+	// nothing about what the ACL does or does not let out.
+	if r.guestOwn[t.IP] {
+		r.record(Check{Label: t.Label, Outcome: Unproven, Advisory: advisory,
+			Detail: "the guest holds " + t.IP + " itself; a probe there never leaves the guest"}, false)
+		return
+	}
 	// A block claim needs the mechanism to be known good, or "blocked" and
 	// "broken" are indistinguishable.
 	if t.Expect == Blocked && !r.working[t.Mechanism] {
-		r.record(Check{Label: t.Label, Outcome: Unproven, Advisory: !t.Attributable,
+		r.record(Check{Label: t.Label, Outcome: Unproven, Advisory: advisory,
 			Detail: string(t.Mechanism) + " probes are not working; a block here would prove nothing"}, false)
 		return
 	}
 	// And it needs the target to be reachable from here, or a failure in the
 	// guest says nothing about the guest.
 	if t.Expect == Blocked && !hostReaches(t.Mechanism, t.IP, t.Port) {
-		r.record(Check{Label: t.Label, Outcome: Unproven, Advisory: !t.Attributable,
+		r.record(Check{Label: t.Label, Outcome: Unproven, Advisory: advisory,
 			Detail: "the host cannot reach it either — proves nothing"}, false)
 		return
 	}
 
 	reach, detail := r.probeGuest(t.Mechanism, t.IP, t.Port)
-	c := Check{Label: t.Label, Detail: detail, Advisory: !t.Attributable && t.Expect == Blocked}
+	c := Check{Label: t.Label, Detail: detail, Advisory: advisory && t.Expect == Blocked}
 	switch {
 	case reach == Unknown:
 		c.Outcome = Unproven

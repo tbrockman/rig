@@ -303,3 +303,80 @@ func TestLastErrorIsClearedByALaterSuccess(t *testing.T) {
 		t.Errorf("a later clean result ends the story; got %q", got)
 	}
 }
+
+// --- until-done ----------------------------------------------------------
+
+// `claude -p` returns when the model stops talking, which for a multi-mission
+// brief is a turn boundary rather than a result. Under --until-done the runner
+// has to say "not finished" to systemd so the restart resumes the conversation.
+func TestRunnerResumesACleanExitOnlyWhenAskedTo(t *testing.T) {
+	r := string(Runner())
+	if !strings.Contains(r, "RIG_AGENT_UNTIL_DONE") {
+		t.Fatal("the runner must read the opt-in; without it this changes every run's behaviour")
+	}
+	if !strings.Contains(r, "exit 75") {
+		t.Error("a turn boundary must exit non-zero, or Restart=on-failure will not resume it")
+	}
+	// The agent's own marker is the terminating condition. Anything rig decided
+	// for itself would be guessing at "finished", which is the mistake the old
+	// shell loop made.
+	if !strings.Contains(r, `[ ! -e "$D/DONE" ]`) {
+		t.Error("only the agent's own DONE marker may end an --until-done run")
+	}
+}
+
+// The failure this guards: a turn boundary and a crash are both a non-zero exit
+// and both bump NRestarts, so without a note the agent is told its process died
+// every time it simply stopped talking — and spends the next turn reconciling a
+// working tree that nothing interrupted.
+func TestRunnerDistinguishesATurnBoundaryFromACrash(t *testing.T) {
+	r := string(Runner())
+	if !strings.Contains(r, "turn_boundary") {
+		t.Fatal("the runner must leave a note saying which kind of exit it was")
+	}
+	if !strings.Contains(r, "Nothing crashed and nothing was interrupted") {
+		t.Error("a resumed turn must not be announced to the agent as a crash")
+	}
+	// Read once and cleared, or a genuine crash after a turn boundary inherits
+	// the wrong explanation.
+	if !strings.Contains(r, `rm -f "$D/turn_boundary"`) {
+		t.Error("the note must be cleared by its reader")
+	}
+	if strings.Contains(r, "restarted after a failure") && !strings.Contains(r, "TURN_BOUNDARY") {
+		t.Error("the crash note must be reached only when the exit was not a turn boundary")
+	}
+}
+
+func TestUntilDoneIsOffByDefault(t *testing.T) {
+	plain := strings.Join(SystemdRun(UnitOpts{Workdir: "/work", Session: "s", Timeout: "6h"}), " ")
+	if strings.Contains(plain, "RIG_AGENT_UNTIL_DONE") {
+		t.Error("the honest default for an unattended process is to stop when it says it is finished")
+	}
+	on := strings.Join(SystemdRun(UnitOpts{Workdir: "/work", Session: "s", Timeout: "6h", UntilDone: true}), " ")
+	if !strings.Contains(on, "--setenv=RIG_AGENT_UNTIL_DONE=1") {
+		t.Error("--until-done must reach the unit's environment")
+	}
+}
+
+// Under --until-done, "unit inactive" means either "finished" or "ran out of
+// restarts". Those want opposite reactions, so status has to be able to tell
+// them apart.
+func TestParseProbeReadsTheDoneMarker(t *testing.T) {
+	if p := ParseProbe("active=inactive\nrestarts=3\ndone=yes\n"); !p.Done {
+		t.Error("a present DONE marker must be reported as a completed mission")
+	}
+	if p := ParseProbe("active=active\nrestarts=0\ndone=\n"); p.Done {
+		t.Error("an absent marker must not read as complete")
+	}
+}
+
+// The probe is one round trip and its format is positional in the fmt string;
+// a mismatched index silently produces a command that asks the wrong question.
+func TestStatusProbeAsksAboutTheRightPaths(t *testing.T) {
+	probe := StatusProbe()
+	for _, want := range []string{Unit, Dir + "/last_exit", Dir + "/DONE"} {
+		if !strings.Contains(probe, want) {
+			t.Errorf("probe does not mention %q:\n%s", want, probe)
+		}
+	}
+}

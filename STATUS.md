@@ -48,9 +48,12 @@ card needs no config change.
   when the dGPU is firmware-primary.
 - **Go, not shell.** Typed, testable, and the Incus REST API is reachable
   directly, so nothing parses CLI output. One module, two binaries: `rig` for
-  everything about VMs, `hostgpu` for the host itself — root, driver rebinds,
-  and the desktop. `rig` was briefly split into a second binary to encode which
-  verbs are dangerous; command groups in `--help` do that without the split.
+  everything about VMs and the host's own card. `rig` was briefly split into a
+  second binary to encode which verbs are dangerous, and `hostgpu` was a third
+  for the one thing that needs root; command groups in `--help` and a sudo
+  re-exec do both jobs without the splits. Reclaiming the card is an ordinary
+  step in the lifecycle, and a tool you have to remember exists separately is
+  one you forget at the moment it matters.
 - **Checking and proving are separate verbs.** `doctor` reads configuration;
   `verify` sends real packets from inside the guest. Config has been right here
   while the effect was absent, so one does not imply the other.
@@ -81,6 +84,96 @@ card needs no config change.
   VM.
 - **Credentials are env vars in a host file**, injected to tmpfs at start.
   Scoping them is the operator's job; nothing else can judge it.
+- **Docker is in the base image, socket-activated.** The stated rule is that the
+  image carries the driver and toolchains come from project flakes, and docker
+  breaks it — deliberately, because it is a *daemon*, and on NixOS enabling a
+  service is system configuration that no devShell can provide. The alternatives
+  were a per-project guest module applied with `nixos-rebuild` in the guest (the
+  doctrinally correct answer, and a whole subsystem for one dependency) and
+  rootless podman from a flake (which still wants `/etc/containers` wired up at
+  system level). `enableOnBoot = false` is what makes it honest: a VM that never
+  speaks docker runs no daemon and gets no bridge, so the cost is disk in one
+  image every instance CoW-shares. The trade is that `restart: unless-stopped`
+  containers do not return by themselves after a guest reboot.
+- **A clean exit is a turn boundary, not a result — when asked.** `claude -p`
+  returns whenever the model stops talking, so a brief with four missions in it
+  stops after the first turn and waits for a human who is not watching. The
+  microsandbox harness solved this with a shell loop that re-invoked
+  `--continue` and guessed at "finished" by grepping the transcript. `rig agent
+  start --until-done` keeps the loop and fixes its termination condition: the
+  runner reports EX_TEMPFAIL on a clean exit so systemd resumes the session, and
+  only the agent's own `DONE` marker ends it. It also leaves a note saying which
+  kind of exit it was — a turn boundary and a crash are both non-zero and both
+  bump NRestarts, and telling an agent it crashed when it merely paused sends it
+  to reconcile a tree nothing interrupted.
+
+## What `verify` could not see (found 2026-09-01, fixed)
+
+Three bugs, all found by adding docker to the base image, and all the same
+shape: something reported on a thing other than the one it named. Each was
+invisible while a guest held exactly one global address.
+
+1. **A probe at an address the guest also holds never leaves the guest.** Docker
+   picks `172.17.0.1/16` for `docker0` on every machine, so a host running
+   docker and a guest running docker hold the same address. `verify` probes the
+   host's addresses from inside the guest; that one reached the *guest's* sshd,
+   one hop, never touching the wire — and was reported as the guest reaching the
+   host, the most serious verdict the tool has. Failing loudly was luck: the same
+   collision on a target expected to be *reachable* would have produced a
+   comfortable PASS for a path that was never tested. `verify` now asks the guest
+   which addresses it holds and refuses to draw a conclusion from those; the base
+   image moves docker to `10.201.0.1/16` so the collision does not arise.
+
+2. **`rig doctor` reported a docker bridge as the guest's address.**
+   `GlobalIPv4` returned the first global IPv4 it found while iterating a Go
+   map, which is random order. That was deterministic only while a guest had
+   exactly one global address; with docker in the image there are two, and the
+   reported address started changing between calls. It now matches the NIC by
+   the MAC in `volatile.<device>.hwaddr`, which is the only unambiguous link
+   between the device rig configured and whatever name the guest's kernel chose.
+
+3. **`--allow-gap` was decoration.** An acknowledged range still produced a
+   non-advisory `Unproven` check, so the run stayed INCONCLUSIVE for exactly the
+   reason the operator had already accepted — the flag could never let anything
+   pass. It went unnoticed because `169.254.0.0/16` had a real proof on the day
+   the suite was written: something on this host answered on
+   `169.254.169.254:80`. It stopped answering, and a flag that had always been
+   decoration became visible. An acknowledged range now makes its own probes
+   advisory when they come out unproven — and only then. A guest that *reaches*
+   an acknowledged range is still a breach.
+
+## Wart: a rig guest has two PATHs
+
+`rig exec` runs a login shell, whose PATH on NixOS is nix profiles plus
+`/run/current-system/sw/bin` — and no `/usr/bin`. The agent's systemd unit has
+its own fixed PATH, which *does* include `/usr/bin`. So a helper installed at
+`/usr/bin/foo` is on the agent's PATH and not on the operator's, and the same
+command works for one and not the other. Hit while installing the `ogx` devShell
+wrapper for the open-groceries VM.
+
+`/usr/bin` is the only writable directory on either list — every other entry is a
+read-only nix profile — so there is nowhere to put a helper that both find by
+name. Fix at the next image build: either put `/usr/bin` on the login PATH, or
+ship such helpers as base-image packages so they land in the system profile.
+Until then, `rig exec` needs the absolute path.
+
+## A guest can reach this host over vsock (2026-09-01)
+
+Relevant to anything that wants a host-side service without opening the ACL.
+
+- **Incus proxy devices cannot do it for VMs.** `bind=instance` is
+  container-only; 6.0.5 refuses with "Only NAT mode is supported for proxies on
+  VM instances", and NAT mode is host→guest through nftables — the wrong
+  direction, and through the NIC where the ACL lives.
+- **vsock does.** Verified end to end: `socat VSOCK-LISTEN:8787` on the host,
+  `socat TCP-LISTEN:8787 VSOCK-CONNECT:2:8787` in the guest, HTTP over it, while
+  the same guest still could not reach `10.187.156.1` over IP. It is the channel
+  the incus agent already uses, so it is not a new hole so much as an existing
+  one named.
+- This is the transport for a credential-injecting proxy: the guest holds no
+  token, and an agent that strips its proxy settings gets a 401 rather than a
+  bypass. Worth knowing that it needs a rig verb — attaching a host channel to a
+  guest is currently raw `socat` on both ends, which is a gap.
 
 ## Known Incus behaviours (verified here)
 
@@ -88,7 +181,7 @@ Behaviours the code now handles are documented at their handling site, not here.
 What remains:
 
 1. **The GPU is not released on VM stop.** Incus sets `driver_override=vfio-pci`
-   and never clears it. `hostgpu desktop` does the rebind.
+   and never clears it. `rig host desktop` does the rebind.
 2. **Starting a second VM with the same GPU hot-unplugs it from the running
    one.** Loud on the VM that failed to start, **silent on the victim** — it
    still shows RUNNING with a healthy IP. This is what `rig` prevents.
@@ -115,8 +208,8 @@ What remains:
    devices, no DRM node appears, and the DisplayPort stays dark. The card also
    keeps issuing DMA against the guest's old mappings: 120 `AMD-Vi
    IO_PAGE_FAULT` events a minute until it is reset. An FLR
-   (`reset_method: flr bus`) clears all of it without a reboot. `hostgpu
-   desktop` now resets between unbind and modprobe, and verifies a DRM node
+   (`reset_method: flr bus`) clears all of it without a reboot. `rig host
+   desktop` resets between unbind and modprobe, and verifies a DRM node
    appears, because binding is not working. Diagnosed 2026-08-25 after the
    first real reclaim; the fault was silent in exactly the way this project
    exists to prevent.
@@ -215,8 +308,8 @@ is one card, one active project.
 |---|---|
 | `CLAUDE.md` | Which tool for what, and how to start a project |
 | `RUNBOOK.md` | Host setup, in order |
-| `cmd/rig` | The whole surface: image, lifecycle, guest access, card and policy |
-| `cmd/hostgpu` | Move the card between the desktop and VMs |
+| `cmd/rig` | The whole surface: image, lifecycle, guest access, card, policy, host |
+| `internal/hostgpu` | Move the card between this host's desktop and VMs |
 | `internal/incus` | Typed REST client over the unix socket; exec over websockets |
 | `internal/policy` | Declared isolation policy and the reconcile |
 | `internal/gpu` | Arbitration, PCI discovery, the lock |
@@ -252,5 +345,5 @@ quietly.
 5. **Nothing here is portable off this host.** Not a goal yet, and the CLI is
    already parameterised (`--flake`, `--attr`, `--alias`, `RIG_*`). The real
    blockers are elsewhere: `base/gpu-dev.nix` hardcodes `hardware.nvidia.open`,
-   `gpu-check` greps PCI vendor `10de:`, `hostgpu` names the NVIDIA module set,
+   `gpu-check` greps PCI vendor `10de:`, `internal/hostgpu` names the NVIDIA modules,
    and `project-template` bakes in CUDA and `sm_89`.

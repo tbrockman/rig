@@ -212,6 +212,7 @@ func (c *Client) SetState(name, action string, timeoutSec int) error {
 
 type instanceState struct {
 	Network map[string]struct {
+		Hwaddr    string `json:"hwaddr"`
 		Addresses []struct {
 			Family  string `json:"family"`
 			Address string `json:"address"`
@@ -220,20 +221,54 @@ type instanceState struct {
 	} `json:"network"`
 }
 
-// GlobalIPv4 returns the first global IPv4 address on any interface, or "".
+// GlobalIPv4 returns the address on the instance's own NIC.
+//
+// It matches by MAC rather than taking the first global address it finds.
+// `Network` is a map, so Go iterates it in random order, and a guest has more
+// global IPv4 addresses than its NIC as soon as it runs anything that makes a
+// bridge — docker being the obvious one. The old version was deterministic only
+// while there was exactly one candidate; the moment there were two it started
+// reporting a docker bridge as the guest's address, intermittently, which is
+// the worst way for an address to be wrong. Incus records the NIC's MAC in
+// `volatile.<device>.hwaddr`, and that is the one unambiguous link between the
+// device rig configured and the interface the guest brought up under whatever
+// name the kernel chose.
 func (c *Client) GlobalIPv4(name string) (string, error) {
+	inst, _, err := c.Instance(name)
+	if err != nil {
+		return "", err
+	}
 	var st instanceState
 	if _, err := c.Get("/1.0/instances/"+url.PathEscape(name)+"/state", &st); err != nil {
 		return "", err
 	}
+
+	// The MACs of every NIC this instance is configured with.
+	wanted := map[string]bool{}
+	for dev := range inst.NICs() {
+		if mac := inst.Config["volatile."+dev+".hwaddr"]; mac != "" {
+			wanted[strings.ToLower(mac)] = true
+		}
+	}
+
+	var fallback string
 	for _, iface := range st.Network {
 		for _, a := range iface.Addresses {
-			if a.Family == "inet" && a.Scope == "global" {
+			if a.Family != "inet" || a.Scope != "global" {
+				continue
+			}
+			if wanted[strings.ToLower(iface.Hwaddr)] {
 				return a.Address, nil
+			}
+			// Deterministic, so a guest whose MACs cannot be matched at least
+			// reports the same wrong answer twice rather than a different one
+			// each call.
+			if fallback == "" || a.Address < fallback {
+				fallback = a.Address
 			}
 		}
 	}
-	return "", nil
+	return fallback, nil
 }
 
 func (c *Client) ConsoleLog(name string) (string, error) {

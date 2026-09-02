@@ -1,5 +1,5 @@
 # Binaries land in the repo root so ./rig keeps working from the docs.
-BINS := rig hostgpu
+BINS := rig
 
 all: $(BINS)
 

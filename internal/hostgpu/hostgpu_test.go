@@ -1,4 +1,4 @@
-package main
+package hostgpu
 
 import (
 	"os"
@@ -63,7 +63,7 @@ func TestResetDeviceExplainsAMissingResetNode(t *testing.T) {
 }
 
 // The regression this whole change exists for. sysfs said "driver: nvidia" and
-// /dev/nvidia0 existed while RmInitAdapter had failed, so every check hostgpu
+// /dev/nvidia0 existed while RmInitAdapter had failed, so every check `rig host`
 // made passed and the DisplayPort stayed dark. A DRM node is the signal that
 // cannot be true unless the adapter really came up.
 func TestAdapterReadyIgnoresBindingAndLooksForADrmNode(t *testing.T) {

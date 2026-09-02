@@ -126,15 +126,35 @@ fi
 # us — so ask it rather than keeping a second, wronger answer.
 rm -f "$D/restarts"   # remove the counter that caused this; nothing reads it now
 
+# Was the previous exit a crash, or our own "the turn ended, keep going"?
+# systemd cannot tell us: both are a non-zero exit and both bump NRestarts. So
+# the side that knows leaves a note, and this is the only reader — clear it now
+# so a later genuine crash is not read as another turn boundary.
+TURN_BOUNDARY=0
+if [ -e "$D/turn_boundary" ]; then
+  TURN_BOUNDARY=1
+  rm -f "$D/turn_boundary"
+fi
+
 if compgen -G "$D/projects/*/$SID.jsonl" > /dev/null; then
   MODE=(--resume "$SID")
 
   NR="$(systemctl show "${RIG_AGENT_UNIT:-rig-agent}" -p NRestarts --value 2>/dev/null)"
   case "$NR" in ''|*[!0-9]*) NR=0 ;; esac
 
-  # Both notes ask for the same reconciliation — a tool call in flight is lost
-  # either way — but only one of them asserts a crash.
-  if [ "$NR" -gt 0 ]; then
+  # Three cases, and only one of them is a crash. Telling an agent its process
+  # died when in fact its own turn simply ended would send it to reconcile a
+  # working tree nothing interrupted — the same wasted turn the NRestarts note
+  # above was written to stop.
+  if [ "$TURN_BOUNDARY" -eq 1 ]; then
+    PROMPT="$PROMPT
+
+--- NOTE: your previous turn ended; you were resumed to keep working ---
+Nothing crashed and nothing was interrupted. You stopped talking, which ends a
+turn but not the engagement, so you were restarted with your conversation
+intact. Pick up where you left off. When the whole brief is genuinely finished,
+create $D/DONE and stop — that is the only thing that ends this."
+  elif [ "$NR" -gt 0 ]; then
     PROMPT="$PROMPT
 
 --- NOTE: this process was restarted after a failure (restart #$NR) ---
@@ -167,6 +187,29 @@ timeout "$TIMEOUT" claude -p "$PROMPT" "${MODE[@]}" \
 
 RC=$?
 echo "$RC" > "$D/last_exit"
+
+# --- did the mission finish, or just the turn? ---------------------------
+# `claude -p` returns when the model stops talking, which for a brief with
+# several missions in it is nowhere near the finish line. Exit 0 there and
+# Restart=on-failure sees success, the unit stops, and an engagement that was
+# four hours from done sits idle until a human notices. The old microsandbox
+# harness papered over this with a shell loop that re-invoked --continue
+# forever; the loop was right and its termination condition was not — it could
+# only guess at "finished" by grepping the transcript.
+#
+# So the agent says so itself, by creating a file. A clean exit with no DONE
+# marker is a turn boundary, not a result: report a failure so systemd restarts
+# us, and the fixed session UUID means the restart resumes the conversation
+# rather than re-reading the brief from the top.
+#
+# Opt-in, because the honest default for an unattended process is to stop when
+# it says it is finished. StartLimitBurst still bounds this: an agent that ends
+# its turn instantly, over and over, escalates to a human instead of spinning.
+if [ "$RC" -eq 0 ] && [ "${RIG_AGENT_UNTIL_DONE:-}" = "1" ] && [ ! -e "$D/DONE" ]; then
+  echo "[$(date -Is)] turn ended cleanly with no $D/DONE marker; resuming" >> "$D/stderr.log"
+  : > "$D/turn_boundary"
+  exit 75   # EX_TEMPFAIL: not a failure of the run, a signal to continue
+fi
 
 # 0 means the agent decided it was finished. Anything else is a failure that
 # systemd should retry — exit non-zero so Restart=on-failure sees it.

@@ -355,7 +355,15 @@ func Stop(c *incus.Client, cfg Config, name string, timeoutSec int) error {
 	if err := c.SetState(name, "stop", timeoutSec); err != nil {
 		return err
 	}
-	fmt.Printf("stopped %s (GPU still attached to it)\n", name)
+	// Only say the card is still attached when it actually is. Incus keeps a
+	// GPU device across a stop, which is what the note is for — but a --no-gpu
+	// VM never had one, and saying so anyway contradicts `rig status` in the
+	// same breath and sends the operator looking for a card to release.
+	if len(inst.GPUDevices()) > 0 {
+		fmt.Printf("stopped %s (GPU still attached to it)\n", name)
+	} else {
+		fmt.Printf("stopped %s\n", name)
+	}
 	return nil
 }
 

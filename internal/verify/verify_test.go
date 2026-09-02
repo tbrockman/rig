@@ -127,3 +127,38 @@ func TestVerdict(t *testing.T) {
 		})
 	}
 }
+
+// --allow-gap was decoration until this: a range acknowledged as unprovable
+// still produced a non-advisory Unproven check, so the run stayed INCONCLUSIVE
+// for exactly the reason the operator had already accepted. It went unnoticed
+// because the acknowledged range happened to have a real proof on the day the
+// suite was written.
+func TestAcknowledgedRangeDoesNotKeepTheRunInconclusive(t *testing.T) {
+	r := &Runner{AllowGaps: DefaultAllowGaps, coverage: map[string][]string{}}
+	if !r.acknowledged("169.254.169.254") {
+		t.Fatal("an address in an acknowledged range must be treated as acknowledged")
+	}
+	if r.acknowledged("10.187.156.1") {
+		t.Error("10.0.0.0/8 is not in DefaultAllowGaps; it must still bind")
+	}
+	if r.acknowledged("1.1.1.1") {
+		t.Error("an address in no reject range is not acknowledged")
+	}
+}
+
+// Acknowledging a range accepts "we could not prove this", never "the guest may
+// reach it". A breach into an acknowledged range is still a breach.
+func TestAcknowledgementDoesNotExcuseAFailure(t *testing.T) {
+	r := &Runner{
+		AllowGaps: DefaultAllowGaps,
+		coverage:  map[string][]string{},
+		report: Report{Checks: []Check{{
+			Label: "link-local 169.254.169.254 tcp/80", Outcome: Fail, Advisory: true,
+		}}},
+	}
+	r.finish()
+	if r.report.Verdict != Violated {
+		t.Fatalf("verdict = %v, want Violated: an advisory check that FAILS is still a breach",
+			r.report.Verdict)
+	}
+}
