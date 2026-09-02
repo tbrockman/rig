@@ -107,6 +107,36 @@ card needs no config change.
   bump NRestarts, and telling an agent it crashed when it merely paused sends it
   to reconcile a tree nothing interrupted.
 
+## Provisioning is a flake, not a remembered sequence (2026-09-02)
+
+Bringing the open-groceries VM up needed `nix profile install claude-code socat`,
+a devShell wrapper installed on PATH, and `mkdir /work/handoff` — none of which
+was written down anywhere. The agent then found `/work/ogx` and `/work/handoff`
+missing while its environment document promised both, and spent a turn creating
+them. A VM assembled from remembered commands is a VM nothing describes, which
+is the exact state the "image is a build artifact" decision exists to prevent;
+it was simply being violated one `rig exec` at a time.
+
+Rejected: a Containerfile-style imperative layer list. The guest is a VM, Incus
+does not build VM images that way, and NixOS already has the declarative
+mechanism — the base is a flake already.
+
+`base/flake.nix` now exposes `nixosModules.gpu-dev` and `lib.mkGuest`, so a
+project can ship an optional guest flake adding its own modules. `rig image
+build` already took `--flake`/`--attr`/`--alias` and `rig new` already took
+`--image`, so no new verbs were needed; the missing piece was only that the base
+was not importable. `project-template/guest/` is the worked example.
+
+It also dissolves the two-PATH wart above: a wrapper in `systemPackages` lands
+in `/run/current-system/sw/bin`, which both the login shell and the agent unit
+search, so there is no longer any reason to write to `/usr/bin` by hand.
+
+`rig new` now records the alias it used on the instance, and `rig doctor`
+measures drift against that rather than the default — otherwise a project with
+its own guest image is reported as drifted from a base it was never built from,
+which is the same "reports on something other than what it names" failure as the
+three below.
+
 ## What `verify` could not see (found 2026-09-01, fixed)
 
 Three bugs, all found by adding docker to the base image, and all the same
@@ -318,6 +348,7 @@ is one card, one active project.
 | `base/` | Declarative image: flake + guest module, built by `rig image build` |
 | `integration/` | Build-tagged: invariants against real Incus and the real card |
 | `project-template/` | Per-project devShell, the CUDA correctness test, `run-agent` |
+| `project-template/guest/` | Optional per-project guest image: the base plus a project's own modules |
 | `secrets/` | Gitignored. Per-project credential files. |
 
 ## What would make this harder over time

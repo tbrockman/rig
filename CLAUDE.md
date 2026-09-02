@@ -102,6 +102,32 @@ daemon. A daemon is the one dependency a project flake cannot supply on NixOS,
 which is why it is here and nvcc is not. The trade: containers declaring
 `restart: unless-stopped` do not come back by themselves after a guest reboot.
 
+A project that needs more of the *machine* than the base gives it can ship a
+**guest flake** — optional, and most projects should not have one:
+
+```bash
+rig image build --flake ./guest --alias myproj-guest
+rig new myproj --image myproj-guest --env secrets/myproj.env --start
+```
+
+`project-template/guest/` is a working example. It is three lines of flake
+calling `rig.lib.mkGuest [ ./guest.nix ]`, because `rig image build` builds
+`nixosConfigurations.gpubase` and that single output is the whole contract.
+
+Reach for it exactly when you would otherwise run setup commands against a
+running guest by hand — `nix profile install`, a wrapper dropped on PATH, a
+directory that must exist at boot. That path produces a VM nothing describes,
+and it is how the `ogx`/`/work/handoff` mess happened: the agent was handed a
+document describing a machine nobody had built. It also fixes the two-PATH wart
+for free, because `writeShellScriptBin` in `systemPackages` lands in
+`/run/current-system/sw/bin`, which both the login shell and the agent unit
+search. Toolchains still belong in the project's devShell flake; this is for the
+machine, not the build.
+
+The alias a VM was created from is recorded on the instance, so `rig doctor`
+measures drift against the image it was actually built from rather than against
+whatever the default alias points at today.
+
 Build with `make`. Go 1.26, one binary from one module.
 
 ## Starting a new project

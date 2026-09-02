@@ -117,6 +117,16 @@ func (a *app) requireInstance(name string) error {
 // instance created before this flag existed keeps its old behaviour.
 const gpuKey = "user.rig.gpu"
 
+// imageKey records which image alias this VM was created from.
+//
+// Without it, `rig doctor` compares every instance against the default alias,
+// which is only right while there is one image on the host. A project with its
+// own guest image would be reported as drifted from a base it was never built
+// from — a check naming one thing and measuring another, which is the failure
+// this project keeps finding. Absent means "compare against the default", so
+// instances created before this existed behave as they did.
+const imageKey = "user.rig.image"
+
 // wantsGPU reports whether an instance should claim the card on start.
 func wantsGPU(inst *incus.Instance) bool { return inst.Config[gpuKey] != "false" }
 
@@ -183,7 +193,7 @@ func (a *app) newCmd() *cobra.Command {
 				return err
 			}
 
-			config := map[string]string{managedKey: "true"}
+			config := map[string]string{managedKey: "true", imageKey: image}
 			if noGPU {
 				config[gpuKey] = "false"
 			}
@@ -677,9 +687,12 @@ func (a *app) doctorCmd() *cobra.Command {
 		GroupID: "vm",
 		Short:   "Check a VM is what you think it is",
 		Long: "Reads configuration and asks the guest a few questions. It reports\n" +
-			"that the isolation is configured; `rig verify` proves it holds.",
+			"that the isolation is configured; `rig verify` proves it holds.\n\n" +
+			"Image drift is measured against the alias the VM was created from,\n" +
+			"not the default one, so a project with its own guest image is not\n" +
+			"reported as drifted from a base it was never built from.",
 		Args: cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			if err := a.requireInstance(name); err != nil {
 				return err
@@ -688,6 +701,7 @@ func (a *app) doctorCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			image = driftAlias(inst.Config[imageKey], image, cmd.Flags().Changed("image"))
 
 			failed := 0
 			check := func(label string, ok bool, detail string) {
@@ -929,6 +943,20 @@ func (a *app) pullCmd() *cobra.Command {
 }
 
 // --- helpers -------------------------------------------------------------
+
+// driftAlias picks the image alias `doctor` measures an instance against.
+//
+// The recorded alias wins over the default, because "has this VM drifted from
+// the image it was built from" is the question worth asking; comparing a
+// project's guest image against the base alias reports drift that does not
+// exist. An explicit --image still wins over both: that is the operator asking
+// a different question on purpose.
+func driftAlias(recorded, flagValue string, flagChanged bool) string {
+	if flagChanged || recorded == "" {
+		return flagValue
+	}
+	return recorded
+}
 
 func isolationDetail(acl string, unisolated, noEgress []string) string {
 	if len(unisolated) > 0 {

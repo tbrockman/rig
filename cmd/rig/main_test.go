@@ -241,3 +241,21 @@ func TestFlakeRefPassesAReferenceThrough(t *testing.T) {
 		t.Errorf("flake refs go through unchanged, got %q (%v)", got, err)
 	}
 }
+
+// A project with its own guest image must not be reported as drifted from a
+// base it was never built from. The recorded alias is the honest comparison;
+// the default is only right while there is one image on the host.
+func TestDriftAliasPrefersWhatTheVMWasBuiltFrom(t *testing.T) {
+	if got := driftAlias("og-guest", defaultImage, false); got != "og-guest" {
+		t.Errorf("compared against %q, want the recorded alias og-guest", got)
+	}
+	// Nothing recorded: instances created before the key existed still compare
+	// against the default rather than against nothing.
+	if got := driftAlias("", defaultImage, false); got != defaultImage {
+		t.Errorf("compared against %q, want the default %q", got, defaultImage)
+	}
+	// An explicit --image is a different question, asked on purpose.
+	if got := driftAlias("og-guest", "some-other", true); got != "some-other" {
+		t.Errorf("compared against %q, want the explicit flag value", got)
+	}
+}

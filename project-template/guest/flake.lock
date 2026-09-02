@@ -1,0 +1,41 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1787414105,
+        "narHash": "sha256-WncT27+3BOkgTaJZLnCsf3LcYf9RXMuR9ONSN4rzQ7s=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "a9e6d84f9c2f9012f5fe7d964a7851352300e61a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-26.05",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "rig": {
+      "inputs": {
+        "nixpkgs": "nixpkgs"
+      },
+      "locked": {
+        "narHash": "sha256-yNenG/nV5+ZPcEZ0cg1w1FLUT7tEkI9WkeKQxkODq9k=",
+        "path": "/home/theo/dev/rig/base",
+        "type": "path"
+      },
+      "original": {
+        "path": "/home/theo/dev/rig/base",
+        "type": "path"
+      }
+    },
+    "root": {
+      "inputs": {
+        "rig": "rig"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
