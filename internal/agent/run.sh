@@ -16,6 +16,15 @@
 #     is still working rather than only when it finishes.
 set -u
 
+# The unit set PATH, and the login shell running this script has just replaced
+# it: NixOS's /etc/profile exports PATH absolutely, so nothing the unit put
+# there survives. Put the unit's list back in front. The login shell's own
+# entries stay behind it — they carry the nix store paths `nix develop` needs
+# and the certificate bundle claude needs to speak TLS.
+if [ -n "${RIG_AGENT_PATH:-}" ]; then
+  export PATH="$RIG_AGENT_PATH:$PATH"
+fi
+
 # Both overridable so the script can be exercised outside a guest. rig always
 # uses the defaults; nothing sets these in production.
 D="${RIG_AGENT_DIR:-/var/lib/rig-agent}"

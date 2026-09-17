@@ -79,17 +79,26 @@ func NewSessionID() (string, error) {
 	return fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32]), nil
 }
 
-// UnitPATH is what the unit runs with.
+// UnitPATH is where the agent looks for its binary.
 //
 // The nix profile comes first: an agent binary installed with `nix profile
-// install` lands there, and a transient unit does not inherit a login shell's
-// PATH. Leaving it out fails as "failed to run command 'claude': No such file
-// or directory", which reads like a broken image rather than a missing entry.
+// install` lands there. /usr/bin is the one writable directory that survives a
+// reboot, for a helper put there by hand or a stand-in binary in a test.
+//
+// It reaches the agent by a detour. The unit runs the runner under a login
+// shell, so that /etc/profile sets up the nix environment — the store paths
+// `nix develop` needs, the certificate bundle claude needs to speak TLS. But
+// NixOS's /etc/profile exports PATH absolutely, so whatever the unit set is
+// discarded at that point (measured: a unit started with PATH=/marker/bin
+// ran its login shell with no /marker/bin in sight). So the unit passes this
+// value as RIG_AGENT_PATH as well, and the runner puts it back in front once
+// the login shell is done. Until that existed, `rig agent start`'s preflight
+// searched this list while the unit searched the login shell's, and a binary
+// in /usr/bin passed the check and then restart-looped on exit 127 — the exact
+// failure the check was written to catch.
 //
 // One constant rather than a literal at the use site, because the preflight
-// check has to look down exactly the PATH the unit will use. A check that
-// searched a login shell's PATH instead would pass for a binary the unit cannot
-// see, which is the failure it exists to catch.
+// has to look down exactly the PATH the runner will use.
 const UnitPATH = "/root/.nix-profile/bin:/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/bin"
 
 // InstallHint is the command that puts the agent binary where the unit will
@@ -157,6 +166,7 @@ func SystemdRun(o UnitOpts) []string {
 		"--setenv=HOME=/root",
 		"--setenv=TERM=dumb",
 		"--setenv=PATH=" + UnitPATH,
+		"--setenv=RIG_AGENT_PATH=" + UnitPATH,
 		"--setenv=RIG_AGENT_WORKDIR=" + o.Workdir,
 		"--setenv=RIG_AGENT_SESSION=" + o.Session,
 		"--setenv=RIG_AGENT_TIMEOUT=" + o.Timeout,
@@ -252,8 +262,11 @@ func ExplainError(msg string) string {
 			"      The credential snapshot is stale. Refreshing an OAuth session rotates\n" +
 			"      its refresh token, so another consumer of the same credential — a\n" +
 			"      Claude Code session on the host — invalidates this copy when it\n" +
-			"      refreshes. Re-snapshot it, then `rig restart` and start again.\n" +
-			"      A token from `claude setup-token` avoids this entirely."
+			"      refreshes. Re-snapshot it and inject it without a VM restart:\n" +
+			"        rig creds <vm> <env-file>\n" +
+			"      A unit still retrying picks it up on its next try; one that gave up\n" +
+			"      resumes with `rig agent start`. A token from `claude setup-token`\n" +
+			"      avoids this entirely."
 	}
 	return msg
 }

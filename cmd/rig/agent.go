@@ -34,9 +34,50 @@ func (a *app) agentCmd() *cobra.Command {
 			"file in the guest, delivered at the agent's next turn or next restart —\n" +
 			"never a pipe, which would die with either process.",
 	}
-	cmd.AddCommand(a.agentStartCmd(), a.agentSendCmd(), a.agentStatusCmd(),
-		a.agentLogCmd(), a.agentStopCmd())
+	cmd.AddCommand(a.agentInstallCmd(), a.agentStartCmd(), a.agentSendCmd(),
+		a.agentStatusCmd(), a.agentLogCmd(), a.agentStopCmd())
 	return cmd
+}
+
+// agentInstallCmd puts the agent binary where the unit will find it.
+//
+// A verb rather than a hint to copy out of an error: the install needs two
+// flags that are not guessable (see agent.InstallHint), and a fresh VM needs
+// it every time, so it belongs on the path an operator actually walks.
+func (a *app) agentInstallCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "install <vm>",
+		Short: "Put the agent binary on the unit's PATH",
+		Long: "Installs claude-code into the guest's nix profile, which is on the agent\n" +
+			"unit's PATH. The agent is a project decision rather than part of the base\n" +
+			"image, so a fresh VM has none. A project that would rather pin its agent\n" +
+			"ships it in its guest flake instead (project-template/guest), and then\n" +
+			"never needs this.\n\n" +
+			"Runs, in the guest:\n  " + agent.InstallHint,
+		Args: cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			name := args[0]
+			if err := a.requireInstance(name); err != nil {
+				return err
+			}
+			if out, err := a.exec(name, agent.ClaudeProbe()); err == nil && strings.TrimSpace(out) != "" {
+				note("claude is already on the unit's PATH in %s: %s", name, strings.TrimSpace(out))
+				return nil
+			}
+			note("installing claude-code into %s's nix profile (a download; this takes a while)", name)
+			if _, err := a.c.Exec(name, agent.InstallHint, incus.ExecOpts{
+				Streaming: true, Timeout: 30 * time.Minute,
+			}); err != nil {
+				return fmt.Errorf("install failed in %s: %w", name, err)
+			}
+			out, err := a.exec(name, agent.ClaudeProbe())
+			if err != nil || strings.TrimSpace(out) == "" {
+				return fmt.Errorf("the install ran, but no `claude` appeared on the unit's PATH\n  PATH searched: %s", agent.UnitPATH)
+			}
+			note("claude at %s", strings.TrimSpace(out))
+			return nil
+		},
+	}
 }
 
 func (a *app) agentStartCmd() *cobra.Command {
@@ -46,7 +87,20 @@ func (a *app) agentStartCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "start <vm>",
 		Short: "Start the unattended agent",
-		Args:  cobra.ExactArgs(1),
+		Long: "Starts the agent as the " + agent.Unit + " systemd unit in the guest, working in\n" +
+			"--workdir on the brief in --prompt-file. Two things must already be true:\n" +
+			"the VM has a credential file recorded (rig new/start --env), and a `claude`\n" +
+			"binary is on the unit's PATH — a project decision, so a fresh VM has none.\n\n" +
+			"Everything about the run lives under " + agent.Dir + " in the guest:\n" +
+			"  prompt          the brief, as given\n" +
+			"  inbox           messages from `rig agent send`, delivered at the next turn\n" +
+			"  events.jsonl    the raw stream-json event log (`rig agent log` filters it)\n" +
+			"  stderr.log      the runner's own notes and claude's stderr\n" +
+			"  STATUS.md       whatever the agent writes there; `rig agent status` prints it\n" +
+			"  DONE            created by the agent to say the brief is finished\n\n" +
+			"A session that already exists is resumed, not replaced; --new-session\n" +
+			"starts a fresh conversation for a second mission in the same VM.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			if err := a.requireInstance(name); err != nil {
@@ -74,7 +128,7 @@ func (a *app) agentStartCmd() *cobra.Command {
 				return fmt.Errorf("no `claude` on the agent unit's PATH in %s.\n"+
 					"The agent binary is a project decision, not part of the base image,\n"+
 					"so a fresh VM does not have one until you put it there:\n"+
-					"  rig exec %s %s\n"+
+					"  rig agent install %s   # runs: %s\n"+
 					"PATH searched: %s", name, name, agent.InstallHint, agent.UnitPATH)
 			}
 
@@ -274,6 +328,11 @@ func (a *app) agentStatusCmd() *cobra.Command {
 					row("last exit", fmt.Sprintf("%s (%s ago)", code, age))
 				default:
 					row("last exit", code)
+				}
+				// 127 is the shell saying the agent binary is not there. It
+				// is the one exit code with a single cause, so name it.
+				if code == "127" {
+					row("", "127 is \"command not found\": no claude on the unit's PATH.  rig agent install "+name)
 				}
 			} else {
 				row("last exit", "")

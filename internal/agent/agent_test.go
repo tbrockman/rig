@@ -42,6 +42,7 @@ func TestSystemdRunCarriesTheSurvivalProperties(t *testing.T) {
 		{"--setenv=RIG_AGENT_SESSION=sid", "the session must be fixed so a restart resumes"},
 		{"--working-directory=/work/p", "claude scopes session lookup to the project dir"},
 		{"/root/.nix-profile/bin", "a nix-profile-installed agent is not on a transient unit's PATH"},
+		{"--setenv=RIG_AGENT_PATH=" + UnitPATH, "the login shell discards PATH; the runner needs the unit's list by another name"},
 	} {
 		if !strings.Contains(got, want.flag) {
 			t.Errorf("missing %s — %s", want.flag, want.why)
@@ -58,6 +59,22 @@ func TestSystemdRunUsesALoginShell(t *testing.T) {
 	}
 	if !strings.Contains(got, RunnerPath) {
 		t.Error("must invoke the installed runner")
+	}
+}
+
+// NixOS's /etc/profile exports PATH absolutely, so the login shell the runner
+// starts under throws the unit's PATH away. Measured: a unit given
+// PATH=/marker/bin ran its login shell without it. The runner has to put the
+// unit's list back, or the preflight checks a PATH nothing searches.
+func TestRunnerRestoresTheUnitPATHAfterTheLoginShell(t *testing.T) {
+	r := string(Runner())
+	if !strings.Contains(r, `export PATH="$RIG_AGENT_PATH:$PATH"`) {
+		t.Error("the runner must prepend the unit's PATH; the login shell has just replaced it")
+	}
+	// Prepend, never replace: the login shell's entries carry the TLS
+	// certificate bundle and the nix store paths the agent's builds need.
+	if strings.Contains(r, `export PATH="$RIG_AGENT_PATH"`) {
+		t.Error("the login shell's PATH must be kept behind the unit's, not dropped")
 	}
 }
 
@@ -157,7 +174,10 @@ func TestLastErrorIsSilentOnSuccess(t *testing.T) {
 // consumer rotated the refresh token — is not guessable from the text.
 func TestExplainErrorAddsTheCauseAndTheFix(t *testing.T) {
 	got := ExplainError("Failed to authenticate: OAuth session expired and could not be refreshed")
-	for _, want := range []string{"rotates", "rig restart", "setup-token"} {
+	// `rig creds`, not `rig restart`: the whole point of that verb is that a
+	// stale credential must not cost the VM, and the agent's own error is the
+	// place an operator learns it exists.
+	for _, want := range []string{"rotates", "rig creds", "setup-token"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("explanation should mention %q, got:\n%s", want, got)
 		}
