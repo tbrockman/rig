@@ -2,7 +2,7 @@
 
 On Linux, `rig` creates isolated NixOS VMs, 
 runs an unattended coding agent inside them, and proves, to the best of its ability using packets, 
-that guest agents cannot reach the host, the LAN, or anything else it has no business reaching.
+that guest agents cannot reach the host, the LAN, or anything else they have no business reaching.
 
 It is pretty much entirely vibe-coded, built on [Incus](https://linuxcontainers.org/incus/), 
 supports GPU passthrough through VFIO, and relies on [Claude Code](https://claude.com/claude-code) as the
