@@ -33,20 +33,22 @@ func (a *app) hostCmd() *cobra.Command {
 		Use:     "host",
 		GroupID: "card",
 		Short:   "Move the card between this host's desktop and VMs",
-		Long: "Assumes the console is on the iGPU (HDMI) and the card is on DisplayPort.\n\n" +
+		Long: "For a host that also uses the card for its own desktop. Assumes another\n" +
+			"GPU — an iGPU, typically — drives the console, so the card can leave for\n" +
+			"a VM and come back without taking the only display with it.\n\n" +
 			"`desktop` and `headless` write to sysfs and need root: they re-exec\n" +
 			"themselves under sudo, printing the command first. `status` does not.\n\n" +
 			"Reclaiming the card RESETS it before the driver loads, then checks a DRM\n" +
 			"node appeared rather than trusting that the driver bound — without the\n" +
 			"reset the desktop comes back with no display, and without the check rig\n" +
 			"reports success anyway.\n\n" +
-			"Environment: GPU_PCI, GPU_AUDIO_PCI.",
+			"Environment: RIG_PCI, when discovery picks the wrong card.",
 	}
 	f := cmd.PersistentFlags()
-	f.StringVar(&dm, "display-manager", "gdm", "display manager unit")
-	f.StringVar(&pci, "pci", os.Getenv("GPU_PCI"), "card's PCI address (default: discovered)")
-	f.StringVar(&audioPCI, "audio-pci", os.Getenv("GPU_AUDIO_PCI"),
-		"the card's audio function (default: the GPU's address at function 1)")
+	f.StringVar(&dm, "display-manager", "display-manager",
+		"the desktop's display manager unit; the display-manager alias resolves to whichever one is enabled (gdm, sddm, lightdm)")
+	f.StringVar(&pci, "pci", "", "card's PCI address (default: RIG_PCI, else discovered)")
+	f.StringVar(&audioPCI, "audio-pci", "", "the card's audio function (default: the GPU's address at function 1)")
 
 	// resolve fills in whatever was not given. Runs unprivileged, before any
 	// elevation, so the root half never has to discover anything.
@@ -159,7 +161,7 @@ func (a *app) printCardHolders() error {
 //
 // Every resolved value crosses as an explicit flag rather than in the
 // environment: sudo resets the environment by default, and --preserve-env is
-// not guaranteed by every sudoers policy, so a discovered GPU_PCI would
+// not guaranteed by every sudoers policy, so a discovered address would
 // silently fail to arrive and the root half would rediscover it — possibly
 // differently. Flags also make the printed command the whole truth about what
 // is about to run as root.

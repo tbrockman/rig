@@ -134,8 +134,9 @@ func DiscoverPCI(c *incus.Client, cfg Config) (string, error) {
 	case 1:
 		return found[0], nil
 	case 0:
-		return "", fmt.Errorf("no NVIDIA display controller on the PCI bus.\n" +
-			"  Set it explicitly:  export RIG_PCI=0000:04:00.0")
+		return "", fmt.Errorf("no NVIDIA display controller on the PCI bus. rig drives NVIDIA cards\n" +
+			"only — the guest image carries the NVIDIA driver. If the card is there under\n" +
+			"another PCI class, name it:  export RIG_PCI=0000:01:00.0")
 	default:
 		return "", fmt.Errorf("found %d NVIDIA display controllers (%s); this tool assumes one.\n"+
 			"  Set it explicitly:  export RIG_PCI=%s",
@@ -297,7 +298,7 @@ func Start(c *incus.Client, cfg Config, name string, allowUnisolated, withGPU bo
 	if len(unisolated) > 0 && !allowUnisolated {
 		return fmt.Errorf("%s has no network isolation: NIC %s does not carry the %q ACL.\n"+
 			"An unisolated guest reaches this host's sshd on every address the host holds, "+
-			"plus the LAN and the tailnet.\n"+
+			"plus the LAN and any overlay network (Tailscale, WireGuard) the host is on.\n"+
 			"Fix it for every instance:  rig apply\n"+
 			"To start anyway:  rig start --allow-unisolated %s",
 			name, strings.Join(unisolated, ", "), cfg.ACL, name)

@@ -15,11 +15,6 @@
     # `nixpkgs.config.allowUnfree` in the base module covers it here.
     claude-code
 
-    # Bridges a guest TCP port to a host vsock listener. Incus proxy devices
-    # cannot do this for VMs — bind=instance is container-only — so vsock is the
-    # only way to reach a host-side service without opening the network ACL.
-    socat
-
     # Run one command inside the project's devShell.
     #
     # In systemPackages, so it lands in /run/current-system/sw/bin — which is on
@@ -51,9 +46,10 @@
     '')
   ];
 
-  # Directories the agent is told exist. Told, in a document it re-reads every
-  # restart — so if one is missing it burns a turn discovering that and creating
-  # it, every time, until someone fixes the document or the machine.
+  # Directories the brief tells the agent exist — here, one for it to hand
+  # results back through. Told, in a document it re-reads every restart: if
+  # the directory is missing it burns a turn discovering that and creating it,
+  # every time, until someone fixes the document or the machine.
   systemd.tmpfiles.rules = [
     "d /work/handoff 0755 root root -"
   ];

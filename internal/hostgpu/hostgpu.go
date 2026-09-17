@@ -12,7 +12,9 @@
 // The privileged half does sysfs and systemctl and nothing else, so the code
 // running as root is as small as it can be.
 //
-// Assumes the console is on the iGPU (HDMI) and the card is on DisplayPort.
+// Assumes the host has another GPU — an iGPU, typically — that can drive the
+// console, so this card can leave for a VM and come back without taking the
+// only display with it.
 package hostgpu
 
 import (
@@ -95,8 +97,8 @@ func (c Conf) Desktop() error {
 	if err := exec.Command("systemctl", "start", c.DM).Run(); err != nil {
 		return fmt.Errorf("starting %s: %w", c.DM, err)
 	}
-	fmt.Println("\nSwitch your monitor to the DisplayPort input.")
-	fmt.Println("(The HDMI/iGPU console stays available on tty1.)")
+	fmt.Println("\nIf your monitor is on this card, switch it to that input.")
+	fmt.Println("(The console on the other GPU stays available on tty1.)")
 	c.Status()
 	return nil
 }

@@ -93,9 +93,10 @@ func (r *Report) ExitCode() int {
 // DefaultAllowGaps are reject ranges this project has accepted as unprovable.
 //
 // 169.254.0.0/16 is in the policy because it covers every cloud metadata
-// address, but nothing on this host answers on it, so a guest failing to reach
+// address, but on most hosts nothing answers there, so a guest failing to reach
 // it demonstrates nothing. It is listed here rather than dropped from the
 // coverage report: an acknowledged gap stays visible, an omitted one does not.
+// Pass --allow-gap with no value to insist on a proof for every range.
 var DefaultAllowGaps = []string{"169.254.0.0/16"}
 
 type Runner struct {

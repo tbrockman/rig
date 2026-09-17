@@ -197,10 +197,10 @@ func TestManifestRecordsWhatWasSent(t *testing.T) {
 // per-file judgement that a count cannot inform.
 func TestErrorNamesEveryFileAndHowToLook(t *testing.T) {
 	err := Error([]Conflict{
-		{"/seed/ESCALATION.md", "changed inside the guest since rig last wrote it"},
-	}, "kclcad", "/seed")
+		{"/work/notes/DECISIONS.md", "changed inside the guest since rig last wrote it"},
+	}, "myvm", "/work/notes")
 	msg := err.Error()
-	for _, want := range []string{"/seed/ESCALATION.md", "rig pull kclcad", "--force"} {
+	for _, want := range []string{"/work/notes/DECISIONS.md", "rig pull myvm", "--force"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message should contain %q, got:\n%s", want, msg)
 		}

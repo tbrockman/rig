@@ -1,2 +1,5 @@
 # Built binary. Anchored, or this also matches cmd/rig.
 /rig
+
+# Per-user Claude Code permissions; the shared allowlist is settings.json.
+/.claude/settings.local.json

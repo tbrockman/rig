@@ -1,12 +1,15 @@
 # Project template
 
-Copy into a new project. Gives you a CUDA toolchain and the agent, both pinned by
-the project rather than the base image, plus one test worth keeping.
+`rig init <dir>` writes this into a new project, from the copy embedded in the
+binary; in a checkout, copying the directory does the same. It gives you a CUDA
+toolchain and the agent, both pinned by the project rather than the base image,
+plus one test worth keeping.
 
 ```bash
-./rig new proj-foo --env secrets/foo.env --start
-./rig push proj-foo project-template
-./rig exec --dir /work/project-template proj-foo nix develop "path:." -c make run
+./rig init proj
+./rig new myproj --env secrets/myproj.env --start
+./rig push myproj proj
+./rig exec --dir /work/proj myproj nix develop "path:." -c make run
 ```
 
 ## Why the toolchain is here
@@ -45,9 +48,9 @@ never runs, because a zeroed output buffer satisfies `0 + 0 == 0`. This one:
 Exit codes: `0` pass, `1` a check failed, `2` a CUDA call failed (including "no
 CUDA device", which is what you get when the GPU is not attached).
 
-It also prints H2D/D2H bandwidth — not a benchmark, but this host has the card in
-a chipset **x2** slot (~3.2 GB/s), and profiling conclusions drawn here will not
-hold on an x16 machine.
+It also prints H2D/D2H bandwidth — not a benchmark, but worth a glance: a card
+in a chipset **x2** slot reports ~3 GB/s, and profiling conclusions drawn there
+do not hold on an x16 machine. Passthrough itself costs nothing measurable.
 
 ## `run-agent`
 
