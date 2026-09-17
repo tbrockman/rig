@@ -1,4 +1,4 @@
-module rig
+module github.com/tbrockman/rig
 
 go 1.26
 

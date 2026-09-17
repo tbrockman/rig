@@ -19,10 +19,10 @@ import (
 	"testing"
 	"time"
 
-	"rig/internal/gpu"
-	"rig/internal/incus"
-	"rig/internal/policy"
-	"rig/internal/verify"
+	"github.com/tbrockman/rig/internal/gpu"
+	"github.com/tbrockman/rig/internal/incus"
+	"github.com/tbrockman/rig/internal/policy"
+	"github.com/tbrockman/rig/internal/verify"
 )
 
 const (

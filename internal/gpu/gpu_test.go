@@ -3,7 +3,7 @@ package gpu
 import (
 	"testing"
 
-	"rig/internal/incus"
+	"github.com/tbrockman/rig/internal/incus"
 )
 
 func TestHoldersOnlyCountsLocalDevices(t *testing.T) {

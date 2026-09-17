@@ -9,9 +9,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"rig/internal/agent"
-	"rig/internal/creds"
-	"rig/internal/incus"
+	"github.com/tbrockman/rig/internal/agent"
+	"github.com/tbrockman/rig/internal/creds"
+	"github.com/tbrockman/rig/internal/incus"
 )
 
 // exec runs a short control command in the guest. Bounded: everything the agent

@@ -14,7 +14,7 @@ import (
 	"regexp"
 	"strings"
 
-	"rig/internal/incus"
+	"github.com/tbrockman/rig/internal/incus"
 )
 
 // GuestPath is on tmpfs, so credentials never reach the instance's disk or its

@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"rig/internal/gpu"
-	"rig/internal/hostgpu"
+	"github.com/tbrockman/rig/internal/gpu"
+	"github.com/tbrockman/rig/internal/hostgpu"
 )
 
 // The host verbs. This was a second binary, `hostgpu`, because it is the only

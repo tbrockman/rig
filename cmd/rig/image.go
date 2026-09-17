@@ -11,7 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"rig/internal/incus"
+	"github.com/tbrockman/rig/internal/incus"
 )
 
 // Properties rig stamps on an image it built.

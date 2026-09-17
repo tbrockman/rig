@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"rig/internal/incus"
+	"github.com/tbrockman/rig/internal/incus"
 )
 
 // RejectRanges is IPv4-only by decision: the bridge runs ipv6.address=none

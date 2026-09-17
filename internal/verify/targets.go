@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"rig/internal/incus"
+	"github.com/tbrockman/rig/internal/incus"
 )
 
 // A Target is one thing to probe, and the claim being made about it.

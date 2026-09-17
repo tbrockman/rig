@@ -14,8 +14,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"rig/internal/incus"
-	"rig/internal/vsock"
+	"github.com/tbrockman/rig/internal/incus"
+	"github.com/tbrockman/rig/internal/vsock"
 )
 
 // Forwarding a TCP port between this host and a guest, over vsock.

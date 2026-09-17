@@ -22,11 +22,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"rig/internal/creds"
-	"rig/internal/gpu"
-	"rig/internal/incus"
-	"rig/internal/policy"
-	"rig/internal/pushguard"
+	"github.com/tbrockman/rig/internal/creds"
+	"github.com/tbrockman/rig/internal/gpu"
+	"github.com/tbrockman/rig/internal/incus"
+	"github.com/tbrockman/rig/internal/policy"
+	"github.com/tbrockman/rig/internal/pushguard"
 )
 
 // managedKey marks instances rig created. rm refuses anything without it, so it

@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"rig/internal/creds"
-	"rig/internal/incus"
+	"github.com/tbrockman/rig/internal/creds"
+	"github.com/tbrockman/rig/internal/incus"
 )
 
 func envFileAt(t *testing.T, content string, mode os.FileMode) string {

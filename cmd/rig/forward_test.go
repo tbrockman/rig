@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"rig/internal/incus"
+	"github.com/tbrockman/rig/internal/incus"
 )
 
 func TestGuestCIDReadsWhatIncusAssigned(t *testing.T) {

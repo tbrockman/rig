@@ -15,8 +15,8 @@ import (
 	"strings"
 	"syscall"
 
-	"rig/internal/incus"
-	"rig/internal/policy"
+	"github.com/tbrockman/rig/internal/incus"
+	"github.com/tbrockman/rig/internal/policy"
 )
 
 const (

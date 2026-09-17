@@ -28,8 +28,8 @@ import (
 	"strings"
 	"time"
 
-	"rig/internal/incus"
-	"rig/internal/policy"
+	"github.com/tbrockman/rig/internal/incus"
+	"github.com/tbrockman/rig/internal/policy"
 )
 
 type Outcome string

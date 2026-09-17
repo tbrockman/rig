@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"rig/internal/verify"
+	"github.com/tbrockman/rig/internal/verify"
 )
 
 func (a *app) verifyCmd() *cobra.Command {
