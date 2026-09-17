@@ -27,12 +27,14 @@ func (a *app) agentCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "agent",
 		GroupID: "guest",
-		Short:   "Run an unattended agent in the guest, and talk to it",
-		Long: "Runs a coding agent as a systemd unit inside the guest so it outlives\n" +
+		Short:   "Run Claude Code unattended in the guest, and talk to it",
+		Long: "Runs Claude Code as a systemd unit inside the guest so it outlives\n" +
 			"your shell. Its session UUID is fixed and stored, so a crash resumes the\n" +
 			"conversation instead of restarting the brief. Messages you send are a\n" +
 			"file in the guest, delivered at the agent's next turn or next restart —\n" +
-			"never a pipe, which would die with either process.",
+			"never a pipe, which would die with either process.\n\n" +
+			"These verbs are built around Claude Code: its flags, its session resume,\n" +
+			"its event stream. DESIGN.md lists what another agent would need.",
 	}
 	cmd.AddCommand(a.agentInstallCmd(), a.agentStartCmd(), a.agentSendCmd(),
 		a.agentStatusCmd(), a.agentLogCmd(), a.agentStopCmd())
@@ -48,11 +50,11 @@ func (a *app) agentInstallCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "install <vm>",
 		Short: "Put the agent binary on the unit's PATH",
-		Long: "Installs claude-code into the guest's nix profile, which is on the agent\n" +
-			"unit's PATH. The agent is a project decision rather than part of the base\n" +
-			"image, so a fresh VM has none. A project that would rather pin its agent\n" +
-			"ships it in its guest flake instead (project-template/guest), and then\n" +
-			"never needs this.\n\n" +
+		Long: "Installs Claude Code into the guest's nix profile, which is on the agent\n" +
+			"unit's PATH. The base image does not carry it, so which build a VM runs\n" +
+			"is a project decision, and a fresh VM has none. A project that would\n" +
+			"rather pin it ships it in its guest flake instead (project-template/guest),\n" +
+			"and then never needs this.\n\n" +
 			"Runs, in the guest:\n  " + agent.InstallHint,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -89,8 +91,8 @@ func (a *app) agentStartCmd() *cobra.Command {
 		Short: "Start the unattended agent",
 		Long: "Starts the agent as the " + agent.Unit + " systemd unit in the guest, working in\n" +
 			"--workdir on the brief in --prompt-file. Two things must already be true:\n" +
-			"the VM has a credential file recorded (rig new/start --env), and a `claude`\n" +
-			"binary is on the unit's PATH — a project decision, so a fresh VM has none.\n\n" +
+			"the VM has a credential file recorded (rig new/start --env), and Claude Code\n" +
+			"is on the unit's PATH — the image does not carry it, so a fresh VM has none.\n\n" +
 			"Everything about the run lives under " + agent.Dir + " in the guest:\n" +
 			"  prompt          the brief, as given\n" +
 			"  inbox           messages from `rig agent send`, delivered at the next turn\n" +
@@ -126,8 +128,8 @@ func (a *app) agentStartCmd() *cobra.Command {
 			// says nothing about the one thing that is wrong.
 			if out, err := a.exec(name, agent.ClaudeProbe()); err != nil || strings.TrimSpace(out) == "" {
 				return fmt.Errorf("no `claude` on the agent unit's PATH in %s.\n"+
-					"The agent binary is a project decision, not part of the base image,\n"+
-					"so a fresh VM does not have one until you put it there:\n"+
+					"rig agent runs Claude Code, and the base image does not carry it, so a\n"+
+					"fresh VM has none until you put one there:\n"+
 					"  rig agent install %s   # runs: %s\n"+
 					"PATH searched: %s", name, name, agent.InstallHint, agent.UnitPATH)
 			}

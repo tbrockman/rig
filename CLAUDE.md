@@ -49,11 +49,13 @@ copy is often the only one. `rig pull --out` refuses to clobber a host file for
 the same reason. An instance created before the manifest existed has no record,
 so its first push asks for `--force` once.
 
-The guest needs an agent binary before `rig agent` can run one. It is a project
-decision, not part of the base image, so a fresh VM has none until you put one
-there: `rig agent install <vm>`. `rig agent start` checks before it creates any
-state, because the alternative is a unit that restart-loops with `last exit 127`
-and says nothing about why.
+The guest needs Claude Code on the unit's PATH before `rig agent` can run it.
+The base image does not carry it, so which build a VM has is a project
+decision, and a fresh VM has none until you put one there: `rig agent install
+<vm>`. `rig agent start` checks before it creates any state, because the
+alternative is a unit that restart-loops with `last exit 127` and says nothing
+about why. The agent verbs are built around Claude Code — its flags, its
+session resume, its event stream; DESIGN.md lists what another agent would need.
 
 `rig agent` runs an unattended agent in the guest and keeps a channel to it.
 It is a systemd unit, so it outlives your shell; its session UUID is fixed and

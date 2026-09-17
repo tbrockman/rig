@@ -447,3 +447,37 @@ quietly.
    card. It once stopped compiling for two weeks behind a signature change,
    because a build tag hides a package from `go vet ./...` — `make test` now
    vets it explicitly, but nothing runs it but a human with the machine idle.
+7. **The credential is in the guest.** `/run/rig/env` is tmpfs and dies with
+   the VM, but while the VM runs the key is in the agent's environment and in
+   the environment of everything it spawns. Nothing keeps it out of the agent's
+   context; an agent that prints its environment has printed it. The design
+   that would fix this is sketched under "A guest can reach this host over
+   vsock": a host-side proxy that holds the key and injects it per request,
+   with the guest holding only a proxy address, so an agent that strips its
+   proxy settings gets a 401 rather than a bypass. `rig forward --to-guest` is
+   the transport it would run over. It is not implemented, and until it is,
+   scoping the key is the only control.
+8. **`rig agent` is Claude Code-shaped.** "The agent is a project decision"
+   means which build of Claude Code, and whether it comes from the nix profile
+   or the guest flake — not which agent. The runner and the host side lean on
+   Claude specifics in nine places: the binary name and its flags (`-p`,
+   `--dangerously-skip-permissions`, `--verbose --output-format stream-json`,
+   `--model`); `--session-id` and `--resume`, which let rig choose the session
+   UUID up front so a restart resumes rather than restarts; the transcript
+   under `projects/<dir>/<uuid>.jsonl`, which is the evidence the runner uses
+   to choose between those two; the credential shapes (`CLAUDE_CODE_OAUTH_TOKEN`,
+   `ANTHROPIC_API_KEY`, `CLAUDE_CREDENTIALS_B64`) and `CLAUDE_CONFIG_DIR`;
+   `IS_SANDBOX=1` to run unattended as root; the stream-json event schema that
+   `agent log` and `agent status` parse for speech and for the last error; the
+   OAuth error text `ExplainError` recognises; the `command -v claude`
+   preflight; and the `claude-code` package `agent install` names. Another
+   agent would need six things from its side — a non-interactive run, a
+   permission bypass, credentials by environment variable, a model flag, a
+   parseable transcript, and a way to resume a conversation by an ID rig
+   picked — and the last decides how well it works: without it a restart can
+   only re-read the brief with a "check git log" note, which is the harness
+   rig replaced. The refactor is an agent profile: one file per agent holding
+   those nine facts, chosen by `rig agent start --agent` and recorded on the
+   instance, with the runner taking its invocation from the environment rather
+   than spelling it out. Roughly a day for an agent with resumable sessions.
+   Not done, because there has been one agent.

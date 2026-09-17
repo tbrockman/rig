@@ -35,7 +35,12 @@ What is contained:
 What is not, stated so nobody has to discover it:
 
 - The agent can reach the internet, so it can send out whatever it holds —
-  including the credential it was handed. Scope that credential; rig cannot.
+  including the credential it was handed. That credential sits in the guest's
+  environment, readable by the agent and everything it runs; nothing keeps it
+  out of the agent's context. The design that would — a host-side proxy over
+  vsock that holds the key and injects it per request, so the guest holds only
+  a proxy address and stripping the proxy setting yields a 401 rather than a
+  bypass — is not implemented. Scope the credential; rig cannot.
 - The agent is root inside the guest.
 - The guest drives the GPU's DMA engine. The IOMMU confines it; rig adds
   nothing there.
@@ -90,7 +95,7 @@ rig new myproj --env secrets/myproj.env --start
 rig doctor myproj                    # is it configured the way you think?
 rig verify myproj                    # 0 proven, 1 violated, 2 could not be proven
 rig push myproj proj                 # -> /work/proj in the guest; your own repos the same way
-rig agent install myproj             # the agent binary: a project decision, not part of the image
+rig agent install myproj             # Claude Code, into the guest's nix profile; the image does not carry it
 rig agent start myproj --prompt-file brief.md --workdir /work/proj --until-done
 rig agent status myproj              # bounded and cheap; check often
 rig agent log myproj                 # what it said, without the tool-call noise
@@ -117,7 +122,7 @@ drives `rig`, and reads the same for a person.
 | `exec`, `shell` | A command, or a login shell, through the Incus agent |
 | `push`, `pull` | Files in and out. `push` refuses to overwrite a guest file it did not itself write |
 | `creds` | Replace the credential in a running VM without restarting it |
-| `agent install/start/status/log/send/stop` | An unattended agent as a systemd unit in the guest, with a fixed session that survives crashes |
+| `agent install/start/status/log/send/stop` | Claude Code, unattended, as a systemd unit in the guest, with a fixed session that survives crashes |
 | `mount`, `unmount`, `forward` | A live view of a guest directory, or one TCP port, over channels that are not IP |
 
 | The card and the policy | |
@@ -159,8 +164,9 @@ Exit status is 0 or 1 except where a verb says otherwise: `verify` exits 2 for
 ## Status
 
 A personal tool, developed and verified on one host: one NVIDIA card, x86_64,
-Incus 6.0.5. `DESIGN.md` ends with what would make it harder to use over time,
-ranked by when it starts to hurt.
+Incus 6.0.5. The agent verbs are built around Claude Code; `DESIGN.md` lists
+what another agent would need, and ends with what would make the tool harder to
+use over time, ranked by when it starts to hurt.
 
 ## License
 
