@@ -15,7 +15,7 @@ import (
 // RejectRanges is IPv4-only by decision. The guest bridge is expected to run
 // with ipv6.address=none, and `rig verify` fails a guest that holds a global
 // IPv6 address, because a denylist cannot be extended to IPv6 — that needs the
-// opposite posture (default-deny plus an allowlist). See DESIGN.md.
+// opposite posture (default-deny plus an allowlist). See docs/DESIGN.md.
 var RejectRanges = []string{
 	"10.0.0.0/8",     // RFC1918. Where Incus puts its bridge by default.
 	"172.16.0.0/12",  // RFC1918. Where docker puts its bridges by default.

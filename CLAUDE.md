@@ -1,7 +1,7 @@
 # Working in this repo
 
 `README.md` says what this is, what it contains and what a host needs;
-`RUNBOOK.md` sets the host up. This file is how to work here once it is.
+`docs/RUNBOOK.md` sets the host up. This file is how to work here once it is.
 
 One GPU, one VM at a time. The VM is where an unattended agent works; the
 isolation around it is the product. Two failures are silent, and shape all the
@@ -23,7 +23,7 @@ break an invariant, so reach for it deliberately.
 root, so `desktop` and `headless` re-exec themselves under sudo, printing the
 command first; `status` does not. Reclaiming the card **resets it** before the
 driver loads, and then checks a DRM node appeared rather than trusting that the
-driver bound — see DESIGN.md, behaviour 6. Both matter: without the reset the
+driver bound — see docs/DESIGN.md, behaviour 6. Both matter: without the reset the
 desktop comes back with no display, and without the check rig says it succeeded.
 
 `rig host headless` ends the desktop **session**, not just its display: under
@@ -55,7 +55,8 @@ decision, and a fresh VM has none until you put one there: `rig agent install
 <vm>`. `rig agent start` checks before it creates any state, because the
 alternative is a unit that restart-loops with `last exit 127` and says nothing
 about why. The agent verbs are built around Claude Code — its flags, its
-session resume, its event stream; DESIGN.md lists what another agent would need.
+session resume, its event stream; docs/DESIGN.md lists what another agent would
+need.
 
 `rig agent` runs an unattended agent in the guest and keeps a channel to it.
 It is a systemd unit, so it outlives your shell; its session UUID is fixed and
@@ -249,6 +250,6 @@ type.
 `.claude/settings.json` allowlists `./rig` so routine work does not prompt. It is
 convenience, not containment — the boundary is the VM and the network ACL.
 
-`DESIGN.md` has the decisions and why, what was learned proving them, and what
-is still weak. `RUNBOOK.md` is host setup. `project-template/README.md` covers
-the CUDA toolchain.
+`docs/DESIGN.md` has the decisions and why, what was learned proving them, and
+what is still weak. `docs/RUNBOOK.md` is host setup. `project-template/README.md`
+covers the CUDA toolchain.

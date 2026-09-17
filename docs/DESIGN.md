@@ -415,9 +415,12 @@ is one card, one active project.
 ## What would make this harder over time
 
 Ranked by when it starts hurting. Two earlier items are now closed: the base
-image is stamped and `rig doctor` reports drift, and `rig verify` fails when
-coverage of a declared reject range drops to nothing rather than skipping
-quietly.
+image is stamped and `rig doctor` reports drift, and `rig verify` fails when a
+target in a declared reject range stops yielding a proof rather than skipping
+quietly. (A range with nothing of the host's in it is a different case: it is
+reported as moot, because there is nothing there for the guest to reach, and
+treating it as a gap had made verify inconclusive on every host without
+Tailscale and docker.)
 
 1. **VMs are not garbage-collected.** Stopped project VMs accumulate at ~6 GiB
    each on a 500 GiB loop file, and a full root means write errors on a ZFS

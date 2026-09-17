@@ -34,7 +34,7 @@ func (a *app) agentCmd() *cobra.Command {
 			"file in the guest, delivered at the agent's next turn or next restart —\n" +
 			"never a pipe, which would die with either process.\n\n" +
 			"These verbs are built around Claude Code: its flags, its session resume,\n" +
-			"its event stream. DESIGN.md lists what another agent would need.",
+			"its event stream. docs/DESIGN.md lists what another agent would need.",
 	}
 	cmd.AddCommand(a.agentInstallCmd(), a.agentStartCmd(), a.agentSendCmd(),
 		a.agentStatusCmd(), a.agentLogCmd(), a.agentStopCmd())

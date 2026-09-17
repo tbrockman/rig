@@ -74,15 +74,17 @@ func (a *app) verifyCmd() *cobra.Command {
 }
 
 func printCoverage(r *verify.Report) {
-	fmt.Println("\n--- coverage: every declared reject range needs one attributable proof ---")
+	fmt.Println("\n--- coverage: every reject range something on this host is in needs one attributable proof ---")
 	for _, cov := range r.Coverage {
 		switch {
 		case len(cov.Proofs) > 0:
 			fmt.Printf("  ok    %-18s %d proof(s): %s\n", cov.Range, len(cov.Proofs), cov.Proofs[0])
 		case cov.Acknowledged:
 			fmt.Printf("  gap   %-18s acknowledged: nothing here is reachable from this host\n", cov.Range)
+		case cov.Moot:
+			fmt.Printf("  moot  %-18s nothing on this host is in it; there is nothing for the guest to reach\n", cov.Range)
 		default:
-			fmt.Printf("  GAP   %-18s NOT PROVEN — no reachable target in this range\n", cov.Range)
+			fmt.Printf("  GAP   %-18s NOT PROVEN — a target here produced no proof\n", cov.Range)
 		}
 	}
 

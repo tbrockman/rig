@@ -57,6 +57,11 @@ type RangeCoverage struct {
 	Range        string   `json:"range"`
 	Proofs       []string `json:"proofs"`
 	Acknowledged bool     `json:"acknowledged"`
+	// Moot means nothing on this host falls in the range: no address the host
+	// holds, no gateway, no neighbour, no peer. There is nothing there for the
+	// guest to reach, so there is nothing to prove — which is different from a
+	// target that exists and could not be probed, and is not counted as a gap.
+	Moot bool `json:"moot,omitempty"`
 }
 
 type Verdict string
@@ -112,6 +117,10 @@ type Runner struct {
 	report   Report
 	working  map[Mechanism]bool
 	coverage map[string][]string
+	// candidates are the reject ranges some derived target fell in, whether or
+	// not the probe then proved anything. A range with no candidate at all is
+	// moot on this host rather than unproven.
+	candidates map[string]bool
 	// guestOwn are addresses the guest holds itself. A probe at one of these
 	// never leaves the guest, so it can neither prove nor disprove isolation.
 	guestOwn map[string]bool
@@ -162,6 +171,7 @@ func (r *Runner) Run() (*Report, error) {
 	r.report.ACL = r.ACL
 	r.working = map[Mechanism]bool{}
 	r.coverage = map[string][]string{}
+	r.candidates = map[string]bool{}
 
 	inst, _, err := r.C.Instance(r.Instance)
 	if err != nil {
@@ -351,10 +361,17 @@ func (r *Runner) check(t Target) {
 	// answering, and a flag that had always been decoration became visible.
 	advisory := !t.Attributable || r.acknowledged(t.IP)
 
+	// No target means nothing on this host to probe — no Tailscale peer on a
+	// host without Tailscale, no LAN neighbour that answers. That is not a
+	// failure to prove anything; there is nothing for the guest to reach.
+	// Advisory, so it is reported and does not make the run inconclusive.
 	if t.IP == "" {
-		r.record(Check{Label: t.Label, Outcome: Unproven, Advisory: !t.Attributable,
-			Detail: "no target could be derived on this host"}, false)
+		r.record(Check{Label: t.Label, Outcome: Unproven, Advisory: true,
+			Detail: "nothing on this host to probe"}, false)
 		return
+	}
+	if rng := rangeContaining(t.IP); rng != "" {
+		r.candidates[rng] = true
 	}
 	// An address the guest also holds is not a target. The probe would loop
 	// back inside the guest and report on the guest's own listeners, which says
@@ -454,12 +471,20 @@ func (r *Runner) record(c Check, control bool) {
 // targets and the policy declared ranges, and nothing joined the two, so a
 // target disappearing quietly reduced what was being proven while the summary
 // still said everything passed.
+//
+// A range is a gap only when something on this host fell in it and no probe
+// proved a block there — a target that rotted, a mechanism that broke. A range
+// nothing on this host is in is moot: the host cannot reach anything there,
+// so neither could the guest, ACL or no ACL, and reporting it as unproven
+// made verify inconclusive on every host without Tailscale and docker for
+// ranges that exist to cover them.
 func (r *Runner) finish() {
 	for _, cidr := range policy.RejectRanges {
 		r.report.Coverage = append(r.report.Coverage, RangeCoverage{
 			Range:        cidr,
 			Proofs:       r.coverage[cidr],
 			Acknowledged: slices.Contains(r.AllowGaps, cidr),
+			Moot:         len(r.coverage[cidr]) == 0 && !r.candidates[cidr],
 		})
 	}
 
@@ -473,7 +498,7 @@ func (r *Runner) finish() {
 		}
 	}
 	for _, cov := range r.report.Coverage {
-		if len(cov.Proofs) == 0 && !cov.Acknowledged {
+		if len(cov.Proofs) == 0 && !cov.Acknowledged && !cov.Moot {
 			gaps++
 		}
 	}
@@ -487,7 +512,7 @@ func (r *Runner) finish() {
 		r.report.Summary = fmt.Sprintf("%d unproven, %d range(s) with no attributable proof", unproven, gaps)
 	default:
 		r.report.Verdict = Proven
-		r.report.Summary = fmt.Sprintf("%d check(s) passed; every reject range proven or acknowledged",
+		r.report.Summary = fmt.Sprintf("%d check(s) passed; every reject range proven, acknowledged, or moot on this host",
 			len(r.report.Checks)+len(r.report.Controls))
 	}
 }

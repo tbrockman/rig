@@ -51,9 +51,13 @@ What is not, stated so nobody has to discover it:
   than being waved through by a denylist that does not cover it.
 
 `rig verify` proves all of the above from inside a running guest and refuses
-to call anything a pass that it could not tell from a broken probe. An
-integration test strips the ACL from a guest and requires `verify` to notice,
-because a verifier that always says "blocked" would pass everything else.
+to call anything a pass that it could not tell from a broken probe. Its
+targets are whatever this host actually has: its own addresses, the LAN
+gateway and a neighbour, a Tailscale peer or a docker bridge when those exist.
+A reject range with nothing of the host's in it is reported as moot rather
+than proven; there is nothing there for the guest to reach. An integration
+test strips the ACL from a guest and requires `verify` to notice, because a
+verifier that always says "blocked" would pass everything else.
 
 ## What you need
 
@@ -70,8 +74,7 @@ because a verifier that always says "blocked" would pass everything else.
 - **Nix** with flakes enabled, to build the guest image. The project template
   uses a relative flake input, which needs Nix 2.26 or later.
 - **Go 1.26** to build rig, unless you `go install` a release.
-- Optional: `sshfs` for `rig mount`. `tailscale` and `docker` on the host are
-  not needed, but if present they widen what `rig verify` can prove.
+- Optional: `sshfs` for `rig mount`.
 
 ## Install
 
@@ -81,8 +84,8 @@ rig --help
 ```
 
 The binary carries the image definition and the project template, so neither
-needs a checkout. Then `RUNBOOK.md`, once: a storage pool, a headless host,
-the image, the ACL.
+needs a checkout. Then `docs/RUNBOOK.md`, once: a storage pool, a headless
+host, the image, the ACL.
 
 ## Quick start
 
@@ -157,16 +160,16 @@ Exit status is 0 or 1 except where a verb says otherwise: `verify` exits 2 for
 | Document | |
 |---|---|
 | `CLAUDE.md` | How to work here: which verb for what, and the reasons |
-| `RUNBOOK.md` | Host setup, in order |
-| `DESIGN.md` | Decisions and why, what was learned proving them, and what is still weak |
+| `docs/RUNBOOK.md` | Host setup, in order |
+| `docs/DESIGN.md` | Decisions and why, what was learned proving them, and what is still weak |
 | `project-template/README.md` | The CUDA toolchain and the correctness test |
 
 ## Status
 
 A personal tool, developed and verified on one host: one NVIDIA card, x86_64,
-Incus 6.0.5. The agent verbs are built around Claude Code; `DESIGN.md` lists
-what another agent would need, and ends with what would make the tool harder to
-use over time, ranked by when it starts to hurt.
+Incus 6.0.5. The agent verbs are built around Claude Code; `docs/DESIGN.md`
+lists what another agent would need, and ends with what would make the tool
+harder to use over time, ranked by when it starts to hurt.
 
 ## License
 

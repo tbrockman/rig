@@ -55,7 +55,7 @@ func main() {
 			"It enforces two invariants: at most one instance has the GPU configured\n" +
 			"and it never moves away from a running one, and no instance starts\n" +
 			"without network isolation.\n\n" +
-			"Typical flow, once the host is set up (RUNBOOK.md):\n" +
+			"Typical flow, once the host is set up (docs/RUNBOOK.md):\n" +
 			"  rig image build                        # the NixOS guest image, from base/\n" +
 			"  rig apply                              # the isolation ACL, onto the profile\n" +
 			"  rig new myproj --env secrets/myproj.env --start\n" +

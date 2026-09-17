@@ -69,22 +69,25 @@ func TestVerdict(t *testing.T) {
 		return out
 	}
 
+	all := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10"}
+
 	cases := []struct {
-		name      string
-		checks    []Check
-		allowGaps []string
-		want      Verdict
+		name       string
+		checks     []Check
+		candidates []string // ranges some target on the host fell in
+		allowGaps  []string
+		want       Verdict
 	}{
-		{"everything proven", covering(), nil, Proven},
+		{"everything proven", covering(), all, nil, Proven},
 		{
 			"a failure outranks everything",
 			append(covering(), Check{Outcome: Fail}, Check{Outcome: Unproven}),
-			nil, Violated,
+			all, nil, Violated,
 		},
 		{
 			"an unproven check is not a pass",
 			append(covering(), Check{Outcome: Unproven}),
-			nil, Inconclusive,
+			all, nil, Inconclusive,
 		},
 		{
 			// Docker's container targets are the case: they stay blocked with the
@@ -92,24 +95,38 @@ func TestVerdict(t *testing.T) {
 			// the run look less conclusive than it is.
 			"an advisory check that could not run does not downgrade the verdict",
 			append(covering(), Check{Outcome: Unproven, Advisory: true}),
-			nil, Proven,
+			all, nil, Proven,
 		},
 		{
-			"a range with no attributable proof is a gap",
+			// A target fell in the range and produced no proof: the thing that
+			// happened when 169.254.169.254 stopped answering. That is a gap.
+			"a range whose target produced no proof is a gap",
 			[]Check{proof},
-			nil, Inconclusive,
+			all, nil, Inconclusive,
 		},
 		{
 			"an acknowledged gap is not",
 			[]Check{proof},
-			[]string{"172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10"},
+			all, []string{"172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10"},
 			Proven,
+		},
+		{
+			// A host with no Tailscale and no docker has nothing in 100.64/10 or
+			// 172.16/12. There is nothing there for the guest to reach, so there
+			// is nothing to prove, and calling that unproven made verify
+			// inconclusive on every host but the one it was written on.
+			"a range nothing on this host is in is moot, not a gap",
+			[]Check{proof},
+			[]string{"10.0.0.0/8"}, nil, Proven,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := &Runner{AllowGaps: tc.allowGaps, coverage: map[string][]string{}}
+			r := &Runner{AllowGaps: tc.allowGaps, coverage: map[string][]string{}, candidates: map[string]bool{}}
+			for _, cidr := range tc.candidates {
+				r.candidates[cidr] = true
+			}
 			for _, c := range tc.checks {
 				r.report.Checks = append(r.report.Checks, c)
 				if c.Proves != "" {
@@ -134,7 +151,7 @@ func TestVerdict(t *testing.T) {
 // because the acknowledged range happened to have a real proof on the day the
 // suite was written.
 func TestAcknowledgedRangeDoesNotKeepTheRunInconclusive(t *testing.T) {
-	r := &Runner{AllowGaps: DefaultAllowGaps, coverage: map[string][]string{}}
+	r := &Runner{AllowGaps: DefaultAllowGaps, coverage: map[string][]string{}, candidates: map[string]bool{}}
 	if !r.acknowledged("169.254.169.254") {
 		t.Fatal("an address in an acknowledged range must be treated as acknowledged")
 	}
@@ -150,8 +167,9 @@ func TestAcknowledgedRangeDoesNotKeepTheRunInconclusive(t *testing.T) {
 // reach it". A breach into an acknowledged range is still a breach.
 func TestAcknowledgementDoesNotExcuseAFailure(t *testing.T) {
 	r := &Runner{
-		AllowGaps: DefaultAllowGaps,
-		coverage:  map[string][]string{},
+		AllowGaps:  DefaultAllowGaps,
+		coverage:   map[string][]string{},
+		candidates: map[string]bool{},
 		report: Report{Checks: []Check{{
 			Label: "link-local 169.254.169.254 tcp/80", Outcome: Fail, Advisory: true,
 		}}},
@@ -160,5 +178,21 @@ func TestAcknowledgementDoesNotExcuseAFailure(t *testing.T) {
 	if r.report.Verdict != Violated {
 		t.Fatalf("verdict = %v, want Violated: an advisory check that FAILS is still a breach",
 			r.report.Verdict)
+	}
+}
+
+// A target that could not be derived — no Tailscale peer on a host without
+// Tailscale, no neighbour that answers — is nothing to probe, not a failure to
+// prove. It is reported, and it does not make the run inconclusive; a target
+// that exists and cannot be reached from the host still does.
+func TestATargetThatDoesNotExistHereIsAdvisory(t *testing.T) {
+	r := &Runner{AllowGaps: nil, coverage: map[string][]string{}, candidates: map[string]bool{},
+		working: map[Mechanism]bool{ICMP: true}}
+	r.check(Target{Label: "tailnet peer icmp", Mechanism: ICMP, IP: "", Expect: Blocked, Attributable: true})
+	if got := r.report.Checks[0]; got.Outcome != Unproven || !got.Advisory {
+		t.Fatalf("an underivable target must be advisory-unproven, got %+v", got)
+	}
+	if r.candidates["100.64.0.0/10"] {
+		t.Error("an underivable target is not a candidate; its range is moot, not a gap")
 	}
 }
