@@ -81,7 +81,7 @@ func TestInvariants(t *testing.T) {
 	// from the running one, and Incus reports that only on the VM that failed to
 	// start — the victim keeps showing RUNNING with a healthy IP.
 	t.Run("the card cannot be taken from a running instance", func(t *testing.T) {
-		if err := gpu.Start(c, cfg, instB, false, 180); err != nil {
+		if err := gpu.Start(c, cfg, instB, false, true, 180); err != nil {
 			t.Fatalf("start: %v", err)
 		}
 		if err := c.WaitAgent(instB, 3*time.Minute); err != nil {
@@ -182,7 +182,7 @@ func TestInvariants(t *testing.T) {
 		}
 		unisolate(t, instA)
 
-		if err := gpu.Start(c, cfg, instA, false, 180); err == nil {
+		if err := gpu.Start(c, cfg, instA, false, true, 180); err == nil {
 			t.Error("start SUCCEEDED on an instance with no isolation ACL")
 		}
 		// The isolation check runs before the claim, so a refusal must not have
@@ -191,7 +191,7 @@ func TestInvariants(t *testing.T) {
 			t.Errorf("a refused start left the card attached (%d holders)", n)
 		}
 
-		if err := gpu.Start(c, cfg, instA, true, 180); err != nil {
+		if err := gpu.Start(c, cfg, instA, true, true, 180); err != nil {
 			t.Errorf("--allow-unisolated did not start the instance: %v", err)
 		}
 		// Stop it here rather than leaving it to the cleanup at the end of the
@@ -218,7 +218,7 @@ func TestVerifyDetectsAnUnisolatedGuest(t *testing.T) {
 	t.Cleanup(func() { teardown(t, name) })
 	unisolate(t, name)
 
-	if err := gpu.Start(c, cfg, name, true, 180); err != nil {
+	if err := gpu.Start(c, cfg, name, true, true, 180); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	if err := c.WaitAgent(name, 3*time.Minute); err != nil {
