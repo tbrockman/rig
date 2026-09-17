@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -96,14 +95,11 @@ func (a *app) forwardCmd() *cobra.Command {
 			// accepts connections and drops every one of them.
 			if out, err := a.exec(name, "command -v socat || true"); err != nil || strings.TrimSpace(out) == "" {
 				return fmt.Errorf("no `socat` in %s, which runs the guest half of the tunnel.\n"+
-					"  rig exec %s nix profile install nixpkgs#socat\n"+
-					"Better: put it in the project's guest image, where it does not have to be\n"+
-					"remembered — see project-template/guest.", name, name)
+					"The base image carries it; this guest was made from one that predates that.\n"+
+					"Rebuild and recreate (rig image build, then rig new), or install it by hand:\n"+
+					"  rig exec %s nix profile install nixpkgs#socat", name, name)
 			}
 
-			// A token in the command line, so teardown kills this tunnel's socat
-			// and not somebody else's.
-			token := fmt.Sprintf("rig-forward-%d-%d", port, time.Now().UnixNano())
 			var guestCmd string
 			if toGuest {
 				guestCmd = fmt.Sprintf(
@@ -114,14 +110,31 @@ func (a *app) forwardCmd() *cobra.Command {
 					"socat VSOCK-LISTEN:%d,reuseaddr,fork TCP:127.0.0.1:%d",
 					vsockPort(port), port)
 			}
-			start := fmt.Sprintf("setsid env %s=1 %s >/dev/null 2>&1 & disown; true", token, guestCmd)
-			if _, err := a.exec(name, start); err != nil {
+
+			// One tunnel per port. A pid that is still alive is a live tunnel
+			// or a leftover from a rig that died without tearing down; either
+			// way it is named rather than killed, because killing something
+			// this did not start is not this command's decision to make.
+			pidfile := guestPIDFile(port)
+			if out, _ := a.exec(name, guestPIDAlive(pidfile)); strings.TrimSpace(out) != "" {
+				pid := strings.TrimSpace(out)
+				return fmt.Errorf("a forward for port %d is already running in %s (pid %s).\n"+
+					"  rig exec %s kill %s   # if it is a leftover rather than someone's live tunnel",
+					port, name, pid, name, pid)
+			}
+			if _, err := a.exec(name, guestStart(pidfile, guestCmd)); err != nil {
 				return fmt.Errorf("starting the guest half: %w", err)
 			}
-			stopGuest := func() {
-				_, _ = a.exec(name, "pkill -f "+token+" 2>/dev/null || true")
-			}
+			stopGuest := func() { _, _ = a.exec(name, guestStop(pidfile)) }
 			defer stopGuest()
+
+			// Announce the tunnel only once the guest half is listening. It
+			// starts in the background, and a connection that arrives before
+			// socat has bound is refused and dropped — a race a human never
+			// hits and a script hits every time.
+			if out, err := a.exec(name, guestListening(pidfile, port, toGuest)); err != nil {
+				return fmt.Errorf("the guest half never started listening on port %d.\n%s", port, strings.TrimSpace(out))
+			}
 
 			stop := make(chan os.Signal, 1)
 			signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -138,6 +151,51 @@ func (a *app) forwardCmd() *cobra.Command {
 	f.BoolVar(&bindAll, "bind-all", false,
 		"listen on 0.0.0.0 rather than 127.0.0.1 — this exposes a guest port to your whole LAN")
 	return cmd
+}
+
+// The guest half is tracked by a pidfile, never by a token in its command
+// line. The first version put a token in socat's *environment* and tore down
+// with `pkill -f`, which matches argument lists and cannot see an environment:
+// the pkill matched nothing, every tunnel left its socat behind, and the next
+// forward of the same port silently inherited a listener it had not started.
+//
+// The pid recorded is socat's own. The wrapper shell writes $$ and then execs
+// socat in place, so the number is right whether or not setsid forked first.
+func guestPIDFile(port int) string { return fmt.Sprintf("/run/rig/forward.%d.pid", port) }
+
+// Only the setsid command is backgrounded, and its streams go to a log file
+// next to the pidfile, so a socat that dies on startup can say why.
+// Backgrounding `mkdir && setsid ...` as one list instead puts a subshell in
+// front of it that inherits the exec's stdout and lives as long as socat does,
+// so the exec never returns and `rig forward` hangs before it says anything.
+// Found by the integration test, which waited 30s for a line that never came.
+func guestStart(pidfile, socatCmd string) string {
+	return fmt.Sprintf("mkdir -p /run/rig; setsid bash -c 'echo $$ > %s; exec %s' >%s 2>&1 & disown; true",
+		pidfile, socatCmd, pidfile+".log")
+}
+
+func guestStop(pidfile string) string {
+	return fmt.Sprintf("kill $(cat %s 2>/dev/null) 2>/dev/null; rm -f %s %s; true", pidfile, pidfile, pidfile+".log")
+}
+
+// guestListening polls until the guest half has bound its listener, and
+// prints socat's own output if it has not within ten seconds. The from-guest
+// half listens on vsock, which `ss --vsock` lists; the to-guest half on
+// loopback TCP.
+func guestListening(pidfile string, port int, toGuest bool) string {
+	probe := fmt.Sprintf("ss -lH --vsock 2>/dev/null | grep -qE ':%d( |$)'", port)
+	if toGuest {
+		probe = fmt.Sprintf("ss -ltnH 2>/dev/null | grep -q '127.0.0.1:%d '", port)
+	}
+	return fmt.Sprintf("for i in $(seq 50); do %s && exit 0; sleep 0.2; done; cat %s 2>/dev/null; exit 1",
+		probe, pidfile+".log")
+}
+
+// guestPIDAlive prints the recorded pid if that process still exists, and
+// nothing otherwise — a stale pidfile is the ordinary aftermath of a guest
+// reboot, and must not read as a tunnel.
+func guestPIDAlive(pidfile string) string {
+	return fmt.Sprintf(`p=$(cat %s 2>/dev/null); [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "$p"; true`, pidfile)
 }
 
 // forwardFromGuest listens here and dials the guest for each connection.
