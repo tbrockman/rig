@@ -1,7 +1,7 @@
 # NixOS guest module for the GPU dev VM base image.
 #
 # Imported by base/flake.nix alongside the nixpkgs VM-image module, which
-# supplies the bootloader and filesystem layout. Build with ./01-build-image.sh.
+# supplies the bootloader and filesystem layout. Built by `rig image build`.
 #
 # This is a module rather than a full nixosSystem so the image module owns the
 # hardware side and this file owns only the GPU/dev concerns.
@@ -19,7 +19,8 @@
   hardware.graphics.enable = true;     # was hardware.opengl before 24.11
 
   hardware.nvidia = {
-    # Ada (RTX 4080 SUPER) is fully supported by the open kernel modules.
+    # The open kernel modules cover Turing and newer; verified here on Ada.
+    # For an older card, set this to false.
     open = true;
     nvidiaSettings = false;            # no GUI in the guest
     modesetting.enable = true;
@@ -102,6 +103,11 @@
     gnugrep
     git
     docker-compose
+
+    # The guest half of `rig forward`. It is rig's own dependency, not a
+    # project's: a rig verb that fails on a fresh guest until someone installs
+    # a package by hand is the provisioning-by-memory this image exists to end.
+    socat
     (writeShellScriptBin "gpu-check" ''
       # writeShellScriptBin provides NO PATH at all. Reference tools by store
       # path, and prepend the system profile for driver binaries: nvidia-smi
@@ -130,10 +136,10 @@
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
   nix.settings.trusted-users = [ "root" "@wheel" ];
 
-  services.openssh = {
-    enable = true;                      # fallback transport if the agent dies
-    settings.PasswordAuthentication = false;
-  };
+  # No sshd. The NIC rejects ingress, so nothing could reach one; every way in
+  # — `rig exec`, `rig shell`, `rig mount` — is the Incus agent over vsock,
+  # which is a channel the host opens and the guest cannot. A listener that
+  # can never be reached is surface without a purpose.
 
   # Project working tree lives here; back it with an Incus disk device so it
   # survives instance rebuilds.
