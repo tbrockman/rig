@@ -102,6 +102,7 @@ func (c *Client) Exists(name string) bool {
 type CreateOpts struct {
 	Name     string
 	Image    string
+	Profile  string // the profile the VM inherits from; empty means "default"
 	CPUs     int
 	Memory   string
 	DiskSize string
@@ -123,17 +124,22 @@ func (c *Client) CreateVM(o CreateOpts) error {
 		config[k] = v
 	}
 
+	profile := o.Profile
+	if profile == "" {
+		profile = "default"
+	}
 	body := map[string]any{
-		"name":   o.Name,
-		"type":   "virtual-machine",
-		"config": config,
-		"source": map[string]string{"type": "image", "alias": o.Image},
+		"name":     o.Name,
+		"type":     "virtual-machine",
+		"config":   config,
+		"profiles": []string{profile},
+		"source":   map[string]string{"type": "image", "alias": o.Image},
 	}
 	// A device override replaces the whole device, so resizing the root disk
 	// means copying the profile's entry and changing one key. (The CLI merges
 	// for you; the API does not, and the resulting error names only "pool".)
 	if o.DiskSize != "" {
-		root, err := c.profileRootDisk("default")
+		root, err := c.profileRootDisk(profile)
 		if err != nil {
 			return err
 		}

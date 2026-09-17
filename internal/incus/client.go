@@ -24,7 +24,8 @@ import (
 const DefaultSocket = "/var/lib/incus/unix.socket"
 
 type Client struct {
-	http *http.Client
+	socket string
+	http   *http.Client
 	// ws has no client-level timeout: exec sockets are long-lived, and the
 	// websocket library rejects a client that carries one. Cancellation for
 	// those comes from the context instead.
@@ -44,9 +45,25 @@ func New(socket string) *Client {
 		},
 	}
 	return &Client{
-		http: &http.Client{Timeout: 15 * time.Minute, Transport: transport},
-		ws:   &http.Client{Transport: transport},
+		socket: socket,
+		http:   &http.Client{Timeout: 15 * time.Minute, Transport: transport},
+		ws:     &http.Client{Transport: transport},
 	}
+}
+
+// socketHint names the two ways a fresh host fails to reach the daemon, which
+// the raw dial error leaves to the reader: the socket is not there, or this
+// user may not open it.
+func socketHint(err error) string {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return "\n  Is Incus installed and running?  systemctl status incus\n" +
+			"  INCUS_SOCKET names the socket if it lives somewhere else."
+	case errors.Is(err, os.ErrPermission):
+		return "\n  This user cannot open the socket. Join the group Incus grants it to, then\n" +
+			"  log in again:  sudo usermod -aG incus-admin $USER"
+	}
+	return ""
 }
 
 // APIError is returned for a well-formed Incus error response, so callers can
@@ -96,7 +113,7 @@ func (c *Client) call(method, path string, body any, etag string) (*envelope, st
 func (c *Client) do(req *http.Request) (*envelope, string, error) {
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("cannot reach incus: %w", err)
+		return nil, "", fmt.Errorf("cannot reach incus at %s: %w%s", c.socket, err, socketHint(err))
 	}
 	defer resp.Body.Close()
 
