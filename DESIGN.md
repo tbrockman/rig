@@ -1,7 +1,8 @@
-# STATUS
+# Design notes
 
-State, decisions and open work. Written 2026-08-23, updated 2026-08-24.
-Start at `CLAUDE.md` for how to actually use this.
+Decisions and why, what was learned proving them, and what is still weak.
+Written 2026-08-23; last updated 2026-09-16. `README.md` says what this is;
+`CLAUDE.md` is how to use it.
 
 ## Goal
 
@@ -13,23 +14,23 @@ An isolated VM with real GPU access for an unsupervised coding agent:
 One VM at a time, one per project, stopped when unused. Remote paid models power
 the agent; the GPU is for the software being built.
 
-## Hardware
+## Reference host
 
-- AMD Ryzen 7 7800X3D, 60 GiB RAM, Ubuntu 26.04, kernel 7.0.0-29
-- RTX 4080 SUPER at `0000:04:00.0` (+ audio `04:00.1`), `10de:2702` / `10de:22bb`
-- IOMMU group 13: bridge + both NVIDIA functions. Clean, no ACS override needed.
-- AMD Raphael iGPU at `0f:00.0` drives the console over HDMI
-- Samsung 990 PRO 4TB: LUKS -> LVM -> ext4 root, VG fully allocated
+Everything here was developed and verified on one machine:
 
-**The GPU is in a chipset slot wired for x2.** `max=x2`, not a training failure:
-3.19 GB/s H2D, 3.30 GB/s D2H is ~82% of PCIe 4.0 x2. On-card D2D 316 GB/s.
+- AMD Ryzen 7 7800X3D, 60 GiB RAM, Ubuntu 26.04, kernel 7.0
+- RTX 4080 SUPER (Ada, `10de:2702`, audio function `10de:22bb`) in an IOMMU
+  group of its own plus the bridge above it — no ACS override needed
+- An AMD iGPU driving the console, so the card can leave without taking the
+  only display with it
+- Incus 6.0.5, Nix 2.34, Go 1.26
+- A loop-backed ZFS pool on the LUKS-encrypted root, ARC capped at 8 GiB
 
-**Slot 1 (the only Gen5 x16) is unresolved** — snapped retention latch, and the
-card previously failed to POST there. Diagnose with the monitor on the iGPU:
-check for POST, try forcing Gen4/Gen3, inspect for bent pins or a cracked slot.
-It matters because an agent profiling GPU code at x2 draws wrong conclusions
-about transfer bottlenecks. The tools discover the PCI address, so moving the
-card needs no config change.
+**The card is in a chipset slot wired for x2.** 3.19 GB/s H2D and 3.30 GB/s D2H
+is ~82% of PCIe 4.0 x2, not a training failure; on-card D2D is 316 GB/s. It
+matters because an agent profiling GPU code at x2 draws wrong conclusions about
+transfer bottlenecks. Nothing in rig depends on it: PCI addresses are
+discovered, so moving the card needs no config change.
 
 ## Decisions, and why
 
@@ -47,13 +48,47 @@ card needs no config change.
 - **Dynamic vfio binding.** Static binding needs boot-framebuffer workarounds
   when the dGPU is firmware-primary.
 - **Go, not shell.** Typed, testable, and the Incus REST API is reachable
-  directly, so nothing parses CLI output. One module, two binaries: `rig` for
-  everything about VMs and the host's own card. `rig` was briefly split into a
-  second binary to encode which verbs are dangerous, and `hostgpu` was a third
-  for the one thing that needs root; command groups in `--help` and a sudo
-  re-exec do both jobs without the splits. Reclaiming the card is an ordinary
-  step in the lifecycle, and a tool you have to remember exists separately is
-  one you forget at the moment it matters.
+  directly, so nothing parses CLI output. One module, one binary. `rig` was
+  briefly split in two to encode which verbs are dangerous, and `hostgpu` was a
+  third for the one thing that needs root; command groups in `--help` and a
+  sudo re-exec do both jobs without the splits. Reclaiming the card is an
+  ordinary step in the lifecycle, and a tool you have to remember exists
+  separately is one you forget at the moment it matters.
+- **A hand-written Incus client, not the Incus Go module.** `internal/incus`
+  is under a thousand lines over the REST API on the unix socket, with two
+  dependencies: a websocket library for exec and `x/net` for ICMP. Importing
+  `github.com/lxc/incus/v6/client` means importing the Incus repository as a
+  module — its `shared/api` types and everything they pull in — for a dozen
+  endpoints. It is also why nothing shells out to the `incus` CLI except
+  `rig mount`, which wraps `incus file mount` because the SFTP-over-agent
+  plumbing behind it is not worth reimplementing. The wire contract the client
+  depends on — request shapes, ETag round-trips, the envelope's quirks, the
+  exec websocket handshake — is pinned by unit tests against a fake daemon on
+  a unix socket; whether Incus then does the right thing is the integration
+  suite's question, and a fake cannot answer it.
+- **Incus is a prerequisite, not embedded.** Incus is a root daemon that owns
+  QEMU, VFIO binding, nftables, dnsmasq, the storage pools and its own
+  database. It is system infrastructure the way docker is, and it comes with
+  the distro's packaging, its updates, and the guest agent the image needs.
+  rig is the unprivileged client of that. Embedding it would make rig the
+  daemon — root, long-running, and welded to one Incus version's internals —
+  to save an operator one package install and one `incus admin init`. The
+  licence (Apache-2.0) would allow it; nothing else recommends it.
+- **The base and the template are embedded in the binary.** A `go install`ed
+  rig has no checkout, so `rig image build` had nothing to build and a new
+  project had nothing to copy. Both directories are `go:embed`ded (`embed.go`)
+  with explicit patterns that a test holds to `git ls-files`, so a stray build
+  product can never ship. `rig init` writes the template out and points its
+  guest flake at the base this build came from — a release names its tag on
+  GitHub, a development build a copy under the cache directory — and
+  `rig image build` falls back to that same copy when there is no `./base`.
+  The cost is that the template a binary writes is the template it was built
+  with, which is the point: it is the one that binary's image build agrees
+  with.
+- **socat is in the base image.** It was a project's job to ship it, so
+  `rig forward` failed on any fresh guest until someone remembered — the
+  provisioning-by-memory the image exists to end. It is rig's dependency, and
+  rig's image carries it.
 - **Checking and proving are separate verbs.** `doctor` reads configuration;
   `verify` sends real packets from inside the guest. Config has been right here
   while the effect was absent, so one does not imply the other.
@@ -109,11 +144,11 @@ card needs no config change.
 
 ## Provisioning is a flake, not a remembered sequence (2026-09-02)
 
-Bringing the open-groceries VM up needed `nix profile install claude-code socat`,
-a devShell wrapper installed on PATH, and `mkdir /work/handoff` — none of which
-was written down anywhere. The agent then found `/work/ogx` and `/work/handoff`
-missing while its environment document promised both, and spent a turn creating
-them. A VM assembled from remembered commands is a VM nothing describes, which
+Bringing one project's VM up needed `nix profile install claude-code socat`, a
+devShell wrapper installed on PATH, and a `mkdir` — none of which was written
+down anywhere. The agent then found the wrapper and the directory missing while
+its environment document promised both, and spent a turn creating them. A VM
+assembled from remembered commands is a VM nothing describes, which
 is the exact state the "image is a build artifact" decision exists to prevent;
 it was simply being violated one `rig exec` at a time.
 
@@ -127,7 +162,7 @@ build` already took `--flake`/`--attr`/`--alias` and `rig new` already took
 `--image`, so no new verbs were needed; the missing piece was only that the base
 was not importable. `project-template/guest/` is the worked example.
 
-It also dissolves the two-PATH wart above: a wrapper in `systemPackages` lands
+It also dissolves the two-PATH wart below: a wrapper in `systemPackages` lands
 in `/run/current-system/sw/bin`, which both the login shell and the agent unit
 search, so there is no longer any reason to write to `/usr/bin` by hand.
 
@@ -139,8 +174,8 @@ three below.
 
 ## `path:` flakerefs fill the disk (found by the agent, 2026-09-02)
 
-The `ogx` wrapper handed to the open-groceries agent ran
-`nix develop "path:/work/open-groceries"`. A `path:` flakeref copies the entire
+The devShell wrapper handed to one agent ran
+`nix develop "path:/work/<project>"`. A `path:` flakeref copies the entire
 directory into `/nix/store`, ignoring `.gitignore`, on every invocation — so
 each build wrote the repo's 19G `target/` to the store again. The VM reached
 191G/197G and every command started failing ENOSPC; `/nix/store` held ten copies
@@ -190,20 +225,33 @@ invisible while a guest held exactly one global address.
    advisory when they come out unproven — and only then. A guest that *reaches*
    an acknowledged range is still a breach.
 
-## Wart: a rig guest has two PATHs
+## Wart: a rig guest has two PATHs (resolved by guest flakes)
 
 `rig exec` runs a login shell, whose PATH on NixOS is nix profiles plus
-`/run/current-system/sw/bin` — and no `/usr/bin`. The agent's systemd unit has
-its own fixed PATH, which *does* include `/usr/bin`. So a helper installed at
-`/usr/bin/foo` is on the agent's PATH and not on the operator's, and the same
-command works for one and not the other. Hit while installing the `ogx` devShell
-wrapper for the open-groceries VM.
+`/run/current-system/sw/bin` — and no `/usr/bin`. The agent's systemd unit
+declares its own PATH, which *does* include `/usr/bin`. So a helper installed
+by hand at `/usr/bin/foo` is on the agent's PATH and not on the operator's, and
+the same command works for one and not the other. Hit while installing a
+devShell wrapper by hand.
 
 `/usr/bin` is the only writable directory on either list — every other entry is a
-read-only nix profile — so there is nowhere to put a helper that both find by
-name. Fix at the next image build: either put `/usr/bin` on the login PATH, or
-ship such helpers as base-image packages so they land in the system profile.
-Until then, `rig exec` needs the absolute path.
+read-only nix profile — so there is nowhere to put a helper *by hand* that both
+find by name. The guest flake is the answer: a package in
+`environment.systemPackages` lands in `/run/current-system/sw/bin`, which both
+search. Until a project has one, `rig exec` needs the absolute path.
+
+A later correction (2026-09-17, found by an integration test with a stand-in
+`claude` in `/usr/bin`): the unit's declared PATH did not reach the agent
+either. The runner starts under a login shell so `/etc/profile` can set up the
+nix environment, and NixOS's `/etc/profile` exports PATH *absolutely* — measured
+by starting a unit with `PATH=/marker/bin` and reading `$PATH` from its login
+shell: no `/marker/bin`. So the agent searched the operator's list all along,
+`nix profile install` worked only because both lists contain
+`/root/.nix-profile/bin`, and `rig agent start`'s preflight checked a list
+nothing used — a binary in `/usr/bin` passed the check and then restart-looped
+on exit 127. The unit now also passes its list as `RIG_AGENT_PATH`, and the
+runner puts it back in front after the login shell; the preflight and the
+runner finally search the same thing.
 
 ## A guest can reach this host over vsock (2026-09-01)
 
@@ -274,12 +322,9 @@ What remains:
    first real reclaim; the fault was silent in exactly the way this project
    exists to prevent.
 
-## Current state
+## What has been verified
 
-- ZFS pool `fast` (loop-backed, 500 GiB, on the LUKS root, so encrypted at rest),
-  ARC capped at 8 GiB. CoW clones measured: `rig new` takes 1.5 s and adds no
-  pool usage.
-- Host headless, console on iGPU/HDMI. `boot_vga=1` on `0f:00.0`.
+- CoW clones: `rig new` takes 1.5 s and adds no pool usage.
 - `rig image build` builds and imports `nixos-gpu-base`, stamping it with the
   store path it came from. A rebuild that changes nothing is a no-op, and
   `rig doctor` reports a VM created from an older image.
@@ -295,6 +340,16 @@ What remains:
   `go test ./...` green; the integration suite green against the real card.
 - The whole path works end to end: `rig new` → `start` (GPU claimed, credentials
   injected) → `doctor` → CUDA test → `rig verify` → `run-agent`.
+- **The guest verbs, through the built binary** (`TestGuestVerbs`, 2026-09-17,
+  no card needed): `rig agent start` refuses a guest with no agent binary; with
+  a stand-in `claude` in `/usr/bin` the unit starts a session, exits at a turn
+  boundary, is resumed by systemd with `--resume` and the "your previous turn
+  ended" note rather than the crash note, receives a queued operator message,
+  and completes on the agent's own `DONE` marker; `rig push` refuses to clobber
+  a guest-side edit and `--force` overrides; `rig forward` carries a round trip
+  and its guest half is gone after Ctrl-C. Writing it found three bugs in an
+  afternoon: the login shell discarding the unit's PATH, a backgrounded list
+  that hung `rig forward`, and the tunnel announced before its listener was up.
 
 ### What the isolation is
 
@@ -331,16 +386,11 @@ What is proven and what is not:
   DHCP/DNS rules ahead of ACL rules). Scoped, not a hole: tcp/22 on the same
   address is blocked.
 
-## Open
-
-1. **Slot 1 diagnostic** (see Hardware). Physical work.
-2. See "What would make this harder over time" below.
-
 ## Parked — IPv6 (do not re-investigate without new information)
 
-**The ISP does not delegate an IPv6 prefix.** Verified 2026-08-23 on the router:
-the WAN v6 link never comes up, and `Received IPv6 prefix` is empty. So
-`ipv6.address=none` stays on `incusbr0`. That is correct, not a workaround:
+**The reference host's ISP delegates no IPv6 prefix** (verified 2026-08-23 on
+the router: the WAN v6 link never comes up), so `ipv6.address=none` stays on
+the bridge. That is correct, not a workaround:
 bridge IPv6 with no upstream route would add a bypass around IPv4-only ACL rules
 and cause AAAA-first stalls.
 
@@ -361,25 +411,6 @@ fails open if the rule is lost.
 
 Snapshots/rollback, remote API access, multi-GPU, any scheduler. The constraint
 is one card, one active project.
-
-## Files
-
-| Path | Purpose |
-|---|---|
-| `CLAUDE.md` | Which tool for what, and how to start a project |
-| `RUNBOOK.md` | Host setup, in order |
-| `cmd/rig` | The whole surface: image, lifecycle, guest access, card, policy, host |
-| `internal/hostgpu` | Move the card between this host's desktop and VMs |
-| `internal/incus` | Typed REST client over the unix socket; exec over websockets |
-| `internal/policy` | Declared isolation policy and the reconcile |
-| `internal/gpu` | Arbitration, PCI discovery, the lock |
-| `internal/creds` | Credential validation and injection |
-| `internal/verify` | Probes a live guest; refuses to pass what it cannot prove |
-| `base/` | Declarative image: flake + guest module, built by `rig image build` |
-| `integration/` | Build-tagged: invariants against real Incus and the real card |
-| `project-template/` | Per-project devShell, the CUDA correctness test, `run-agent` |
-| `project-template/guest/` | Optional per-project guest image: the base plus a project's own modules |
-| `secrets/` | Gitignored. Per-project credential files. |
 
 ## What would make this harder over time
 
@@ -403,8 +434,16 @@ quietly.
 4. **The ACL is a denylist.** Every new private range someone invents is a gap
    until noticed. The IPv6 plan already says default-deny plus an allowlist; the
    same argument applies to IPv4 once there is any appetite for the churn.
-5. **Nothing here is portable off this host.** Not a goal yet, and the CLI is
-   already parameterised (`--flake`, `--attr`, `--alias`, `RIG_*`). The real
-   blockers are elsewhere: `base/gpu-dev.nix` hardcodes `hardware.nvidia.open`,
-   `gpu-check` greps PCI vendor `10de:`, `internal/hostgpu` names the NVIDIA modules,
-   and `project-template` bakes in CUDA and `sm_89`.
+5. **It is NVIDIA-only, and one card.** The CLI is parameterised (`--flake`,
+   `--attr`, `--alias`, `--profile`, `RIG_*`) and nothing names a particular
+   host, but the vendor is everywhere: discovery greps PCI vendor `10de`,
+   `base/gpu-dev.nix` is `hardware.nvidia`, `internal/hostgpu` names the NVIDIA
+   modules, and `project-template` is CUDA. Another vendor is a second driver
+   in the image and a second reset path on the host, not a flag.
+6. **The integration suite is the only thing that tests Incus itself, and it
+   is easy to stop running.** `internal/incus` is now unit-tested against a
+   fake daemon, but a fake only pins what rig sends; whether Incus honours it
+   is the tagged suite's question, and that suite needs the daemon and the
+   card. It once stopped compiling for two weeks behind a signature change,
+   because a build tag hides a package from `go vet ./...` — `make test` now
+   vets it explicitly, but nothing runs it but a human with the machine idle.

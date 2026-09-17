@@ -1,5 +1,8 @@
 # Working in this repo
 
+`README.md` says what this is, what it contains and what a host needs;
+`RUNBOOK.md` sets the host up. This file is how to work here once it is.
+
 One GPU, one VM at a time. The VM is where an unattended agent works; the
 isolation around it is the product. Two failures are silent, and shape all the
 tooling:
@@ -7,7 +10,7 @@ tooling:
 - Starting a second VM with the same GPU **hot-unplugs the card from the running
   one**. `incus list` still shows the victim RUNNING with a healthy IP.
 - A VM created without the network ACL can reach **this host's sshd** on every
-  address the host holds, plus the LAN and the tailnet.
+  address the host holds, plus the LAN and any overlay network the host is on.
 
 ## Which tool for what
 
@@ -20,13 +23,13 @@ break an invariant, so reach for it deliberately.
 root, so `desktop` and `headless` re-exec themselves under sudo, printing the
 command first; `status` does not. Reclaiming the card **resets it** before the
 driver loads, and then checks a DRM node appeared rather than trusting that the
-driver bound — see STATUS.md, behaviour 6. Both matter: without the reset the
+driver bound — see DESIGN.md, behaviour 6. Both matter: without the reset the
 desktop comes back with no display, and without the check rig says it succeeded.
 
-`rig host headless` ends the desktop **session**, not just its display: on this
-host `gnome-shell` renders on the card even when the monitor is on the iGPU. It
-lists what holds the card before stopping anything, so you can see whose session
-you are about to end.
+`rig host headless` ends the desktop **session**, not just its display: under
+GNOME, `gnome-shell` renders on the discrete card even when the monitor is on
+the iGPU. It lists what holds the card before stopping anything, so you can see
+whose session you are about to end.
 
 `rig new --no-gpu` makes a VM that never claims the card. Use it for CPU-only
 work: without it every `rig start` claims the GPU, so on a host whose desktop is
@@ -48,9 +51,9 @@ so its first push asks for `--force` once.
 
 The guest needs an agent binary before `rig agent` can run one. It is a project
 decision, not part of the base image, so a fresh VM has none until you put one
-there: `rig exec <vm> nix profile install nixpkgs#claude-code`. `rig agent
-start` checks before it creates any state, because the alternative is a unit
-that restart-loops with `last exit 127` and says nothing about why.
+there: `rig agent install <vm>`. `rig agent start` checks before it creates any
+state, because the alternative is a unit that restart-loops with `last exit 127`
+and says nothing about why.
 
 `rig agent` runs an unattended agent in the guest and keeps a channel to it.
 It is a systemd unit, so it outlives your shell; its session UUID is fixed and
@@ -99,13 +102,13 @@ devices cannot do this on a VM (6.0.5 allows only NAT mode there, which is
 host-to-guest through the NIC, where the ACL lives).
 
 ```bash
-rig forward og 9222              # guest:9222 -> 127.0.0.1:9222 here
-rig forward og 8787 --to-guest   # here:8787  -> 127.0.0.1:8787 in the guest
+rig forward myvm 9222              # guest:9222 -> 127.0.0.1:9222 here
+rig forward myvm 8787 --to-guest   # here:8787  -> 127.0.0.1:8787 in the guest
 ```
 
 It blocks while it holds the tunnel and tears down both ends on Ctrl-C. The
-guest half is `socat`, so the guest needs it — put it in the project's guest
-image rather than installing it by hand.
+guest half is `socat`, which the base image carries; a guest made from an older
+image is told so, and wants recreating rather than a package installed by hand.
 
 The case it was built for is a **captcha**. An unattended agent cannot solve an
 interactive challenge, and neither can an operator handed a screenshot: those
@@ -141,12 +144,12 @@ calling `rig.lib.mkGuest [ ./guest.nix ]`, because `rig image build` builds
 Reach for it exactly when you would otherwise run setup commands against a
 running guest by hand — `nix profile install`, a wrapper dropped on PATH, a
 directory that must exist at boot. That path produces a VM nothing describes,
-and it is how the `ogx`/`/work/handoff` mess happened: the agent was handed a
-document describing a machine nobody had built. It also fixes the two-PATH wart
-for free, because `writeShellScriptBin` in `systemPackages` lands in
-`/run/current-system/sw/bin`, which both the login shell and the agent unit
-search. Toolchains still belong in the project's devShell flake; this is for the
-machine, not the build.
+and it is how one VM ended up with a wrapper and a directory nothing recorded:
+the agent was handed a document describing a machine nobody had built. It also
+fixes the two-PATH wart for free, because `writeShellScriptBin` in
+`systemPackages` lands in `/run/current-system/sw/bin`, which both the login
+shell and the agent unit search. Toolchains still belong in the project's
+devShell flake; this is for the machine, not the build.
 
 The alias a VM was created from is recorded on the instance, so `rig doctor`
 measures drift against the image it was actually built from rather than against
@@ -160,31 +163,38 @@ Build with `make`. Go 1.26, one binary from one module.
 printf 'ANTHROPIC_API_KEY=sk-ant-...\n' > secrets/myproj.env
 chmod 600 secrets/myproj.env
 
+./rig init proj                               # the project template, written out
 ./rig new myproj --env secrets/myproj.env --start
-./rig push myproj project-template            # -> /work/project-template
+./rig push myproj proj                        # -> /work/proj
 ./rig doctor myproj                           # isolation, GPU, agent, address, creds
 ```
+
+`rig init` writes the same files as `project-template/` from the copy built into
+the binary, and points the guest flake at the base this rig was built from. From
+a checkout, pushing `project-template` itself does the same job.
 
 `run-agent` gets the agent from the project flake. `rig agent` does not — it runs
 a systemd unit with a fixed PATH, so the binary has to be in the guest's own nix
 profile:
 
 ```bash
-./rig exec myproj NIXPKGS_ALLOW_UNFREE=1 nix profile install --impure nixpkgs#claude-code
+./rig agent install myproj
 ```
 
-Both halves of that are load-bearing. `claude-code` is unfree, and a flake
-reference does not read `~/.config/nixpkgs/config.nix` — flake evaluation is pure
-— so the base image's own `allowUnfree` does not reach it either. Without them
-nix fails with three suggested fixes, all of which are for the non-flake path.
+which runs `NIXPKGS_ALLOW_UNFREE=1 nix profile install --impure nixpkgs#claude-code`
+in the guest. Both halves of that are load-bearing. `claude-code` is unfree, and
+a flake reference does not read `~/.config/nixpkgs/config.nix` — flake evaluation
+is pure — so the base image's own `allowUnfree` does not reach it either. Without
+them nix fails with three suggested fixes, all of which are for the non-flake
+path. A project that would rather pin its agent ships it in its guest flake.
 
 Then prove the two things `doctor` cannot: that a kernel returns correct results,
 and that the isolation holds against real traffic.
 
 ```bash
-./rig exec --dir /work/project-template myproj nix develop "path:." -c make run
+./rig exec --dir /work/proj myproj nix develop "path:." -c make run
 ./rig verify myproj    # 0 proven, 1 violated, 2 could not be proven
-./rig exec --dir /work/project-template myproj nix develop "path:." -c ./run-agent
+./rig exec --dir /work/proj myproj nix develop "path:." -c ./run-agent
 ```
 
 `verify` exit 2 is not a pass. It means some check could not tell a blocked
@@ -237,5 +247,6 @@ type.
 `.claude/settings.json` allowlists `./rig` so routine work does not prompt. It is
 convenience, not containment — the boundary is the VM and the network ACL.
 
-`STATUS.md` has current state, decisions and why, and open work. `RUNBOOK.md` is
-host setup. `project-template/README.md` covers the CUDA toolchain.
+`DESIGN.md` has the decisions and why, what was learned proving them, and what
+is still weak. `RUNBOOK.md` is host setup. `project-template/README.md` covers
+the CUDA toolchain.
