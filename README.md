@@ -1,12 +1,16 @@
 # rig
 
 On Linux, `rig` creates isolated NixOS VMs, 
-runs an unattended coding agent inside it, and proves, to the best of its ability using packets, 
-that the agent cannot reach the host, the LAN, or anything else it has no business reaching.
+runs an unattended coding agent inside them, and proves, to the best of its ability using packets, 
+that guest agents cannot reach the host, the LAN, or anything else it has no business reaching.
 
 It is pretty much entirely vibe-coded, built on [Incus](https://linuxcontainers.org/incus/), 
 supports GPU passthrough through VFIO, and relies on [Claude Code](https://claude.com/claude-code) as the
-inner agent (but you could probably add support for others if you were so inclined).
+guest agent (but you could probably add support for others if you were so inclined). 
+
+
+Sharing the GPU concurrently _is not_ supported, so you are only expected to work on one "project" 
+(whatever that means to you) at a time.
 
 It is best used by mentioning its existence, pointing to `rig --help`, talking a bit about how it should be used, 
 and telling Claude to check in on the work of the unattended agent every so often.
