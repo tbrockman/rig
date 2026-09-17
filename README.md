@@ -1,14 +1,15 @@
 # rig
 
-One Linux host, one GPU, one VM at a time. `rig` creates an isolated NixOS VM
-with the card passed through, runs an unattended coding agent inside it, and
-proves — with packets, not configuration — that the agent cannot reach the
-host, the LAN, or anything else it has no business reaching.
+On Linux, `rig` creates isolated NixOS VMs, 
+runs an unattended coding agent inside it, and proves, to the best of its ability using packets, 
+that the agent cannot reach the host, the LAN, or anything else it has no business reaching.
 
-It is built on [Incus](https://linuxcontainers.org/incus/) for the VM, VFIO for
-the passthrough, and [Claude Code](https://claude.com/claude-code) as the
-agent. The isolation around the agent is the product; the GPU is for whatever
-the agent is building.
+It is pretty much entirely vibe-coded, built on [Incus](https://linuxcontainers.org/incus/), 
+supports GPU passthrough through VFIO, and relies on [Claude Code](https://claude.com/claude-code) as the
+inner agent (but you could probably add support for others if you were so inclined).
+
+It is best used by mentioning its existence, pointing to `rig --help`, talking a bit about how it should be used, 
+and telling Claude to check in on the work of the unattended agent every so often.
 
 ## What the isolation is, and is not
 
