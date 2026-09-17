@@ -53,6 +53,19 @@ func (a *app) imageBuildCmd() *cobra.Command {
 			// RIG_FLAKE counts as naming it: the operator set it deliberately,
 			// and envOr has already folded it into the default.
 			named := cmd.Flags().Changed("flake") || os.Getenv("RIG_FLAKE") != ""
+			if !named {
+				if _, err := os.Stat(filepath.Join(flake, "flake.nix")); err != nil {
+					// No checkout here — a `go install`ed rig, most likely.
+					// Build the base this binary carries, and say so: the
+					// operator should know which definition became the image.
+					dir, err := materializeBase()
+					if err != nil {
+						return err
+					}
+					note("no %s here; building the base image built into this rig, from %s", flake, dir)
+					flake, named = dir, true
+				}
+			}
 			ref, err := flakeRef(flake, named)
 			if err != nil {
 				return err
@@ -204,7 +217,7 @@ func (a *app) imageDrift(inst *incus.Instance, alias string) (drifted bool, deta
 
 // --- nix -----------------------------------------------------------------
 
-// flakeRef turns a directory into a path flake ref, and passes anything that
+// flakeRef turns a directory into a flake ref, and passes anything that
 // already looks like a ref straight through.
 //
 // named says the operator chose this directory, by --flake or RIG_FLAKE. When
@@ -213,6 +226,15 @@ func (a *app) imageDrift(inst *incus.Instance, alias string) (drifted bool, deta
 // anywhere but the rig checkout failed with "no flake.nix in /somewhere/base",
 // naming a path the operator never typed. The default is the assumption worth
 // reporting, not the path it produced.
+//
+// Inside a git working tree the bare path is the ref, not `path:`. Nix then
+// reads the directory through git, which honours .gitignore and — the reason
+// this matters — resolves a relative input such as `path:../../base` against
+// the tree. A `path:` ref copies the directory into the store first, and a
+// relative input is then resolved against the store copy, where `../../base`
+// is nothing. The cost is that untracked files are invisible to nix, so they
+// are named here rather than discovered as a missing-file error from inside
+// the build.
 func flakeRef(in string, named bool) (string, error) {
 	if strings.Contains(in, ":") {
 		return in, nil
@@ -232,7 +254,30 @@ func flakeRef(in string, named bool) (string, error) {
 		}
 		return "", fmt.Errorf("no flake.nix in %s\n  Point --flake at the directory holding the image definition.", abs)
 	}
-	return "path:" + abs, nil
+	if !inGitTree(abs) {
+		return "path:" + abs, nil
+	}
+	if untracked := untrackedFiles(abs); len(untracked) > 0 {
+		note("WARNING: nix reads a git tree through git, so it will not see these untracked files:")
+		for _, f := range untracked {
+			note("         %s", f)
+		}
+		note("         git add them first if the flake needs them.")
+	}
+	return abs, nil
+}
+
+func inGitTree(dir string) bool {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--is-inside-work-tree").Output()
+	return err == nil && strings.TrimSpace(string(out)) == "true"
+}
+
+func untrackedFiles(dir string) []string {
+	out, err := exec.Command("git", "-C", dir, "ls-files", "--others", "--exclude-standard", ".").Output()
+	if err != nil {
+		return nil
+	}
+	return strings.Fields(string(out))
 }
 
 // nixBuild builds one installable and returns its store path. Nix's progress

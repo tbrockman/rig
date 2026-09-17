@@ -15,9 +15,16 @@
 {
   description = "Project guest image";
 
-  # Point this at your rig checkout. Absolute, because once this directory is
-  # copied into a project the relative path to rig no longer means anything.
-  inputs.rig.url = "path:/home/theo/dev/rig/base";
+  # The rig base image. Relative, and it resolves because this directory and
+  # base/ are in one git tree: `rig image build` hands nix a bare path inside a
+  # git checkout, and nix reads that through git, where ../../base means
+  # something. (Behind a `path:` ref it would not — the directory is copied into
+  # the store first and the relative path is resolved against the copy.)
+  #
+  # When you copy this directory into your own project, point it at rig itself:
+  #   inputs.rig.url = "github:<owner>/rig?dir=base";
+  #   inputs.rig.url = "path:/absolute/path/to/a/rig/checkout/base";
+  inputs.rig.url = "path:../../base";
 
   # `rig image build` builds nixosConfigurations.<attr>, default `gpubase`, so
   # that single output is the whole contract.

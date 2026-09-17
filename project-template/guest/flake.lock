@@ -21,14 +21,14 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "narHash": "sha256-yNenG/nV5+ZPcEZ0cg1w1FLUT7tEkI9WkeKQxkODq9k=",
-        "path": "/home/theo/dev/rig/base",
+        "path": "../../base",
         "type": "path"
       },
       "original": {
-        "path": "/home/theo/dev/rig/base",
+        "path": "../../base",
         "type": "path"
-      }
+      },
+      "parent": []
     },
     "root": {
       "inputs": {

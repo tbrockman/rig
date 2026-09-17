@@ -17,6 +17,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -49,13 +50,33 @@ func main() {
 	root := &cobra.Command{
 		Use:   "rig",
 		Short: "Isolated project VMs with the GPU attached",
-		Long: "rig creates and runs isolated project VMs with the GPU attached.\n\n" +
+		Long: "rig creates and runs isolated project VMs with the GPU attached, and runs\n" +
+			"an unattended coding agent inside one.\n\n" +
 			"It enforces two invariants: at most one instance has the GPU configured\n" +
 			"and it never moves away from a running one, and no instance starts\n" +
 			"without network isolation.\n\n" +
-			"Environment: RIG_PCI, RIG_DEVICE, RIG_ACL, RIG_PROFILE, RIG_LOCK,\n" +
-			"INCUS_SOCKET, RIG_IMAGE, RIG_CPUS, RIG_MEMORY, RIG_DISK, RIG_FLAKE,\n" +
-			"RIG_FLAKE_ATTR.",
+			"Typical flow, once the host is set up (RUNBOOK.md):\n" +
+			"  rig image build                        # the NixOS guest image, from base/\n" +
+			"  rig apply                              # the isolation ACL, onto the profile\n" +
+			"  rig new myproj --env secrets/myproj.env --start\n" +
+			"  rig doctor myproj && rig verify myproj # configured, then proven\n" +
+			"  rig push myproj ./project              # -> /work/project in the guest\n" +
+			"  rig agent start myproj --prompt-file brief.md --until-done\n" +
+			"  rig agent status myproj                # bounded and cheap; check often\n\n" +
+			"Exit status is 0 or 1 except where a verb says otherwise: verify exits 2\n" +
+			"for \"could not be proven\", and exec carries the guest command's status out.\n" +
+			"Progress notes go to stdout prefixed \"rig:\"; errors go to stderr.\n\n" +
+			"Environment (each has a flag or a default; none is required):\n" +
+			"  RIG_PCI           the card's PCI address, when discovery picks wrong\n" +
+			"  RIG_DEVICE        name of the GPU device rig puts on an instance (gpu0)\n" +
+			"  RIG_ACL           name of the isolation ACL (vm-isolate)\n" +
+			"  RIG_PROFILE       profile that carries the isolation and that new VMs use (default)\n" +
+			"  RIG_LOCK          lock file serialising card moves (/var/lock/rig.lock)\n" +
+			"  RIG_IMAGE         image alias new VMs are made from (nixos-gpu-base)\n" +
+			"  RIG_CPUS, RIG_MEMORY, RIG_DISK    defaults for rig new\n" +
+			"  RIG_FLAKE, RIG_FLAKE_ATTR         what rig image build builds\n" +
+			"  INCUS_SOCKET      the daemon's unix socket (/var/lib/incus/unix.socket)",
+		Version:       version(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -67,6 +88,7 @@ func main() {
 		&cobra.Group{ID: "card", Title: "The card and the policy:"},
 	)
 	root.AddCommand(
+		a.initCmd(),
 		a.newCmd(), a.startCmd(), a.stopCmd(), a.restartCmd(), a.rmCmd(),
 		a.statusCmd(), a.doctorCmd(), a.verifyCmd(), a.logsCmd(),
 		a.execCmd(), a.shellCmd(), a.pushCmd(), a.pullCmd(), a.agentCmd(),
@@ -87,6 +109,51 @@ func main() {
 		fmt.Fprintf(os.Stderr, "rig: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// build is what the toolchain recorded about this binary: its module path, the
+// module version (a tag for a release `go install`, a pseudo-version or
+// "(devel)" otherwise), and the commit a `make` ran at.
+type build struct {
+	module, version, rev string
+	dirty                bool
+}
+
+func readBuild() build {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return build{version: "unknown"}
+	}
+	b := build{module: info.Main.Path, version: info.Main.Version}
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			b.rev = s.Value
+		case "vcs.modified":
+			b.dirty = s.Value == "true"
+		}
+	}
+	if len(b.rev) > 12 {
+		b.rev = b.rev[:12]
+	}
+	return b
+}
+
+// version renders the build for --version: the tag when there is one, and the
+// commit, marked when the tree was dirty.
+func version() string {
+	b := readBuild()
+	dirty := ""
+	if b.dirty {
+		dirty = "-dirty"
+	}
+	switch {
+	case b.rev == "":
+		return b.version
+	case b.version == "" || b.version == "(devel)":
+		return b.rev + dirty
+	}
+	return b.version + " (" + b.rev + dirty + ")"
 }
 
 // exitCodeError carries a specific process exit status out of a command whose
@@ -167,15 +234,20 @@ func (a *app) setEnvFile(name, envFile string) error {
 
 func (a *app) newCmd() *cobra.Command {
 	var (
-		envFile, image, memory, disk string
-		cpus                         int
-		start, noGPU                 bool
+		envFile, image, memory, disk, profile string
+		cpus                                  int
+		start, noGPU                          bool
 	)
 	cmd := &cobra.Command{
 		Use:     "new <vm>",
 		GroupID: "vm",
 		Short:   "Create a project VM (isolated, GPU-ready)",
-		Args:    cobra.ExactArgs(1),
+		Long: "Creates a stopped VM from the base image. Its NIC — and so its network\n" +
+			"isolation — and its root disk come from the profile, which is the one\n" +
+			"`rig apply` reconciles. The image alias, the credential file and whether\n" +
+			"the VM wants the card are all recorded on the instance, so later verbs\n" +
+			"need none of them repeated.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			name := args[0]
 			if !nameRE.MatchString(name) {
@@ -201,7 +273,7 @@ func (a *app) newCmd() *cobra.Command {
 				config[creds.InstanceKey] = absEnv
 			}
 			if err := a.c.CreateVM(incus.CreateOpts{
-				Name: name, Image: image, CPUs: cpus, Memory: memory,
+				Name: name, Image: image, Profile: profile, CPUs: cpus, Memory: memory,
 				DiskSize: disk, Config: config,
 			}); err != nil {
 				return err
@@ -215,8 +287,12 @@ func (a *app) newCmd() *cobra.Command {
 				return err
 			}
 			if !policy.Isolated(inst, a.cfg.ACL) {
+				fix := "rig apply"
+				if profile != "default" {
+					fix += " --profile " + profile
+				}
 				note("WARNING: %s did NOT inherit network isolation.", name)
-				note("         Fix the profile:  rig apply")
+				note("         Fix the profile:  %s", fix)
 				note("         rig start will refuse it until then.")
 			}
 
@@ -238,6 +314,8 @@ func (a *app) newCmd() *cobra.Command {
 	f := cmd.Flags()
 	f.StringVar(&envFile, "env", "", "host file of KEY=VALUE credentials to inject on start")
 	f.StringVar(&image, "image", envOr("RIG_IMAGE", defaultImage), "base image alias")
+	f.StringVar(&profile, "profile", envOr("RIG_PROFILE", "default"),
+		"Incus profile the VM inherits its NIC and root disk from; rig apply isolates the same one")
 	f.IntVar(&cpus, "cpus", envInt("RIG_CPUS", 8), "vCPUs")
 	f.StringVar(&memory, "memory", envOr("RIG_MEMORY", "16GiB"), "RAM")
 	f.StringVar(&disk, "disk", envOr("RIG_DISK", "40GiB"), "root disk size")

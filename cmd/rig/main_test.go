@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -135,8 +136,8 @@ func TestSshfsHintNamesBothRoutes(t *testing.T) {
 // Guest files are root-owned, so git refuses the tree. That failure is opaque
 // unless you have hit it before, so the path must be spelled out ready to paste.
 func TestGitSafeHintIsPasteable(t *testing.T) {
-	msg := gitSafeHint("/home/theo/dev/vm-live")
-	if !strings.Contains(msg, "git config --global --add safe.directory /home/theo/dev/vm-live") {
+	msg := gitSafeHint("/srv/rig/myvm-live")
+	if !strings.Contains(msg, "git config --global --add safe.directory /srv/rig/myvm-live") {
 		t.Errorf("hint must be a runnable command, got:\n%s", msg)
 	}
 }
@@ -242,12 +243,53 @@ func TestFlakeRefPassesAReferenceThrough(t *testing.T) {
 	}
 }
 
+// Inside a git tree the ref is the bare path, so nix reads it through git and
+// a relative input such as project-template/guest's `path:../../base` resolves.
+// With a `path:` prefix the directory is copied into the store first and the
+// relative input is resolved against the copy, where it points at nothing —
+// verified as "access to absolute path '/nix/base/flake.nix' is forbidden".
+func TestFlakeRefIsBareInsideAGitTreeAndPathOutsideOne(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git on PATH")
+	}
+	plain := t.TempDir()
+	if err := os.WriteFile(filepath.Join(plain, "flake.nix"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := flakeRef(plain, true); err != nil || got != "path:"+plain {
+		t.Errorf("outside git: got %q (%v), want path:%s", got, err, plain)
+	}
+
+	repo := t.TempDir()
+	dir := filepath.Join(repo, "guest")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "flake.nix"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	got, err := flakeRef(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(got, "path:") {
+		t.Errorf("inside git the ref must be bare so relative inputs resolve, got %q", got)
+	}
+	// Resolved through git; the untracked flake.nix is the case the warning is for.
+	if !inGitTree(dir) || len(untrackedFiles(dir)) == 0 {
+		t.Error("expected the untracked flake.nix to be reported")
+	}
+}
+
 // A project with its own guest image must not be reported as drifted from a
 // base it was never built from. The recorded alias is the honest comparison;
 // the default is only right while there is one image on the host.
 func TestDriftAliasPrefersWhatTheVMWasBuiltFrom(t *testing.T) {
-	if got := driftAlias("og-guest", defaultImage, false); got != "og-guest" {
-		t.Errorf("compared against %q, want the recorded alias og-guest", got)
+	if got := driftAlias("myproj-guest", defaultImage, false); got != "myproj-guest" {
+		t.Errorf("compared against %q, want the recorded alias myproj-guest", got)
 	}
 	// Nothing recorded: instances created before the key existed still compare
 	// against the default rather than against nothing.
@@ -255,7 +297,7 @@ func TestDriftAliasPrefersWhatTheVMWasBuiltFrom(t *testing.T) {
 		t.Errorf("compared against %q, want the default %q", got, defaultImage)
 	}
 	// An explicit --image is a different question, asked on purpose.
-	if got := driftAlias("og-guest", "some-other", true); got != "some-other" {
+	if got := driftAlias("myproj-guest", "some-other", true); got != "some-other" {
 		t.Errorf("compared against %q, want the explicit flag value", got)
 	}
 }
