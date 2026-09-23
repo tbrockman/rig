@@ -28,9 +28,14 @@ import (
 // DefaultFile is where the verbs look when -f is not given.
 const DefaultFile = "rig.yaml"
 
+// Manifest is a rig.yaml: what one VM is given. Nothing is given unless it is
+// listed here.
 type Manifest struct {
-	Host  Host  `yaml:"host"`
-	Guest Guest `yaml:"guest"`
+	// Devices on this host that a VM may be given. It repeats per project, so
+	// one file describes everything its VM needs.
+	Host Host `yaml:"host,omitempty"`
+	// The VM, and what it is given.
+	Guest Guest `yaml:"guest" jsonschema:"required"`
 
 	// Path is the file this came from, absolute; Dir is what relative paths
 	// inside it resolve against.
@@ -38,81 +43,89 @@ type Manifest struct {
 	Dir  string `yaml:"-"`
 }
 
+// Host is the host: block.
 type Host struct {
-	Devices map[string]Device `yaml:"devices"`
+	// Devices by a name of your choosing, which guest.devices refers to.
+	Devices map[string]Device `yaml:"devices,omitempty"`
 }
 
 // Device is one host device a VM may be given.
 //
-// Kind selects everything rig knows about it: how to express it to Incus, and
-// whether it is exclusive. gpu and pci pass a whole PCI function through VFIO,
-// so at most one VM may hold one at a time and the host loses it meanwhile;
-// usb attaches one USB device by identity and can be shared or hotplugged.
+// gpu and pci pass a whole PCI function through VFIO, so at most one VM holds
+// one at a time and the host loses it meanwhile; usb attaches one USB device
+// by identity, and the host keeps its controller.
 type Device struct {
-	Kind string `yaml:"kind"`
-	PCI  string `yaml:"pci,omitempty"` // gpu, pci: 0000:3c:00.3
-	// ID is vendor:product for usb, which is how the device is found. For gpu
-	// and pci it is vendor:device, what must be at the address: PCI addresses
-	// are renumbered when a device appears or disappears ahead of them (a BIOS
-	// setting is enough), and an address alone once handed a VM the host's SATA
-	// controller in place of a USB one.
+	// gpu: an NVIDIA card (the guest needs rig.nixosModules.nvidia). pci: any
+	// PCI function, such as a USB controller. usb: one USB device, by id.
+	Kind string `yaml:"kind" jsonschema:"required,enum=gpu,enum=pci,enum=usb"`
+	// The PCI address, from lspci -D, for gpu and pci. It must be alone in its
+	// IOMMU group.
+	PCI string `yaml:"pci,omitempty"`
+	// For usb, vendor:product from lsusb. For gpu and pci, vendor:device from
+	// lspci -nn: what must be at the address, since a BIOS change can renumber
+	// the bus. Required for pci.
 	ID string `yaml:"id,omitempty"`
-
-	// Return says how the host takes an exclusive device back once no VM
-	// holds it. Absent means it stays parked on vfio-pci, which is right for a
-	// device the host never uses itself.
+	// How the host takes a gpu or pci device back after rig stop. Without it,
+	// the device stays on vfio-pci, which suits hardware the host never uses.
 	Return *Return `yaml:"return,omitempty"`
 }
 
-// Return is the host-side recipe for one device, as data rather than code.
+// Return is how the host takes a device back after rig stop.
 type Return struct {
-	// Modules to unload before the unbind and reload after the reset. The
-	// NVIDIA driver needs this; most drivers do not.
+	// Kernel modules to unload before the unbind and reload after the reset;
+	// the NVIDIA driver needs this.
 	Modules []string `yaml:"modules,omitempty"`
-	// Reset issues a function-level reset before the host driver binds. A
-	// card handed back from a guest keeps that guest's state, and on some
-	// hardware the host driver cannot initialise on top of it.
+	// Reset the device before the host driver binds it. A card handed back
+	// from a guest may not initialise without it.
 	Reset bool `yaml:"reset,omitempty"`
-	// Alive is a glob under the device's sysfs directory that exists only
-	// once the host driver has actually brought the device up: drm/card* for
-	// a display adapter, usb* for a USB controller. Binding is not working;
-	// this is the check that says it worked.
+	// A glob under the device's sysfs directory that exists once the host
+	// driver has really brought it up: drm/card* for a card, usb* for a USB
+	// controller.
 	Alive string `yaml:"alive,omitempty"`
-	// Unit is a host systemd unit that uses the device — a display manager,
-	// typically. Stopped before a VM claims the device, started after it is
-	// returned.
+	// A host systemd unit that uses the device, such as display-manager:
+	// stopped before a VM claims it, started after it comes back.
 	Unit string `yaml:"unit,omitempty"`
 }
 
+// Guest is the guest: block.
 type Guest struct {
-	Name  string `yaml:"name"`
+	// The VM's name in Incus.
+	Name string `yaml:"name" jsonschema:"required"`
+	// An image alias already built (rig image build). Give this or flake.
 	Image string `yaml:"image,omitempty"`
-	// Flake is a flake reference to build the guest image from: a directory
-	// ("./guest"), anything nix accepts ("github:me/vms?dir=guest"), with an
-	// optional #name for nixosConfigurations.<name>, "guest" when absent.
+	// A flake to build the image from, as <name>-guest when missing: ./guest
+	// builds nixosConfigurations.guest, ./guest#daw builds .daw, and remote
+	// references (github:me/vms?dir=guest) work too.
 	Flake string `yaml:"flake,omitempty"`
 	// Build is refused with a pointer to Flake. Compose's build: is a
 	// Dockerfile's directory; rig builds NixOS flakes, and a field that looks
 	// like Compose's but means something else is worse than a different one.
-	Build   string   `yaml:"build,omitempty"`
-	CPUs    CPUs     `yaml:"cpus,omitempty"`
-	Memory  string   `yaml:"memory,omitempty"`
-	Disk    string   `yaml:"disk,omitempty"`
-	EnvFile string   `yaml:"env_file,omitempty"`
+	Build string `yaml:"build,omitempty" jsonschema:"-"`
+	// A number of vCPUs, or a set of host CPUs to pin them to, one each
+	// ("4-7,12-15"): for a guest with deadlines, such as audio.
+	CPUs CPUs `yaml:"cpus,omitempty"`
+	// Memory, as Incus sizes it: 16GiB.
+	Memory string `yaml:"memory,omitempty"`
+	// Root disk size: 40GiB.
+	Disk string `yaml:"disk,omitempty"`
+	// A file of KEY=VALUE credentials, injected to tmpfs in the guest at each
+	// start and never written to its disk. Keep it outside any repository.
+	EnvFile string `yaml:"env_file,omitempty"`
+	// Which of host.devices this VM gets.
 	Devices []string `yaml:"devices,omitempty"`
-	Ports   []Port   `yaml:"ports,omitempty"`
-	// Volumes are Incus custom storage volumes mounted into the guest. They
-	// outlive the VM: `rig rm` leaves them, so what is on them survives the
-	// VM being recreated from a new image.
+	// Guest ports published on a host address, in Compose's syntax. Each one
+	// opens that port alone through the isolation.
+	Ports []Port `yaml:"ports,omitempty"`
+	// Named Incus volumes mounted in the guest. They outlive the VM, so data
+	// survives it being recreated; host directories are refused.
 	Volumes []Volume `yaml:"volumes,omitempty"`
-	// Network is empty for the profile's NIC, the isolated default, or
-	// NetworkNone for no network device at all: the profile's NIC masked. A
-	// guest with none still has every rig verb, which runs over vsock.
-	Network string `yaml:"network,omitempty"`
-	// Input is empty, or InputHost to have `rig start` lend this host's
-	// keyboard and mouse to the guest as events (`rig host input`) for as
-	// long as the VM runs.
-	Input string `yaml:"input,omitempty"`
+	// none: no network device at all. Left out, the VM gets the isolated NIC,
+	// which reaches the internet but not this host or the LAN.
+	Network string `yaml:"network,omitempty" jsonschema:"enum=none"`
+	// host: lend this host's keyboard and mouse to the guest as events from
+	// start to stop, toggled with both Ctrl keys. The guest needs
+	// rig.nixosModules.desktop.
+	Input string `yaml:"input,omitempty" jsonschema:"enum=host"`
 }
 
 // NetworkNone asks for a VM with no network device.
@@ -182,9 +195,14 @@ func (c CPUs) Limit() string {
 // refused: a directory of this host inside the guest is the kind of path the
 // isolation exists to keep out, and an untrusted guest could write to it.
 type Volume struct {
-	Name  string `yaml:"source"`
-	Path  string `yaml:"target"`
-	Size  string `yaml:"size,omitempty"`
+	// The volume's name; created in the VM's storage pool when missing.
+	Name string `yaml:"source" jsonschema:"required"`
+	// Where the guest mounts it: an absolute path.
+	Path string `yaml:"target" jsonschema:"required"`
+	// A size limit, such as 50GiB.
+	Size string `yaml:"size,omitempty"`
+	// uid:gid that owns the volume's root when it is created, such as 1000:100
+	// for the desktop user. Root otherwise.
 	Owner string `yaml:"owner,omitempty"`
 }
 
@@ -231,10 +249,15 @@ func (v *Volume) validate(line int) error {
 // the host address to publish on; empty means the address on the host's
 // default route, which is the one a machine on the LAN would use.
 type Port struct {
-	HostIP    string `yaml:"host_ip,omitempty"`
-	Published string `yaml:"published"`
-	Target    string `yaml:"target"`
-	Protocol  string `yaml:"protocol,omitempty"`
+	// The host address to publish on, such as its tailnet address to keep the
+	// port off the LAN. The LAN address when left out.
+	HostIP string `yaml:"host_ip,omitempty"`
+	// The host port, or a range a-b.
+	Published string `yaml:"published,omitempty"`
+	// The guest port, or a range a-b the same size. Defaults to published.
+	Target string `yaml:"target,omitempty"`
+	// tcp (the default) or udp.
+	Protocol string `yaml:"protocol,omitempty" jsonschema:"enum=tcp,enum=udp"`
 }
 
 // String renders the port back in Compose's short form.

@@ -12,6 +12,7 @@ reference for each verb; keep it accurate rather than repeating it here.
 ```bash
 make                   # ./rig
 make test              # go vet (including the integration tag) and unit tests
+make generate          # schema/rig.schema.json and README's field table, from internal/manifest
 make test-integration  # real Incus and a real card; destructive, refuses if anything is up
 ```
 
@@ -38,6 +39,11 @@ survive). Nix sees only files git knows about, so `git add` a new file under
   paths in docs, tests or templates: GPU `0000:2b:00.0` / `10de:abcd`, tailnet
   `100.64.0.7`, `/home/me`. Credentials live outside any repository
   (`~/.config/rig/<vm>.env`).
+- **A manifest field is documented once**, in its doc comment in
+  `internal/manifest/manifest.go`, written for someone editing a rig.yaml.
+  `make generate` turns the comments into `schema/rig.schema.json` (editor
+  hover and validation) and README's field table; `make test` fails when either
+  is stale, or when the schema and `validate()` disagree about a manifest.
 - **Docs stay short.** A sentence of why beats a paragraph of history; history
   goes in DESIGN.md, hard-won facts in DEV_NOTES.md.
 

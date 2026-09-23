@@ -87,6 +87,11 @@ func (a *app) initCmd() *cobra.Command {
 				return err
 			}
 			text := fillManifest(string(b), name, pci, id)
+			if ref, err := schemaRef(); err == nil {
+				text = pointAtSchema(text, ref)
+			} else {
+				note("WARNING: could not write the schema for editors: %v", err)
+			}
 			if mods["nvidia"] {
 				text = grantCard(text)
 			}
@@ -365,4 +370,48 @@ func buildKey(b build) string {
 		}
 		return '_'
 	}, key)
+}
+
+func (a *app) schemaCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "schema",
+		GroupID: "vm",
+		Short:   "Print the JSON Schema for rig.yaml",
+		Long: "Prints the JSON Schema rig.yaml is checked against, for an editor or\n" +
+			"another tool. rig init already points a new rig.yaml at it, with a\n" +
+			"yaml-language-server comment that VS Code's YAML extension reads.",
+		Args: cobra.NoArgs,
+		RunE: func(*cobra.Command, []string) error {
+			_, err := os.Stdout.Write(rig.Schema())
+			return err
+		},
+	}
+}
+
+// schemaLineRE matches the template's yaml-language-server comment.
+var schemaLineRE = regexp.MustCompile(`(?m)^# yaml-language-server: \$schema=\S+$`)
+
+// pointAtSchema points a manifest's yaml-language-server comment at ref.
+func pointAtSchema(text, ref string) string {
+	return schemaLineRE.ReplaceAllString(text, "# yaml-language-server: $$schema="+ref)
+}
+
+// schemaRef is the schema a manifest written by this binary should name: the
+// release's own on GitHub for a release build, else a copy of the embedded
+// one in the cache directory, since a development build's schema may not be
+// published anywhere.
+func schemaRef() (string, error) {
+	b := readBuild()
+	if repo, ok := strings.CutPrefix(b.module, "github.com/"); ok && semverTagRE.MatchString(b.version) {
+		return "https://raw.githubusercontent.com/" + repo + "/" + b.version + "/schema/rig.schema.json", nil
+	}
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(cache, "rig", "rig.schema-"+buildKey(b)+".json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	return path, os.WriteFile(path, rig.Schema(), 0o644)
 }

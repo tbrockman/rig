@@ -1,0 +1,414 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/tbrockman/rig/main/schema/rig.schema.json",
+  "$defs": {
+    "CPUs": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$"
+        }
+      ]
+    },
+    "Device": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "gpu"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "pci"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "pci"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "pci",
+              "id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "usb"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "pci"
+                  ]
+                },
+                {
+                  "required": [
+                    "return"
+                  ]
+                }
+              ]
+            },
+            "required": [
+              "id"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "gpu",
+            "pci",
+            "usb"
+          ],
+          "description": "gpu: an NVIDIA card (the guest needs rig.nixosModules.nvidia). pci: any PCI function, such as a USB controller. usb: one USB device, by id."
+        },
+        "pci": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$",
+          "description": "The PCI address, from lspci -D, for gpu and pci. It must be alone in its IOMMU group."
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{4}:[0-9a-f]{4}$",
+          "description": "For usb, vendor:product from lsusb. For gpu and pci, vendor:device from lspci -nn: what must be at the address, since a BIOS change can renumber the bus. Required for pci."
+        },
+        "return": {
+          "$ref": "#/$defs/Return",
+          "description": "How the host takes a gpu or pci device back after rig stop. Without it, the device stays on vfio-pci, which suits hardware the host never uses."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "description": "Device is one host device a VM may be given."
+    },
+    "Guest": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "network": {
+                "const": "none"
+              }
+            },
+            "required": [
+              "network"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "ports"
+              ]
+            }
+          }
+        }
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "image"
+          ]
+        },
+        {
+          "required": [
+            "flake"
+          ]
+        }
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}$",
+          "description": "The VM's name in Incus."
+        },
+        "image": {
+          "type": "string",
+          "description": "An image alias already built (rig image build). Give this or flake."
+        },
+        "flake": {
+          "type": "string",
+          "description": "A flake to build the image from, as \u003cname\u003e-guest when missing: ./guest builds nixosConfigurations.guest, ./guest#daw builds .daw, and remote references (github:me/vms?dir=guest) work too."
+        },
+        "cpus": {
+          "$ref": "#/$defs/CPUs",
+          "description": "A number of vCPUs, or a set of host CPUs to pin them to, one each (\"4-7,12-15\"): for a guest with deadlines, such as audio."
+        },
+        "memory": {
+          "type": "string",
+          "description": "Memory, as Incus sizes it: 16GiB."
+        },
+        "disk": {
+          "type": "string",
+          "description": "Root disk size: 40GiB."
+        },
+        "env_file": {
+          "type": "string",
+          "description": "A file of KEY=VALUE credentials, injected to tmpfs in the guest at each start and never written to its disk. Keep it outside any repository."
+        },
+        "devices": {
+          "items": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}$"
+          },
+          "type": "array",
+          "description": "Which of host.devices this VM gets."
+        },
+        "ports": {
+          "items": {
+            "$ref": "#/$defs/Port"
+          },
+          "type": "array",
+          "description": "Guest ports published on a host address, in Compose's syntax. Each one opens that port alone through the isolation."
+        },
+        "volumes": {
+          "items": {
+            "$ref": "#/$defs/Volume"
+          },
+          "type": "array",
+          "description": "Named Incus volumes mounted in the guest. They outlive the VM, so data survives it being recreated; host directories are refused."
+        },
+        "network": {
+          "type": "string",
+          "enum": [
+            "none"
+          ],
+          "description": "none: no network device at all. Left out, the VM gets the isolated NIC, which reaches the internet but not this host or the LAN."
+        },
+        "input": {
+          "type": "string",
+          "enum": [
+            "host"
+          ],
+          "description": "host: lend this host's keyboard and mouse to the guest as events from start to stop, toggled with both Ctrl keys. The guest needs rig.nixosModules.desktop."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "description": "Guest is the guest: block."
+    },
+    "Host": {
+      "properties": {
+        "devices": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/Device"
+              },
+              "propertyNames": {
+                "pattern": "^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}$"
+              },
+              "type": "object",
+              "description": "Devices by a name of your choosing, which guest.devices refers to."
+            }
+          ],
+          "description": "Devices by a name of your choosing, which guest.devices refers to."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "Host is the host: block."
+    },
+    "Port": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^(?:(\\d+\\.\\d+\\.\\d+\\.\\d+):)?(\\d+(?:-\\d+)?)(?::(\\d+(?:-\\d+)?))?(?:/(tcp|udp))?$"
+        },
+        {
+          "anyOf": [
+            {
+              "required": [
+                "published"
+              ]
+            },
+            {
+              "required": [
+                "target"
+              ]
+            }
+          ],
+          "properties": {
+            "host_ip": {
+              "type": "string",
+              "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$",
+              "description": "The host address to publish on, such as its tailnet address to keep the port off the LAN. The LAN address when left out."
+            },
+            "published": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "maximum": 65535,
+                  "minimum": 1
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[0-9]+(-[0-9]+)?$"
+                }
+              ],
+              "description": "The host port, or a range a-b."
+            },
+            "target": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "maximum": 65535,
+                  "minimum": 1
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[0-9]+(-[0-9]+)?$"
+                }
+              ],
+              "description": "The guest port, or a range a-b the same size. Defaults to published."
+            },
+            "protocol": {
+              "type": "string",
+              "enum": [
+                "tcp",
+                "udp"
+              ],
+              "description": "tcp (the default) or udp."
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "description": "Port is one published port, in Compose's terms: Published is the host side, Target the guest side, each a port or an inclusive range \"a-b\"."
+        }
+      ],
+      "description": "Port is one published port, in Compose's terms: Published is the host side, Target the guest side, each a port or an inclusive range \"a-b\"."
+    },
+    "Return": {
+      "properties": {
+        "modules": {
+          "items": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]+$"
+          },
+          "type": "array",
+          "description": "Kernel modules to unload before the unbind and reload after the reset; the NVIDIA driver needs this."
+        },
+        "reset": {
+          "type": "boolean",
+          "description": "Reset the device before the host driver binds it. A card handed back from a guest may not initialise without it."
+        },
+        "alive": {
+          "not": {
+            "anyOf": [
+              {
+                "pattern": "^/"
+              },
+              {
+                "pattern": "\\.\\."
+              }
+            ]
+          },
+          "type": "string",
+          "description": "A glob under the device's sysfs directory that exists once the host driver has really brought it up: drm/card* for a card, usb* for a USB controller."
+        },
+        "unit": {
+          "type": "string",
+          "description": "A host systemd unit that uses the device, such as display-manager: stopped before a VM claims it, started after it comes back."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "Return is how the host takes a device back after rig stop."
+    },
+    "Volume": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,62}:/.+$"
+        },
+        {
+          "properties": {
+            "source": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$",
+              "description": "The volume's name; created in the VM's storage pool when missing."
+            },
+            "target": {
+              "type": "string",
+              "pattern": "^/.+",
+              "description": "Where the guest mounts it: an absolute path."
+            },
+            "size": {
+              "type": "string",
+              "description": "A size limit, such as 50GiB."
+            },
+            "owner": {
+              "type": "string",
+              "pattern": "^[0-9]+:[0-9]+$",
+              "description": "uid:gid that owns the volume's root when it is created, such as 1000:100 for the desktop user. Root otherwise."
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "source",
+            "target"
+          ],
+          "description": "Volume is one entry of guest.volumes: an Incus custom storage volume by name, and where the guest mounts it."
+        }
+      ],
+      "description": "Volume is one entry of guest.volumes: an Incus custom storage volume by name, and where the guest mounts it."
+    }
+  },
+  "properties": {
+    "host": {
+      "$ref": "#/$defs/Host",
+      "description": "Devices on this host that a VM may be given. It repeats per project, so one file describes everything its VM needs."
+    },
+    "guest": {
+      "$ref": "#/$defs/Guest",
+      "description": "The VM, and what it is given."
+    }
+  },
+  "additionalProperties": false,
+  "type": "object",
+  "required": [
+    "guest"
+  ],
+  "title": "rig.yaml",
+  "description": "Manifest is a rig.yaml: what one VM is given."
+}

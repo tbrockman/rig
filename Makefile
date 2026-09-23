@@ -14,6 +14,11 @@ test: FORCE
 	go vet -tags integration ./integration/
 	go test ./...
 
+# schema/rig.schema.json and README.md's field table, from internal/manifest's
+# types and doc comments. `make test` fails when they are stale.
+generate: FORCE
+	go test ./internal/manifest -run TestGeneratedFilesAreCurrent -update
+
 # Against real Incus and the real card. Destructive: creates and deletes
 # instances, moves the GPU, and starts a VM with no isolation on purpose.
 # Refuses to run while anything else is up.
@@ -29,4 +34,4 @@ clean: FORCE
 	rm -f $(BINS)
 
 FORCE:
-.PHONY: all test test-integration install clean FORCE
+.PHONY: all test generate test-integration install clean FORCE

@@ -569,3 +569,19 @@ func TestInitModules(t *testing.T) {
 		t.Errorf("modules: %s", got)
 	}
 }
+
+// rig init points a new rig.yaml's editor comment at the schema matching the
+// rig that wrote it, and leaves the rest of the file alone.
+func TestPointAtSchemaRewritesOnlyTheComment(t *testing.T) {
+	tmpl, err := os.ReadFile("../../project-template/rig.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := pointAtSchema(string(tmpl), "/home/me/.cache/rig/rig.schema-abc.json")
+	if !strings.HasPrefix(got, "# yaml-language-server: $schema=/home/me/.cache/rig/rig.schema-abc.json\n") {
+		t.Errorf("first line: %q", strings.SplitN(got, "\n", 2)[0])
+	}
+	if strings.SplitN(got, "\n", 2)[1] != strings.SplitN(string(tmpl), "\n", 2)[1] {
+		t.Error("more than the comment changed")
+	}
+}

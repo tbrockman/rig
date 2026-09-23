@@ -75,34 +75,38 @@ func TestParseRejectsUnknownKeys(t *testing.T) {
 	}
 }
 
+// badEdits turn the example into manifests that must be refused. The schema
+// test holds the JSON Schema to the same list.
+var badEdits = map[string]func(string) string{
+	"no image and no flake": func(s string) string { return strings.Replace(s, "flake: ./guest", "", 1) },
+	// Compose's build: is a Dockerfile's directory, so it is refused by
+	// name rather than read as a flake.
+	"compose's build": func(s string) string { return strings.Replace(s, "flake: ./guest", "build: ./guest", 1) },
+	"wanted device not declared": func(s string) string {
+		return strings.Replace(s, "devices: [gpu, desk-usb, mouse]", "devices: [gpu, webcam]", 1)
+	},
+	"bad pci address": func(s string) string { return strings.Replace(s, "0000:3c:00.3", "3c:00.3", 1) },
+	"usb with a pci": func(s string) string {
+		return strings.Replace(s, "id: 1234:5678", "id: 1234:5678\n      pci: 0000:01:00.0", 1)
+	},
+	"unknown kind":  func(s string) string { return strings.Replace(s, "kind: pci", "kind: xhci", 1) },
+	"duplicate pci": func(s string) string { return strings.Replace(s, "0000:3c:00.3", "0000:2b:00.0", 1) },
+	"bad port":      func(s string) string { return strings.Replace(s, `"8080:80"`, `"8080:80/sctp"`, 1) },
+	"unequal ranges": func(s string) string {
+		return strings.Replace(s, `"47998-48000:47998-48000/udp"`, `"47998-48000:47998/udp"`, 1)
+	},
+	"port out of range": func(s string) string { return strings.Replace(s, `"8080:80"`, `"80800:80"`, 1) },
+	"wildcard host ip":  func(s string) string { return strings.Replace(s, `"8080:80"`, `"0.0.0.0:8080:80"`, 1) },
+	"bad name":          func(s string) string { return strings.Replace(s, "name: myproj", "name: my proj", 1) },
+	"alive is a path":   func(s string) string { return strings.Replace(s, `alive: "usb*"`, `alive: "/sys/usb*"`, 1) },
+	// An address alone once handed a VM the host's SATA controller after a
+	// BIOS change renumbered the bus; a pci device must say what it is.
+	"pci without its identity": func(s string) string { return strings.Replace(s, "      id: 1022:1111\n", "", 1) },
+	"malformed identity":       func(s string) string { return strings.Replace(s, "id: 10de:abcd", "id: RTX4080", 1) },
+}
+
 func TestParseRejectsWhatWouldFailLater(t *testing.T) {
-	for name, edit := range map[string]func(string) string{
-		"no image and no flake": func(s string) string { return strings.Replace(s, "flake: ./guest", "", 1) },
-		// Compose's build: is a Dockerfile's directory, so it is refused by
-		// name rather than read as a flake.
-		"compose's build": func(s string) string { return strings.Replace(s, "flake: ./guest", "build: ./guest", 1) },
-		"wanted device not declared": func(s string) string {
-			return strings.Replace(s, "devices: [gpu, desk-usb, mouse]", "devices: [gpu, webcam]", 1)
-		},
-		"bad pci address": func(s string) string { return strings.Replace(s, "0000:3c:00.3", "3c:00.3", 1) },
-		"usb with a pci": func(s string) string {
-			return strings.Replace(s, "id: 1234:5678", "id: 1234:5678\n      pci: 0000:01:00.0", 1)
-		},
-		"unknown kind":  func(s string) string { return strings.Replace(s, "kind: pci", "kind: xhci", 1) },
-		"duplicate pci": func(s string) string { return strings.Replace(s, "0000:3c:00.3", "0000:2b:00.0", 1) },
-		"bad port":      func(s string) string { return strings.Replace(s, `"8080:80"`, `"8080:80/sctp"`, 1) },
-		"unequal ranges": func(s string) string {
-			return strings.Replace(s, `"47998-48000:47998-48000/udp"`, `"47998-48000:47998/udp"`, 1)
-		},
-		"port out of range": func(s string) string { return strings.Replace(s, `"8080:80"`, `"80800:80"`, 1) },
-		"wildcard host ip":  func(s string) string { return strings.Replace(s, `"8080:80"`, `"0.0.0.0:8080:80"`, 1) },
-		"bad name":          func(s string) string { return strings.Replace(s, "name: myproj", "name: my proj", 1) },
-		"alive is a path":   func(s string) string { return strings.Replace(s, `alive: "usb*"`, `alive: "/sys/usb*"`, 1) },
-		// An address alone once handed a VM the host's SATA controller after a
-		// BIOS change renumbered the bus; a pci device must say what it is.
-		"pci without its identity": func(s string) string { return strings.Replace(s, "      id: 1022:1111\n", "", 1) },
-		"malformed identity":       func(s string) string { return strings.Replace(s, "id: 10de:abcd", "id: RTX4080", 1) },
-	} {
+	for name, edit := range badEdits {
 		t.Run(name, func(t *testing.T) {
 			if _, err := Parse([]byte(edit(example))); err == nil {
 				t.Fatalf("%s was accepted", name)

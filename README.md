@@ -110,18 +110,35 @@ rig doctor daw                   # what it has, and where it has drifted
 rig delete -f rig.yaml           # remove it; its volumes stay unless --volumes
 ```
 
+<!-- fields: generated from internal/manifest by `make generate` -->
 | Field | |
 |---|---|
-| `host.devices.<name>` | `kind: gpu` (an NVIDIA card), `pci` (any PCI function, such as a USB controller; `id:` required) or `usb` (one device by `id: vendor:product`). `return:` is how the host takes a PCI device back |
-| `guest.flake` / `image` | A flake reference to build the image from, as `<name>-guest` when missing: `./guest` builds `nixosConfigurations.guest`, `./guest#daw` builds `.daw`, and remote refs (`github:…`) work. Or an image alias already built |
-| `guest.cpus` | A count, or a set of host CPUs to pin to (`"4-7,12-15"`) |
-| `guest.memory`, `disk` | Sizes |
-| `guest.devices` | Which `host.devices` this VM gets |
-| `guest.env_file` | `KEY=VALUE` credentials, injected to tmpfs in the guest on start |
-| `guest.volumes` | Named Incus volumes: `"name:/path"`, or `{ source, target, size, owner }` |
-| `guest.ports` | `"host:guest/proto"`, optionally prefixed with the host address to publish on (a tailnet address keeps it off the LAN) |
-| `guest.network` | `none` for no network device |
-| `guest.input` | `host` to lend the host's keyboard and mouse from start to stop |
+| `host.devices.<name>.kind` | gpu: an NVIDIA card (the guest needs rig.nixosModules.nvidia). pci: any PCI function, such as a USB controller. usb: one USB device, by id. |
+| `host.devices.<name>.pci` | The PCI address, from lspci -D, for gpu and pci. It must be alone in its IOMMU group. |
+| `host.devices.<name>.id` | For usb, vendor:product from lsusb. For gpu and pci, vendor:device from lspci -nn: what must be at the address, since a BIOS change can renumber the bus. Required for pci. |
+| `host.devices.<name>.return` | How the host takes a gpu or pci device back after rig stop. Without it, the device stays on vfio-pci, which suits hardware the host never uses. |
+| `host.devices.<name>.return.modules` | Kernel modules to unload before the unbind and reload after the reset; the NVIDIA driver needs this. |
+| `host.devices.<name>.return.reset` | Reset the device before the host driver binds it. A card handed back from a guest may not initialise without it. |
+| `host.devices.<name>.return.alive` | A glob under the device's sysfs directory that exists once the host driver has really brought it up: drm/card* for a card, usb* for a USB controller. |
+| `host.devices.<name>.return.unit` | A host systemd unit that uses the device, such as display-manager: stopped before a VM claims it, started after it comes back. |
+| `guest.name` | The VM's name in Incus. |
+| `guest.image` | An image alias already built (rig image build). Give this or flake. |
+| `guest.flake` | A flake to build the image from, as &lt;name&gt;-guest when missing: ./guest builds nixosConfigurations.guest, ./guest#daw builds .daw, and remote references (github:me/vms?dir=guest) work too. |
+| `guest.cpus` | A number of vCPUs, or a set of host CPUs to pin them to, one each ("4-7,12-15"): for a guest with deadlines, such as audio. |
+| `guest.memory` | Memory, as Incus sizes it: 16GiB. |
+| `guest.disk` | Root disk size: 40GiB. |
+| `guest.env_file` | A file of KEY=VALUE credentials, injected to tmpfs in the guest at each start and never written to its disk. Keep it outside any repository. |
+| `guest.devices` | Which of host.devices this VM gets. |
+| `guest.ports` | Guest ports published on a host address, in Compose's syntax. Each one opens that port alone through the isolation. |
+| `guest.volumes` | Named Incus volumes mounted in the guest. They outlive the VM, so data survives it being recreated; host directories are refused. |
+| `guest.network` | none: no network device at all. Left out, the VM gets the isolated NIC, which reaches the internet but not this host or the LAN. |
+| `guest.input` | host: lend this host's keyboard and mouse to the guest as events from start to stop, toggled with both Ctrl keys. The guest needs rig.nixosModules.desktop. |
+<!-- /fields -->
+
+`rig init` starts the file with a `# yaml-language-server: $schema=…` line, so
+editors using yaml-language-server (VS Code's YAML extension, among others)
+complete and check these fields as you type. `rig schema` prints the schema;
+`schema/rig.schema.json` is the same file.
 
 The guest flake (`rig init` writes one) is rig's base plus the project's own
 modules. rig provides `rig.nixosModules.nvidia` for a card, `.docker`, and
@@ -150,6 +167,7 @@ Keep credential files outside any repository (`~/.config/rig/`).
 |---|---|
 | `image build`, `image list` | Build a guest image from `base/` or a project's guest flake |
 | `init` | Write a `rig.yaml` and a guest flake; `--with nvidia,docker,desktop` adds modules |
+| `schema` | Print rig.yaml's JSON Schema |
 | `apply -f`, `delete -f` | Create a manifest's VM or bring it back in line with the file; remove it |
 | `new` | Create a VM without a manifest (`--gpu` for this host's card) |
 | `start`, `stop`, `restart`, `rm` | Lifecycle. `start` claims devices; `stop` returns them; `rm --volumes` also deletes volumes |

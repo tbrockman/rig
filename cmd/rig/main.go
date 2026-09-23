@@ -97,7 +97,7 @@ func main() {
 		&cobra.Group{ID: "card", Title: "Grants and isolation:"},
 	)
 	root.AddCommand(
-		a.initCmd(),
+		a.initCmd(), a.schemaCmd(),
 		a.newCmd(), a.startCmd(), a.stopCmd(), a.restartCmd(), a.rmCmd(),
 		a.statusCmd(), a.doctorCmd(), a.verifyCmd(), a.logsCmd(),
 		a.execCmd(), a.shellCmd(), a.pushCmd(), a.pullCmd(), a.agentCmd(),

@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/tbrockman/rig/main/schema/rig.schema.json
 # What this VM is given. Nothing is given unless it is listed here.
 #
 #   rig apply -f rig.yaml --start    # create the VM, or bring it back to this file
