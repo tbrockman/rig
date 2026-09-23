@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./rig)",
+      "Bash(./rig:*)",
+      "Bash(make:*)",
+      "Bash(go build:*)",
+      "Bash(go vet:*)",
+      "Bash(go test:*)",
+      "Bash(incus list:*)",
+      "Bash(incus info:*)",
+      "Bash(incus config show:*)",
+      "Bash(incus config device show:*)",
+      "Bash(incus image list:*)",
+      "Bash(incus storage info:*)"
+    ],
+    "deny": []
+  }
+}

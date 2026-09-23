@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Launch the unattended agent inside the guest.
+#
+#   nix develop "path:." -c ./run-agent
+#
+# Credentials come from /run/rig/env, which `rig start` injects from a host file
+# at boot. /run is tmpfs, so they exist only while the VM is up and are never
+# written to the instance's disk or its Incus config.
+#
+# Scoping those credentials is the operator's job. Nothing here can tell whether
+# a key is narrow enough, and this script deliberately does not try.
+
+set -euo pipefail
+
+ENV_FILE=/run/rig/env
+
+if [ ! -r "$ENV_FILE" ]; then
+  cat >&2 <<EOF
+No credentials at $ENV_FILE.
+
+On the host:
+  mkdir -p -m 700 ~/.config/rig
+  printf 'ANTHROPIC_API_KEY=sk-ant-...\\n' > ~/.config/rig/<project>.env
+  chmod 600 ~/.config/rig/<project>.env
+  ./rig new <project> --env ~/.config/rig/<project>.env  # or set it on an
+  ./rig start <project>                                  # existing VM, see CLAUDE.md
+EOF
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
+: "${ANTHROPIC_API_KEY:?$ENV_FILE does not define ANTHROPIC_API_KEY}"
+
+# claude refuses --dangerously-skip-permissions when it is running as root, and
+# in this guest everything is: `rig exec` and `rig shell` both land as root, and
+# the base image declares no login user besides the nixbld* build accounts. So
+# without this the launch fails on its very last line, after the whole devShell
+# has been built — which reads like a broken image and is not one.
+#
+# IS_SANDBOX is how you say "root here is not the hazard that check guards
+# against". That claim is exactly the claim below, and it is checkable.
+export IS_SANDBOX=1
+
+# --dangerously-skip-permissions is the point of this VM, not a shortcut around
+# it. The agent is unattended, so there is nobody to answer a prompt; the
+# containment is the VM boundary and the network ACL, which is why it is safe
+# here and would not be on the host. Verify before trusting that:
+#   ./rig doctor <vm>     # the GPU is really attached, isolation is configured
+#   ./rig verify <vm>     # the guest really cannot reach this host or the LAN
+exec claude --dangerously-skip-permissions "$@"
