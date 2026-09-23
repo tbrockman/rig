@@ -40,7 +40,7 @@ func image() string {
 	if v := os.Getenv("RIG_IMAGE"); v != "" {
 		return v
 	}
-	return "nixos-gpu-base"
+	return "rig-nvidia"
 }
 
 // TestInvariants runs as ordered subtests sharing state, the way the states
@@ -48,7 +48,7 @@ func image() string {
 func TestInvariants(t *testing.T) {
 	preflight(t)
 	t.Cleanup(func() {
-		_ = c.SetProfiles(instA, []string{"default"})
+		_ = c.SetProfiles(instA, []string{policy.DefaultProfile})
 		_ = c.DeleteProfile(badProfile)
 		teardown(t, instA, instB)
 	})
@@ -166,10 +166,10 @@ func TestInvariants(t *testing.T) {
 			t.Error("poisoned profile not detected while unused")
 		}
 
-		if err := c.SetProfiles(instA, []string{"default", badProfile}); err != nil {
+		if err := c.SetProfiles(instA, []string{policy.DefaultProfile, badProfile}); err != nil {
 			t.Fatalf("attaching the poisoned profile: %v", err)
 		}
-		defer c.SetProfiles(instA, []string{"default"})
+		defer c.SetProfiles(instA, []string{policy.DefaultProfile})
 
 		if err := checkProfiles(); err == nil {
 			t.Error("profile-borne GPU not detected: masked by the instance's own gpu0")
@@ -312,10 +312,14 @@ func create(t *testing.T, name string) {
 	t.Helper()
 	teardown(t, name)
 	err := c.CreateVM(incus.CreateOpts{
-		Name: name, Image: image(), CPUs: 4, Memory: "8GiB",
-		// Marked the way `rig new` marks them, so debris from a failed run can
-		// be cleared with `rig rm` rather than needing raw incus.
-		Config: map[string]string{"user.rig.managed": "true"},
+		Name: name, Image: image(), Profile: policy.DefaultProfile, CPUs: 4, Memory: "8GiB",
+		// Marked the way `rig new --gpu` marks them, so debris from a failed
+		// run can be cleared with `rig rm` rather than needing raw incus, and
+		// so each one wants the card.
+		Config: map[string]string{
+			"user.rig.managed": "true",
+			devices.DevicesKey: devices.Encode([]devices.Decl{{Name: "gpu", Kind: "gpu"}}),
+		},
 	})
 	if err != nil {
 		t.Fatalf("creating %s: %v", name, err)

@@ -343,7 +343,7 @@ func Reconcile(c *incus.Client, baseACL string, inst *incus.Instance, ports []ma
 	//
 	// The instance's NIC normally comes from the profile. Overriding it means
 	// copying the whole device onto the instance and changing two keys; the
-	// isolation keys come along, so `rig apply` still sees an isolated NIC.
+	// isolation keys come along, so `rig setup` still sees an isolated NIC.
 	local := incus.Device{}
 	for k, v := range nic {
 		local[k] = v
@@ -365,7 +365,7 @@ func Reconcile(c *incus.Client, baseACL string, inst *incus.Instance, ports []ma
 	}
 	if !policyHasACL(local["security.acls"], baseACL) {
 		return changes, fmt.Errorf("%s/%s does not carry the isolation ACL %q; publishing ports onto an "+
-			"unisolated NIC is not something rig will do. Run rig apply first.", inst.Name, nicName, baseACL)
+			"unisolated NIC is not something rig will do. Run rig setup first.", inst.Name, nicName, baseACL)
 	}
 
 	// 3. The proxy devices.

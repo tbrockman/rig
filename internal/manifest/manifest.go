@@ -2,8 +2,8 @@
 //
 // The file is declared intent, in the shape of a Compose file because that is
 // the shape people and models already know. Incus stays the record of what is
-// true. `rig new -f` turns the file into an instance, recording on it what it
-// was given; `rig apply -f` reconciles an existing instance to the file; and
+// true. `rig apply -f` turns the file into an instance, recording on it what
+// it was given, or reconciles an existing instance to the file; and
 // `rig doctor` reports where the two have drifted.
 //
 // The host block names devices on this machine — their addresses, and how the
@@ -85,8 +85,15 @@ type Return struct {
 }
 
 type Guest struct {
-	Name    string   `yaml:"name"`
-	Image   string   `yaml:"image,omitempty"`
+	Name  string `yaml:"name"`
+	Image string `yaml:"image,omitempty"`
+	// Flake is a flake reference to build the guest image from: a directory
+	// ("./guest"), anything nix accepts ("github:me/vms?dir=guest"), with an
+	// optional #name for nixosConfigurations.<name>, "guest" when absent.
+	Flake string `yaml:"flake,omitempty"`
+	// Build is refused with a pointer to Flake. Compose's build: is a
+	// Dockerfile's directory; rig builds NixOS flakes, and a field that looks
+	// like Compose's but means something else is worse than a different one.
 	Build   string   `yaml:"build,omitempty"`
 	CPUs    CPUs     `yaml:"cpus,omitempty"`
 	Memory  string   `yaml:"memory,omitempty"`
@@ -395,8 +402,11 @@ func (m *Manifest) validate() error {
 	if !nameRE.MatchString(m.Guest.Name) {
 		return fmt.Errorf("guest.name %q is not a valid instance name", m.Guest.Name)
 	}
-	if m.Guest.Image == "" && m.Guest.Build == "" {
-		return fmt.Errorf("guest needs image: <alias> or build: <flake directory>")
+	if m.Guest.Build != "" {
+		return fmt.Errorf("guest.build: rig builds NixOS flakes, not Dockerfiles; say flake: %s", m.Guest.Build)
+	}
+	if m.Guest.Image == "" && m.Guest.Flake == "" {
+		return fmt.Errorf("guest needs image: <alias> or flake: <flake reference, e.g. ./guest>")
 	}
 	switch m.Guest.Network {
 	case "", NetworkNone:
@@ -523,8 +533,31 @@ func ExpandHome(p string) string {
 	return filepath.Join(home, rest)
 }
 
+// DefaultFlakeAttr is the nixosConfigurations entry a flake: without a
+// #name builds.
+const DefaultFlakeAttr = "guest"
+
+// FlakeRef splits guest.flake into the flake to build and the
+// nixosConfigurations entry in it, the way nixos-rebuild reads
+// --flake dir#name. A local path is resolved against the manifest's
+// directory; a reference with a scheme (github:, path:, git+https:) is
+// passed to nix as it is.
+func (m *Manifest) FlakeRef() (ref, attr string) {
+	ref, attr, _ = strings.Cut(m.Guest.Flake, "#")
+	if attr == "" {
+		attr = DefaultFlakeAttr
+	}
+	if ref == "" {
+		ref = "."
+	}
+	if !strings.Contains(ref, ":") {
+		ref = m.Resolve(ref)
+	}
+	return ref, attr
+}
+
 // ImageAlias is the Incus alias the guest is made from: the one named, else
-// one derived from the project name for a `build:`.
+// one derived from the project name for a `flake:`.
 func (m *Manifest) ImageAlias() string {
 	if m.Guest.Image != "" {
 		return m.Guest.Image

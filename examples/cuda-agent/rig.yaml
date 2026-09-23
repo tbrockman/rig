@@ -1,0 +1,20 @@
+# A GPU VM for an unattended agent. Fill in your card: lspci -Dnn | grep -i nvidia
+host:
+  devices:
+    gpu:
+      kind: gpu
+      pci: 0000:2b:00.0
+      id: 10de:abcd
+      return:
+        modules: [nvidia_drm, nvidia_modeset, nvidia_uvm, nvidia]
+        reset: true
+        alive: drm/card*
+
+guest:
+  name: cuda-agent
+  flake: ./guest
+  cpus: 8
+  memory: 16GiB
+  disk: 40GiB
+  env_file: ~/.config/rig/cuda-agent.env
+  devices: [gpu]

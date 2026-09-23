@@ -31,7 +31,7 @@ func (a *app) imageCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "image",
 		GroupID: "vm",
-		Short:   "Build and inspect the base image VMs are made from",
+		Short:   "Build and list guest images",
 	}
 	cmd.AddCommand(a.imageBuildCmd(), a.imageListCmd())
 	return cmd
@@ -43,7 +43,7 @@ func (a *app) imageBuildCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "build",
-		Short: "Build the base image from its flake and import it",
+		Short: "Build a guest image from a flake and import it",
 		Long: "Builds the image declaratively and imports it. The image is a build\n" +
 			"artifact, not a snapshot of a VM someone logged into, so rebuilding\n" +
 			"from the same flake produces the same image — and rebuilding when\n" +
@@ -73,7 +73,7 @@ func (a *app) imageBuildCmd() *cobra.Command {
 	}
 	f := cmd.Flags()
 	f.StringVar(&flake, "flake", envOr("RIG_FLAKE", "./base"), "directory or flake ref holding the image definition (a relative path resolves against your current directory)")
-	f.StringVar(&attr, "attr", envOr("RIG_FLAKE_ATTR", "gpubase"), "nixosConfigurations attribute to build")
+	f.StringVar(&attr, "attr", envOr("RIG_FLAKE_ATTR", "guest"), "nixosConfigurations attribute to build")
 	f.StringVar(&alias, "alias", envOr("RIG_IMAGE", defaultImage), "alias to point at the result")
 	f.BoolVar(&keepPrevious, "keep-previous", false, "keep the image the alias pointed at before (each is gigabytes)")
 	return cmd
@@ -81,7 +81,7 @@ func (a *app) imageBuildCmd() *cobra.Command {
 
 // buildImage builds nixosConfigurations.<attr> of a flake, imports the result
 // and points alias at it. Shared by `rig image build` and a manifest's
-// `build:`, so the two cannot drift apart in what they stamp on an image.
+// `flake:`, so the two cannot drift apart in what they stamp on an image.
 func (a *app) buildImage(flake string, named bool, attr, alias string, keepPrevious bool) error {
 	ref, err := flakeRef(flake, named)
 	if err != nil {

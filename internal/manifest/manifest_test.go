@@ -28,7 +28,7 @@ host:
       id: 1234:5678
 guest:
   name: myproj
-  build: ./guest
+  flake: ./guest
   cpus: 8
   memory: 16GiB
   disk: 40GiB
@@ -50,7 +50,7 @@ func TestParseReadsTheExample(t *testing.T) {
 		t.Errorf("guest fields not read: %+v", m.Guest)
 	}
 	if got := m.ImageAlias(); got != "myproj-guest" {
-		t.Errorf("alias for a build: = %q, want myproj-guest", got)
+		t.Errorf("alias for a flake: = %q, want myproj-guest", got)
 	}
 	wanted := m.Wanted()
 	if len(wanted) != 3 || wanted[0].Name != "gpu" || wanted[1].PCI != "0000:3c:00.3" || wanted[2].ID != "1234:5678" {
@@ -77,7 +77,10 @@ func TestParseRejectsUnknownKeys(t *testing.T) {
 
 func TestParseRejectsWhatWouldFailLater(t *testing.T) {
 	for name, edit := range map[string]func(string) string{
-		"no image and no build": func(s string) string { return strings.Replace(s, "build: ./guest", "", 1) },
+		"no image and no flake": func(s string) string { return strings.Replace(s, "flake: ./guest", "", 1) },
+		// Compose's build: is a Dockerfile's directory, so it is refused by
+		// name rather than read as a flake.
+		"compose's build": func(s string) string { return strings.Replace(s, "flake: ./guest", "build: ./guest", 1) },
 		"wanted device not declared": func(s string) string {
 			return strings.Replace(s, "devices: [gpu, desk-usb, mouse]", "devices: [gpu, webcam]", 1)
 		},
@@ -152,8 +155,8 @@ func TestLoadResolvesPathsAgainstTheFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := m.Resolve(m.Guest.Build); got != filepath.Join(dir, "guest") {
-		t.Errorf("build resolved to %q", got)
+	if ref, attr := m.FlakeRef(); ref != filepath.Join(dir, "guest") || attr != "guest" {
+		t.Errorf("flake resolved to %q #%s", ref, attr)
 	}
 	if got := m.Resolve("/abs/path"); got != "/abs/path" {
 		t.Errorf("absolute path was rewritten to %q", got)
@@ -257,5 +260,22 @@ func TestInputIsHostOrNothing(t *testing.T) {
 	}
 	if _, err := Parse([]byte(base + "  input: passthrough\n")); err == nil {
 		t.Fatal("an unknown input value must be refused, not ignored")
+	}
+}
+
+// flake: follows nixos-rebuild's dir#name, and a reference with a scheme is
+// nix's to resolve, not the manifest's.
+func TestFlakeRefSplitsTheName(t *testing.T) {
+	for in, want := range map[string][2]string{
+		"./guest":                     {"/work/proj/guest", "guest"},
+		"./guest#daw":                 {"/work/proj/guest", "daw"},
+		"#daw":                        {"/work/proj", "daw"},
+		"github:me/vms?dir=guest#daw": {"github:me/vms?dir=guest", "daw"},
+		"path:/abs/guest":             {"path:/abs/guest", "guest"},
+	} {
+		m := &Manifest{Dir: "/work/proj", Guest: Guest{Flake: in}}
+		if ref, attr := m.FlakeRef(); ref != want[0] || attr != want[1] {
+			t.Errorf("%s: got %s #%s, want %s #%s", in, ref, attr, want[0], want[1])
+		}
 	}
 }

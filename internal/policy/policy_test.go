@@ -115,3 +115,22 @@ func TestRemoveACL(t *testing.T) {
 		}
 	}
 }
+
+// A new rig profile takes the host's bridge and pool from default, and
+// nothing else: a passthrough device on default must not follow rig's VMs.
+func TestSeedTakesOnlyTheNICAndRootDisk(t *testing.T) {
+	seed := map[string]incus.Device{
+		"eth0": {"type": "nic", "network": "incusbr0"},
+		"root": {"type": "disk", "path": "/", "pool": "fast"},
+		"data": {"type": "disk", "path": "/srv", "source": "/host/dir"},
+		"gpu0": {"type": "gpu", "pci": "0000:2b:00.0"},
+	}
+	got := Seed(seed)
+	if len(got) != 2 || got["eth0"]["network"] != "incusbr0" || got["root"]["pool"] != "fast" {
+		t.Fatalf("seed = %v", got)
+	}
+	got["eth0"]["security.acls"] = "x"
+	if seed["eth0"]["security.acls"] != "" {
+		t.Fatal("seeding must copy, not share, the devices")
+	}
+}

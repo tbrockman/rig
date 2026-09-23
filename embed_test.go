@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 // The embed patterns are explicit, so a file added to the template or the base
@@ -39,27 +40,42 @@ func TestEmbeddedAssetsAreExactlyWhatGitTracks(t *testing.T) {
 	}
 }
 
-// run-agent is a script; written without its mode it is a file nobody can run,
-// and the failure shows up as "permission denied" from inside the guest.
+// A script written without its mode is a file nobody can run, and the
+// failure shows up as "permission denied" from inside the guest.
 func TestWriteTreeMakesScriptsExecutableAndHonoursSkip(t *testing.T) {
+	src := fstest.MapFS{
+		"run":           {Data: []byte("#!/bin/sh\necho hi\n")},
+		"guest/a.nix":   {Data: []byte("{ }\n")},
+		"guest/skipped": {Data: []byte("x")},
+	}
 	dir := t.TempDir()
-	err := WriteTree(ProjectTemplate(), dir, func(p string) bool { return p == "guest/flake.lock" })
-	if err != nil {
+	if err := WriteTree(src, dir, func(p string) bool { return p == "guest/skipped" }); err != nil {
 		t.Fatal(err)
 	}
-	st, err := os.Stat(filepath.Join(dir, "run-agent"))
+	st, err := os.Stat(filepath.Join(dir, "run"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st.Mode()&0o111 == 0 {
-		t.Error("run-agent was written without an executable bit")
+		t.Error("a script was written without an executable bit")
 	}
-	for _, p := range []string{"flake.nix", "guest/flake.nix", "guest/guest.nix", ".gitignore"} {
+	if st, err := os.Stat(filepath.Join(dir, "guest", "a.nix")); err != nil || st.Mode()&0o111 != 0 {
+		t.Errorf("guest/a.nix: %v, mode %v", err, st)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "guest", "skipped")); err == nil {
+		t.Error("a skipped file was written")
+	}
+}
+
+// rig init writes the whole template: the manifest and the guest flake.
+func TestProjectTemplateIsTheManifestAndGuestFlake(t *testing.T) {
+	dir := t.TempDir()
+	if err := WriteTree(ProjectTemplate(), dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"rig.yaml", "guest/flake.nix", "guest/guest.nix", ".gitignore"} {
 		if _, err := os.Stat(filepath.Join(dir, p)); err != nil {
 			t.Errorf("%s missing from the written template", p)
 		}
-	}
-	if _, err := os.Stat(filepath.Join(dir, "guest", "flake.lock")); err == nil {
-		t.Error("guest/flake.lock was written despite skip")
 	}
 }

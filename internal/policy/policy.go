@@ -26,6 +26,37 @@ var RejectRanges = []string{
 
 const aclDescription = "Guest isolation: public internet only (IPv4 denylist)"
 
+// DefaultProfile is the profile rig's VMs inherit their NIC and root disk
+// from, and the one `rig setup` puts the isolation on. rig's own rather than
+// Incus's `default`, so installing rig changes nothing about instances it did
+// not create.
+const DefaultProfile = "rig"
+
+// seedProfile is where a missing rig profile takes its NIC and root disk from:
+// the bridge and storage pool the host already chose.
+const seedProfile = "default"
+
+// Seed is the device set a new rig profile starts from: the NICs and root
+// disk of seed, and nothing else. A passthrough device someone put on
+// `default` must not follow every rig VM.
+func Seed(seed map[string]incus.Device) map[string]incus.Device {
+	out := map[string]incus.Device{}
+	for name, dev := range seed {
+		if dev.Type() == "nic" || (dev.Type() == "disk" && dev["path"] == "/") {
+			out[name] = cloneDevice(dev)
+		}
+	}
+	return out
+}
+
+func cloneDevice(d incus.Device) incus.Device {
+	out := incus.Device{}
+	for k, v := range d {
+		out[k] = v
+	}
+	return out
+}
+
 // NICKeys are the three settings that make the policy. All three matter:
 // attaching an ACL makes Incus default to *reject* in both directions, so a
 // denylist ACL without egress.action=allow is a blackout — and a quiet one,
@@ -121,34 +152,39 @@ func Apply(c *incus.Client, aclName, profileName string, dryRun bool) ([]string,
 		}
 	}
 
+	profiles, err := c.Profiles()
+	if err != nil {
+		return changes, err
+	}
+	exists := false
+	for _, p := range profiles {
+		exists = exists || p.Name == profileName
+	}
+	if !exists {
+		seed, _, err := c.Profile(seedProfile)
+		if err != nil {
+			return changes, fmt.Errorf("no profile %q to take the bridge and storage pool from: %w", seedProfile, err)
+		}
+		devs := Seed(seed.Devices)
+		changes = append(changes, fmt.Sprintf("create profile %q with %s's NIC and root disk", profileName, seedProfile))
+		if dryRun {
+			// Report the NIC keys the new profile would get, from the seed.
+			changes = append(changes, nicChanges(profileName, cloneDevices(devs), aclName)...)
+			return changes, nil
+		}
+		if err := c.CreateProfile(profileName, devs); err != nil {
+			return changes, err
+		}
+	}
+
 	prof, etag, err := c.Profile(profileName)
 	if err != nil {
 		return changes, err
 	}
 	devices := cloneDevices(prof.Devices)
-	dirty := false
-	nics := 0
-	for _, nic := range sortedKeys(devices) {
-		if devices[nic].Type() != "nic" {
-			continue
-		}
-		nics++
-		for _, key := range sortedKeys(NICKeys(aclName)) {
-			val := NICKeys(aclName)[key]
-			if devices[nic][key] != val {
-				old := devices[nic][key]
-				if old == "" {
-					old = "<unset>"
-				}
-				changes = append(changes, fmt.Sprintf("profile %s/%s: %s %q -> %q", profileName, nic, key, old, val))
-				devices[nic][key] = val
-				dirty = true
-			}
-		}
-	}
-	if nics == 0 {
-		changes = append(changes, fmt.Sprintf("WARNING: profile %q has no NIC device, so nothing inherits the isolation", profileName))
-	}
+	nicLines := nicChanges(profileName, devices, aclName)
+	changes = append(changes, nicLines...)
+	dirty := len(nicLines) > 0 && !strings.HasPrefix(nicLines[0], "WARNING")
 	if dirty && !dryRun {
 		if err := c.SetProfileDevices(profileName, prof, devices, etag); err != nil {
 			return changes, err
@@ -400,4 +436,32 @@ func slicesContains(hay []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// nicChanges sets the isolation keys on every NIC in devices, in place, and
+// describes each change; with no NIC at all it returns only a warning.
+func nicChanges(profileName string, devices map[string]incus.Device, aclName string) []string {
+	var changes []string
+	nics := 0
+	for _, nic := range sortedKeys(devices) {
+		if devices[nic].Type() != "nic" {
+			continue
+		}
+		nics++
+		for _, key := range sortedKeys(NICKeys(aclName)) {
+			val := NICKeys(aclName)[key]
+			if devices[nic][key] != val {
+				old := devices[nic][key]
+				if old == "" {
+					old = "<unset>"
+				}
+				changes = append(changes, fmt.Sprintf("profile %s/%s: %s %q -> %q", profileName, nic, key, old, val))
+				devices[nic][key] = val
+			}
+		}
+	}
+	if nics == 0 {
+		return []string{fmt.Sprintf("WARNING: profile %q has no NIC device, so nothing inherits the isolation", profileName)}
+	}
+	return changes
 }

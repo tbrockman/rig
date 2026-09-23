@@ -1,45 +1,37 @@
-# What this project wants its VM to be given. Read by:
+# What this VM is given. Nothing is given unless it is listed here.
 #
-#   rig new -f rig.yaml --start      # create the VM from this file
-#   rig apply -f rig.yaml            # bring an existing VM back to it
+#   rig apply -f rig.yaml --start    # create the VM, or bring it back to this file
 #   rig doctor <vm>                  # report where the VM has drifted from it
+#   rig delete -f rig.yaml           # remove it (its volumes stay)
 #
-# The shape is Compose's where Compose has one: `image`/`build`, `env_file`,
-# `devices`, `ports`. Incus stays the record of what is true; this file is
-# what you meant, and rig reconciles one to the other.
+# The shape is Compose's where Compose has one. Unknown keys are errors.
 
-# Devices on THIS host a VM may be given. Written once per machine; `rig init`
-# filled in the card. `lspci -D` lists PCI addresses, `lsusb` USB ids.
+# Devices on THIS host a VM may be given. `lspci -Dnn` lists PCI addresses and
+# ids, `lsusb` USB ids. A PCI device must sit alone in its IOMMU group.
 host:
   devices:
-    gpu:
-      kind: gpu
-      pci: GPU_PCI
-      # What must be at that address. PCI addresses are renumbered when a
-      # device ahead of them appears or disappears (a BIOS setting is enough);
-      # rig refuses to start a VM when the device there is not this one.
-      id: GPU_ID
-      # How the host takes the card back after `rig stop`. Leave `return`
-      # out for a device the host never uses itself; it then stays parked on
-      # vfio-pci, ready for the next VM. `unit: display-manager` here would
-      # also stop the host's desktop before a VM starts and restart it after.
-      return:
-        modules: [nvidia_drm, nvidia_modeset, nvidia_uvm, nvidia]
-        reset: true
-        alive: drm/card*
-
-    # A whole USB controller, for a monitor's hub or a dock: everything
-    # plugged into it appears in the guest, hotplug included. It must sit
-    # alone in its IOMMU group (see docs/RUNBOOK.md); find which controller a
-    # port belongs to by plugging something in and reading `lsusb -t`.
+    # A graphics card (NVIDIA; the guest needs rig.nixosModules.nvidia).
+    # `rig init` filled in this host's, if it found one. `id` is what must be
+    # at that address; `return` is how the host takes it back after rig stop.
     #
-    # desk-usb:
+    # gpu:
+    #   kind: gpu
+    #   pci: GPU_PCI
+    #   id: GPU_ID
+    #   return:
+    #     modules: [nvidia_drm, nvidia_modeset, nvidia_uvm, nvidia]
+    #     reset: true
+    #     alive: drm/card*
+
+    # A whole USB controller: everything plugged into it appears in the guest.
+    #
+    # usb-ctl:
     #   kind: pci
     #   pci: 0000:3c:00.3
-    #   id: 1022:1111          # required for kind pci: lspci -nn -s 3c:00.3
+    #   id: 1022:1111
     #   return: { reset: true, alive: "usb*" }
 
-    # One USB device by identity, hotpluggable, host keeps the controller.
+    # One USB device by vendor:product; the host keeps the controller.
     #
     # mouse:
     #   kind: usb
@@ -47,27 +39,15 @@ host:
 
 guest:
   name: PROJECT
-  # `build:` names a guest flake directory; the image is built under the
-  # alias <name>-guest when missing. `image:` names an alias already built.
-  build: ./guest
-  cpus: 8
-  memory: 16GiB
+  flake: ./guest                  # nixosConfigurations.guest in guest/flake.nix; or image: <alias>
+  cpus: 4                         # or pinned host CPUs: "4-7,12-15"
+  memory: 8GiB
   disk: 40GiB
-  env_file: ~/.config/rig/PROJECT.env
-  devices: [gpu]
-  # Lend this host's keyboard and mouse to the guest as events, from rig start
-  # to rig stop, toggled with both Ctrl keys (rig host input; the guest needs
-  # rig's desktop module):
-  #
-  # input: host
-  # Ports published from this host to the guest, Compose short syntax
-  # host:guest/proto. Each one is a hole in the isolation's ingress reject,
-  # opened for that port alone. Sunshine, for a Moonlight client:
-  #
-  # ports:
-  #   - "47984:47984/tcp"
-  #   - "47989:47989/tcp"
-  #   - "48010:48010/tcp"
-  #   - "47998-48000:47998-48000/udp"
-  #   - "48002:48002/udp"
-  #   - "48010:48010/udp"
+  # devices: [gpu]
+  # env_file: ~/.config/rig/PROJECT.env   # KEY=VALUE, injected to tmpfs on start
+  # volumes:                      # named volumes; they outlive the VM
+  #   - "PROJECT-data:/srv/data"
+  # ports:                        # host:guest/proto, published on the LAN
+  #   - "8080:80/tcp"
+  # network: none                 # no network device at all
+  # input: host                   # lend the host's keyboard and mouse (desktop module)

@@ -136,7 +136,7 @@ func TestCreateVMSendsTheProfileSecurebootAndARootDiskOverride(t *testing.T) {
 	})
 
 	err := f.client().CreateVM(CreateOpts{
-		Name: "myvm", Image: "nixos-gpu-base", Profile: "rigprof", CPUs: 4, Memory: "8GiB",
+		Name: "myvm", Image: "rig-base", Profile: "rigprof", CPUs: 4, Memory: "8GiB",
 		DiskSize: "40GiB", Config: map[string]string{"user.rig.managed": "true"},
 	})
 	if err != nil {
@@ -167,7 +167,7 @@ func TestCreateVMSendsTheProfileSecurebootAndARootDiskOverride(t *testing.T) {
 	if body.Config["limits.cpu"] != "4" || body.Config["limits.memory"] != "8GiB" || body.Config["user.rig.managed"] != "true" {
 		t.Errorf("config = %v", body.Config)
 	}
-	if body.Source["alias"] != "nixos-gpu-base" {
+	if body.Source["alias"] != "rig-base" {
 		t.Errorf("source = %v", body.Source)
 	}
 	// The override must be the profile's whole root device with one key

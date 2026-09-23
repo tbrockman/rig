@@ -30,24 +30,21 @@ import (
 )
 
 const (
-	DefaultDevice = "gpu0"
-	DefaultACL    = "vm-isolate"
-	DefaultLock   = "/var/lock/rig.lock"
+	DefaultACL  = "vm-isolate"
+	DefaultLock = "/var/lock/rig.lock"
 )
 
 type Config struct {
-	Device string // device name for the card on an instance without a manifest
-	PCI    string // e.g. 0000:2b:00.0; empty means discover
-	ACL    string // required isolation ACL
-	Lock   string
+	PCI  string // the card `kind: gpu` without an address means; empty means discover
+	ACL  string // required isolation ACL
+	Lock string
 }
 
 func ConfigFromEnv() Config {
 	return Config{
-		Device: envOr("RIG_DEVICE", DefaultDevice),
-		PCI:    os.Getenv("RIG_PCI"),
-		ACL:    envOr("RIG_ACL", DefaultACL),
-		Lock:   envOr("RIG_LOCK", DefaultLock),
+		PCI:  os.Getenv("RIG_PCI"),
+		ACL:  envOr("RIG_ACL", DefaultACL),
+		Lock: envOr("RIG_LOCK", DefaultLock),
 	}
 }
 
@@ -158,13 +155,9 @@ func kindOf(dev incus.Device) string {
 
 func isPassthrough(dev incus.Device) bool { return kindOf(dev) != "" }
 
-// DevicesKey records what an instance wants, as a JSON list of Decl. An
-// instance created before it existed has none, and falls back to the one
-// rule that held then: it wants the card unless user.rig.gpu says otherwise.
-const (
-	DevicesKey = "user.rig.devices"
-	legacyGPU  = "user.rig.gpu"
-)
+// DevicesKey records what an instance wants, as a JSON list of Decl. No
+// record means nothing: a device is only ever given because it was asked for.
+const DevicesKey = "user.rig.devices"
 
 // Wanted returns the devices an instance should be given when it starts.
 func Wanted(inst *incus.Instance, cfg Config) ([]Decl, error) {
@@ -178,10 +171,7 @@ func Wanted(inst *incus.Instance, cfg Config) ([]Decl, error) {
 		}
 		return out, nil
 	}
-	if inst.Config[legacyGPU] == "false" {
-		return []Decl{}, nil
-	}
-	return []Decl{{Name: cfg.Device, Kind: manifest.KindGPU, PCI: cfg.PCI}}, nil
+	return []Decl{}, nil
 }
 
 // Record writes the wanted list onto an instance.
@@ -653,7 +643,7 @@ func Start(c *incus.Client, cfg Config, name string, allowUnisolated bool, timeo
 		return fmt.Errorf("%s has no network isolation: NIC %s does not carry the %q ACL.\n"+
 			"An unisolated guest reaches this host's sshd on every address the host holds, "+
 			"plus the LAN and any overlay network (Tailscale, WireGuard) the host is on.\n"+
-			"Fix it for every instance:  rig apply\n"+
+			"Fix it for every instance:  rig setup\n"+
 			"To start anyway:  rig start --allow-unisolated %s",
 			name, strings.Join(unisolated, ", "), cfg.ACL, name)
 	}

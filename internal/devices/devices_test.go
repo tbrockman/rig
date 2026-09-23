@@ -75,36 +75,15 @@ func TestIncusDeviceRoundTripsTheAddress(t *testing.T) {
 	}
 }
 
-// A VM created before the record existed has no marker, and must keep
-// claiming the card. Defaulting the other way would silently strip the GPU
-// from every existing project.
-func TestWantedDefaultsToTheCardForAnUnrecordedInstance(t *testing.T) {
-	cfg := Config{Device: "gpu0"}
+// Nothing recorded means nothing wanted: a device is given only when asked for.
+func TestWantedIsNothingUnlessRecorded(t *testing.T) {
 	for name, conf := range map[string]map[string]string{
 		"no config at all": nil,
 		"unrelated keys":   {"user.rig.env": "/x"},
-		"explicit true":    {legacyGPU: "true"},
+		"empty record":     {DevicesKey: "[]"},
 	} {
-		got, err := Wanted(&incus.Instance{Config: conf}, cfg)
-		if err != nil || len(got) != 1 || got[0].Kind != manifest.KindGPU || got[0].Name != "gpu0" {
-			t.Errorf("%s: wanted = %+v, %v; should be the card", name, got, err)
-		}
-	}
-}
-
-// Only the exact legacy marker opts out, so a typo cannot quietly disable the
-// GPU; and a recorded empty list opts out too, which is what --no-gpu writes.
-func TestWantedOptsOutOnlyExplicitly(t *testing.T) {
-	cfg := Config{Device: "gpu0"}
-	if got, _ := Wanted(&incus.Instance{Config: map[string]string{legacyGPU: "false"}}, cfg); len(got) != 0 {
-		t.Error("an explicit false must not claim the card")
-	}
-	if got, _ := Wanted(&incus.Instance{Config: map[string]string{DevicesKey: "[]"}}, cfg); len(got) != 0 {
-		t.Error("a recorded empty list must want nothing")
-	}
-	for _, v := range []string{"False", "FALSE", "0", "no", ""} {
-		if got, _ := Wanted(&incus.Instance{Config: map[string]string{legacyGPU: v}}, cfg); len(got) != 1 {
-			t.Errorf("%q is not the marker; it must not disable the GPU", v)
+		if got, err := Wanted(&incus.Instance{Config: conf}, Config{}); err != nil || len(got) != 0 {
+			t.Errorf("%s: wanted = %+v, %v; should be nothing", name, got, err)
 		}
 	}
 }
@@ -143,10 +122,9 @@ func TestFromManifestCarriesTheRecipe(t *testing.T) {
 }
 
 func TestConfigFromEnvDefaults(t *testing.T) {
-	t.Setenv("RIG_DEVICE", "")
 	t.Setenv("RIG_ACL", "")
 	cfg := ConfigFromEnv()
-	if cfg.Device != DefaultDevice || cfg.ACL != DefaultACL {
+	if cfg.ACL != DefaultACL || cfg.Lock != DefaultLock {
 		t.Fatalf("defaults not applied: %+v", cfg)
 	}
 }

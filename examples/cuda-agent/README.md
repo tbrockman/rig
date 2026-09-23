@@ -1,20 +1,24 @@
-# Project template
+# cuda-agent
 
-`rig init <dir>` writes this into a new project, from the copy embedded in the
-binary; in a checkout, copying the directory does the same. It gives you a CUDA
-toolchain and the agent, both pinned by the project rather than the base image,
-plus one test worth keeping.
+A GPU VM for an unattended coding agent: a CUDA devShell, a correctness test
+for the passed-through card, `run-agent`, and a guest image with the NVIDIA
+driver and Claude Code.
 
 ```bash
-./rig init proj
-./rig new myproj --env ~/.config/rig/myproj.env --start
-./rig push myproj proj
-./rig exec --dir /work/proj myproj nix develop "path:." -c make run
+# fill in your card in rig.yaml first:  lspci -Dnn | grep -i nvidia
+mkdir -p -m 700 ~/.config/rig
+printf 'ANTHROPIC_API_KEY=sk-ant-...\n' > ~/.config/rig/cuda-agent.env && chmod 600 ~/.config/rig/cuda-agent.env
+
+rig apply -f rig.yaml --start
+rig push cuda-agent .                  # -> /work/cuda-agent
+rig exec --dir /work/cuda-agent cuda-agent nix develop "path:." -c make run
+rig verify cuda-agent
+rig exec --dir /work/cuda-agent cuda-agent nix develop "path:." -c ./run-agent
 ```
 
 ## Why the toolchain is here
 
-The base image carries the NVIDIA **driver**, which has to match the kernel.
+The guest image carries the NVIDIA **driver**, which has to match the kernel.
 Everything above it — nvcc, cudart, the agent — is a project decision, and two
 projects should be able to disagree without either needing a new base image.
 

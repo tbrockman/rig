@@ -1,8 +1,8 @@
-# Per-project devShell template.
+# The example's devShell.
 #
-# The base image carries the NVIDIA *driver* and nothing else. Toolchains live
+# The guest image carries the NVIDIA *driver* and nothing else. Toolchains live
 # here, in the project, so two projects can disagree about their CUDA version
-# without either of them needing a new base image.
+# without either of them needing a new image.
 #
 #   nix develop            # toolchain on PATH
 #   nix develop -c make run

@@ -22,8 +22,7 @@ On the host:
   mkdir -p -m 700 ~/.config/rig
   printf 'ANTHROPIC_API_KEY=sk-ant-...\\n' > ~/.config/rig/<project>.env
   chmod 600 ~/.config/rig/<project>.env
-  ./rig new <project> --env ~/.config/rig/<project>.env  # or set it on an
-  ./rig start <project>                                  # existing VM, see CLAUDE.md
+  rig creds <vm> ~/.config/rig/<project>.env            # into this running VM
 EOF
   exit 1
 fi

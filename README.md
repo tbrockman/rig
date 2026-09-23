@@ -15,9 +15,9 @@ passed-through audio interface and no network at all.
 
 The general idea:
 
-- **A VM gets almost nothing by default.** No route to the host or the LAN,
-  no host directories, and no devices except the GPU, which `rig new` grants
-  unless you pass `--no-gpu`.
+- **A VM gets nothing by default.** No route to the host or the LAN, no host
+  devices, no host directories. Its NIC and root disk come from a `rig`
+  profile, so nothing else on the host's Incus is touched.
 - **Every grant is declared**, in `rig.yaml` or on the command line, and
   recorded on the instance, so `rig doctor` can tell you what a VM has and
   whether that still matches the file.
@@ -36,11 +36,12 @@ supported.
 - **Incus 6.0+** with a managed bridge, and your user in `incus-admin`. Use a
   storage pool with cheap clones (ZFS, btrfs); on `dir`, every `rig new` copies
   the whole image.
-- **Nix** with flakes, to build guest images (2.26+ for the project template).
+- **Nix** with flakes, to build guest images.
 - **Go 1.26**, to build rig.
 - For passthrough: the IOMMU on, and each passed device alone in its IOMMU
-  group. GPUs must be NVIDIA; the guest image carries that driver. A second GPU
-  (an iGPU will do) lets the host keep a display while the VM has the card.
+  group. GPUs must be NVIDIA (`rig.nixosModules.nvidia` is the driver). A
+  second GPU (an iGPU will do) lets the host keep a display while a VM has the
+  card.
 - Optional: `sshfs` for `rig mount`.
 
 ## Install
@@ -50,27 +51,30 @@ go install github.com/tbrockman/rig/cmd/rig@latest   # or, in a checkout: make
 ```
 
 The binary carries the guest image definition and the project template. Then
-work through `docs/RUNBOOK.md` once: storage pool, image, ACL.
+work through `docs/RUNBOOK.md` once: storage pool, `rig setup`, image.
 
-## An agent VM
+## Quick start
 
 ```bash
-mkdir -p -m 700 ~/.config/rig          # credentials live outside any repository
-printf 'ANTHROPIC_API_KEY=sk-ant-...\n' > ~/.config/rig/myproj.env && chmod 600 ~/.config/rig/myproj.env
+rig new scratch --start          # a VM with no host devices
+rig verify scratch               # prove the isolation with real packets
+rig shell scratch
+rig stop scratch && rig rm scratch
 
-rig init proj                           # project template, plus a rig.yaml for this host
-rig new myproj --env ~/.config/rig/myproj.env --start
-rig verify myproj                       # prove the isolation with real packets
-rig push myproj proj                    # -> /work/proj in the guest
-rig agent install myproj                # Claude Code into the guest
-rig agent start myproj --prompt-file brief.md --workdir /work/proj --until-done
-rig agent status myproj                 # cheap; check often
-rig agent log myproj                    # what it said, minus the tool calls
+rig init myproj --with nvidia    # myproj/rig.yaml granting the card, myproj/guest/ with its driver
+$EDITOR myproj/rig.yaml          # grant anything else it needs
+rig apply -f myproj/rig.yaml --start
 ```
+
+`--with` takes `nvidia`, `docker` and `desktop`; without it, `rig init` writes
+a manifest that grants nothing. `--image <alias>` skips the guest flake.
+
+`rig new --gpu` is the shortcut for a VM with this host's NVIDIA card and
+nothing else; it uses the `rig-nvidia` image.
 
 ## A manifest
 
-For anything beyond "a VM with the GPU", write the grants down. For example:
+Anything a VM is given goes in its `rig.yaml`. For example:
 
 ```yaml
 host:
@@ -90,7 +94,7 @@ host:
       return: { reset: true, alive: "usb*" }
 guest:
   name: daw
-  build: ./guest                 # a guest flake, built into an image when missing
+  flake: ./guest                 # nixosConfigurations.guest in ./guest/flake.nix
   cpus: "4-7,12-15"              # pinned host CPUs, one vCPU each
   memory: 16GiB
   devices: [gpu, audio]
@@ -101,23 +105,42 @@ guest:
 ```
 
 ```bash
-rig new -f rig.yaml --start      # create and start it
-rig apply -f rig.yaml            # bring an existing VM back in line with the file
+rig apply -f rig.yaml --start    # create it, or bring it back in line with the file
 rig doctor daw                   # what it has, and where it has drifted
+rig delete -f rig.yaml           # remove it; its volumes stay unless --volumes
 ```
 
-Why bother:
+| Field | |
+|---|---|
+| `host.devices.<name>` | `kind: gpu` (an NVIDIA card), `pci` (any PCI function, such as a USB controller; `id:` required) or `usb` (one device by `id: vendor:product`). `return:` is how the host takes a PCI device back |
+| `guest.flake` / `image` | A flake reference to build the image from, as `<name>-guest` when missing: `./guest` builds `nixosConfigurations.guest`, `./guest#daw` builds `.daw`, and remote refs (`github:…`) work. Or an image alias already built |
+| `guest.cpus` | A count, or a set of host CPUs to pin to (`"4-7,12-15"`) |
+| `guest.memory`, `disk` | Sizes |
+| `guest.devices` | Which `host.devices` this VM gets |
+| `guest.env_file` | `KEY=VALUE` credentials, injected to tmpfs in the guest on start |
+| `guest.volumes` | Named Incus volumes: `"name:/path"`, or `{ source, target, size, owner }` |
+| `guest.ports` | `"host:guest/proto"`, optionally prefixed with the host address to publish on (a tailnet address keeps it off the LAN) |
+| `guest.network` | `none` for no network device |
+| `guest.input` | `host` to lend the host's keyboard and mouse from start to stop |
 
-- **The file is the review.** Everything the VM can touch is in one place, and
-  unknown keys are errors, so a typo can't quietly grant something different.
-- **Recreating is cheap.** Every image change means a new VM; volumes carry the
-  data across, and the file puts everything else back.
-- **Addresses move.** A BIOS setting renumbered this host's PCI bus, and the
-  next start would have handed a VM the SATA controller. Each `id:` makes rig
-  refuse to start and name the device's new address instead.
+The guest flake (`rig init` writes one) is rig's base plus the project's own
+modules. rig provides `rig.nixosModules.nvidia` for a card, `.docker`, and
+`.desktop` for an X11 session on the card.
 
-`CLAUDE.md` covers every field: device kinds, `ports:` (including
-Tailscale-only), volumes, CPU sets, the desktop module.
+## An agent VM
+
+`examples/cuda-agent` is a GPU VM for an unattended coding agent: a CUDA
+devShell, a test that the card really computes, and Claude Code in the image.
+
+```bash
+rig apply -f examples/cuda-agent/rig.yaml --start
+rig push cuda-agent examples/cuda-agent          # -> /work/cuda-agent
+rig agent start cuda-agent --prompt-file brief.md --workdir /work/cuda-agent --until-done
+rig agent status cuda-agent      # cheap; check often
+rig agent log cuda-agent         # what it said, minus the tool calls
+```
+
+Keep credential files outside any repository (`~/.config/rig/`).
 
 ## Commands
 
@@ -126,8 +149,10 @@ Tailscale-only), volumes, CPU sets, the desktop module.
 | VMs | |
 |---|---|
 | `image build`, `image list` | Build a guest image from `base/` or a project's guest flake |
-| `init` | Write the project template and a `rig.yaml` for this host |
-| `new`, `start`, `stop`, `restart`, `rm` | Lifecycle. `start` claims devices; `stop` returns them; `rm --volumes` also deletes volumes |
+| `init` | Write a `rig.yaml` and a guest flake; `--with nvidia,docker,desktop` adds modules |
+| `apply -f`, `delete -f` | Create a manifest's VM or bring it back in line with the file; remove it |
+| `new` | Create a VM without a manifest (`--gpu` for this host's card) |
+| `start`, `stop`, `restart`, `rm` | Lifecycle. `start` claims devices; `stop` returns them; `rm --volumes` also deletes volumes |
 | `status`, `logs` | Who holds which device; the console of a VM that won't boot |
 | `doctor`, `verify` | Check the configuration; prove the isolation from inside |
 
@@ -140,12 +165,13 @@ Tailscale-only), volumes, CPU sets, the desktop module.
 | `creds` | Swap the credential in a running VM |
 | `agent install/start/status/log/send/stop` | Claude Code as a systemd unit that resumes its session after a crash |
 
-| Grants | |
+| Grants and isolation | |
 |---|---|
-| `apply` | The isolation ACL; with `-f`, a VM to its manifest |
+| `setup` | This host's isolation ACL and the `rig` profile, once |
 | `claim`, `release` | Attach a stopped VM's devices; take every device back |
 | `host input` | Lend the keyboard and mouse as events (both Ctrl keys toggle) |
-| `host desktop/headless/return/free/status` | Move devices between the host and VMs (root) |
+| `host return/free` | What `stop` and `start` run for each device (root) |
+| `host desktop/headless/status` | Move the NVIDIA card between the host's desktop and VMs (root) |
 
 `verify` exits 2 for "could not be proven", which is not a pass; `exec`
 passes the guest command's exit status through.
@@ -178,11 +204,12 @@ What doesn't:
 
 ## Docs
 
-| | |
+| Path | Description |
 |---|---|
-| `CLAUDE.md` | How to use it: which verb for what, and why. Written for a Claude Code session driving rig, and reads fine for a person |
 | `docs/RUNBOOK.md` | Host setup |
+| `docs/DEV_NOTES.md` | Facts about Incus and the host the code depends on, and failures that look like something else |
 | `docs/DESIGN.md` | Decisions, what was learned proving them, and what's still weak |
+| `CLAUDE.md` | Conventions for working on rig, for a Claude Code session or a person |
 
 ## Status
 

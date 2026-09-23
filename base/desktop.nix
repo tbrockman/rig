@@ -5,7 +5,7 @@
 # Opt-in. The base image stays headless; a project that wants a screen
 # imports `rig.nixosModules.desktop` from its guest flake:
 #
-#   nixosConfigurations.gpubase = rig.lib.mkGuest [ rig.nixosModules.desktop ./guest.nix ];
+#   nixosConfigurations.guest = rig.lib.mkGuest [ rig.nixosModules.desktop ./guest.nix ];
 #
 # and sets the options below in guest.nix. Importing the module enables it.
 #

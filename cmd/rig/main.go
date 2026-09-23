@@ -41,7 +41,10 @@ import (
 const managedKey = "user.rig.managed"
 
 // defaultImage is the alias `rig image build` writes and `rig new` reads.
-const defaultImage = "nixos-gpu-base"
+const (
+	defaultImage = "rig-base"
+	gpuImage     = "rig-nvidia" // rig image build --attr guest-nvidia --alias rig-nvidia
+)
 
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}$`)
 
@@ -55,32 +58,30 @@ func main() {
 
 	root := &cobra.Command{
 		Use:   "rig",
-		Short: "Isolated project VMs with the GPU attached",
-		Long: "rig creates and runs isolated project VMs with the GPU attached, and runs\n" +
-			"an unattended coding agent inside one.\n\n" +
-			"It enforces two invariants: a host device passed through to a VM — the\n" +
-			"card, a USB controller — is configured on at most one instance and never\n" +
-			"moves away from a running one, and no instance starts without network\n" +
-			"isolation.\n\n" +
+		Short: "Isolated NixOS VMs that get only the host resources you grant them",
+		Long: "rig creates and runs isolated NixOS VMs on Incus. A VM gets no route to\n" +
+			"this host or the LAN and no host devices unless they are granted: in a\n" +
+			"rig.yaml, or with a flag. Grants are recorded on the instance, checked\n" +
+			"before a start, and handed back on stop.\n\n" +
+			"It enforces two invariants: a host device passed through to a VM is\n" +
+			"configured on at most one instance and never moves away from a running\n" +
+			"one, and no instance starts without network isolation.\n\n" +
 			"Typical flow, once the host is set up (docs/RUNBOOK.md):\n" +
-			"  rig image build                        # the NixOS guest image, from base/\n" +
-			"  rig apply                              # the isolation ACL, onto the profile\n" +
-			"  rig new myproj --env ~/.config/rig/myproj.env --start\n" +
-			"  rig new -f rig.yaml --start            # or everything from a manifest\n" +
+			"  rig setup                              # the isolation ACL and the rig profile\n" +
+			"  rig image build                        # the guest image, from base/\n" +
+			"  rig init myproj                        # a rig.yaml and a guest flake\n" +
+			"  rig apply -f myproj/rig.yaml --start   # the VM that file describes\n" +
 			"  rig doctor myproj && rig verify myproj # configured, then proven\n" +
-			"  rig push myproj ./project              # -> /work/project in the guest\n" +
-			"  rig agent start myproj --prompt-file brief.md --until-done\n" +
-			"  rig agent status myproj                # bounded and cheap; check often\n\n" +
+			"  rig shell myproj\n\n" +
 			"Exit status is 0 or 1 except where a verb says otherwise: verify exits 2\n" +
 			"for \"could not be proven\", and exec carries the guest command's status out.\n" +
 			"Progress notes go to stdout prefixed \"rig:\"; errors go to stderr.\n\n" +
 			"Environment (each has a flag or a default; none is required):\n" +
-			"  RIG_PCI           the card's PCI address, when discovery picks wrong\n" +
-			"  RIG_DEVICE        name of the GPU device rig puts on an instance (gpu0)\n" +
+			"  RIG_PCI           the card --gpu gives, when discovery picks wrong\n" +
 			"  RIG_ACL           name of the isolation ACL (vm-isolate)\n" +
-			"  RIG_PROFILE       profile that carries the isolation and that new VMs use (default)\n" +
-			"  RIG_LOCK          lock file serialising card moves (/var/lock/rig.lock)\n" +
-			"  RIG_IMAGE         image alias new VMs are made from (nixos-gpu-base)\n" +
+			"  RIG_PROFILE       profile that carries the isolation and that new VMs use (rig)\n" +
+			"  RIG_LOCK          lock file serialising device moves (/var/lock/rig.lock)\n" +
+			"  RIG_IMAGE         image alias new VMs are made from (rig-base)\n" +
 			"  RIG_CPUS, RIG_MEMORY, RIG_DISK    defaults for rig new\n" +
 			"  RIG_FLAKE, RIG_FLAKE_ATTR         what rig image build builds\n" +
 			"  INCUS_SOCKET      the daemon's unix socket (/var/lib/incus/unix.socket)",
@@ -91,9 +92,9 @@ func main() {
 	// Grouped so the sharp verbs stay visibly separate in help. They used to be
 	// a second binary; that only ever encoded this distinction.
 	root.AddGroup(
-		&cobra.Group{ID: "vm", Title: "Project VMs:"},
+		&cobra.Group{ID: "vm", Title: "VMs:"},
 		&cobra.Group{ID: "guest", Title: "Working inside a guest:"},
-		&cobra.Group{ID: "card", Title: "The card and the policy:"},
+		&cobra.Group{ID: "card", Title: "Grants and isolation:"},
 	)
 	root.AddCommand(
 		a.initCmd(),
@@ -102,7 +103,7 @@ func main() {
 		a.execCmd(), a.shellCmd(), a.pushCmd(), a.pullCmd(), a.agentCmd(),
 		a.credsCmd(),
 		a.mountCmd(), a.unmountCmd(), a.forwardCmd(),
-		a.claimCmd(), a.releaseCmd(), a.applyCmd(), a.hostCmd(), a.imageCmd(),
+		a.claimCmd(), a.releaseCmd(), a.applyCmd(), a.setupCmd(), a.hostCmd(), a.imageCmd(),
 	)
 
 	if err := root.Execute(); err != nil {
@@ -235,47 +236,29 @@ func (a *app) setEnvFile(name, envFile string) error {
 
 func (a *app) newCmd() *cobra.Command {
 	var (
-		envFile, image, memory, disk, profile, file string
-		cpus                                        int
-		start, noGPU                                bool
+		envFile, image, memory, disk, profile string
+		cpus                                  int
+		start, gpu                            bool
 	)
 	cmd := &cobra.Command{
-		Use:     "new <vm> | new -f rig.yaml",
+		Use:     "new <vm>",
 		GroupID: "vm",
-		Short:   "Create a project VM (isolated, GPU-ready)",
+		Short:   "Create an isolated VM",
 		Long: "Creates a stopped VM from the base image. Its NIC — and so its network\n" +
 			"isolation — and its root disk come from the profile, which is the one\n" +
-			"`rig apply` reconciles. The image alias, the credential file and which\n" +
-			"host devices the VM wants are all recorded on the instance, so later\n" +
-			"verbs need none of them repeated.\n\n" +
-			"With -f, everything comes from the manifest: the name, the image (built\n" +
-			"from its `build:` directory when the alias is missing), the size, the\n" +
-			"credential file, the devices and the published ports. `rig init` writes\n" +
-			"one to start from.",
-		Args: cobra.MaximumNArgs(1),
+			"`rig setup` isolates. It is given no host devices unless asked:\n" +
+			"--gpu gives it this host's NVIDIA card, and a manifest can give it\n" +
+			"anything else. The image alias, the credential file and the devices are\n" +
+			"recorded on the instance, so later verbs need none of them repeated.\n\n" +
+			"For anything more, write a rig.yaml (`rig init`) and `rig apply -f` it.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if file != "" {
-				for _, f := range []string{"env", "image", "cpus", "memory", "disk", "no-gpu"} {
-					if cmd.Flags().Changed(f) {
-						return fmt.Errorf("--%s and -f together: with a manifest, that comes from the file", f)
-					}
-				}
-				m, err := manifest.Load(file)
-				if err != nil {
-					return err
-				}
-				if len(args) == 1 && args[0] != m.Guest.Name {
-					return fmt.Errorf("%s names the VM %q, not %q", file, m.Guest.Name, args[0])
-				}
-				if err := a.newFromManifest(m, profile); err != nil {
-					return err
-				}
-				return a.afterNew(m.Guest.Name, profile, start)
-			}
-			if len(args) != 1 {
-				return errors.New("name the VM, or pass -f rig.yaml")
-			}
 			name := args[0]
+			// A card needs its driver in the guest, which the plain base does
+			// not carry.
+			if gpu && !cmd.Flags().Changed("image") && os.Getenv("RIG_IMAGE") == "" {
+				image = gpuImage
+			}
 			if !nameRE.MatchString(name) {
 				return fmt.Errorf("not a valid instance name: %s", name)
 			}
@@ -283,7 +266,11 @@ func (a *app) newCmd() *cobra.Command {
 				return fmt.Errorf("%s already exists", name)
 			}
 			if !a.c.ImageExists(image) {
-				return fmt.Errorf("no such image: %s\n  Build it:  rig image build", image)
+				build := "rig image build"
+				if image == gpuImage {
+					build += " --attr guest-nvidia --alias " + gpuImage
+				}
+				return fmt.Errorf("no such image: %s\n  Build it:  %s", image, build)
 			}
 
 			absEnv, err := absEnvFile(envFile)
@@ -291,10 +278,13 @@ func (a *app) newCmd() *cobra.Command {
 				return err
 			}
 
-			config := map[string]string{managedKey: "true", imageKey: image}
-			if noGPU {
-				config[devices.DevicesKey] = devices.Encode(nil)
+			// Recorded either way, so what the VM was given is never a
+			// question for a later verb.
+			var decls []devices.Decl
+			if gpu {
+				decls = []devices.Decl{{Name: "gpu", Kind: manifest.KindGPU}}
 			}
+			config := map[string]string{managedKey: "true", imageKey: image, devices.DevicesKey: devices.Encode(decls)}
 			if absEnv != "" {
 				config[creds.InstanceKey] = absEnv
 			}
@@ -305,9 +295,9 @@ func (a *app) newCmd() *cobra.Command {
 				return err
 			}
 
-			gpuNote := ""
-			if noGPU {
-				gpuNote = ", no GPU"
+			gpuNote := ", no host devices"
+			if gpu {
+				gpuNote = ", with the GPU"
 			}
 			note("created %s (image %s, %d cpus, %s, %s disk%s)", name, image, cpus, memory, disk, gpuNote)
 			if absEnv != "" {
@@ -317,24 +307,23 @@ func (a *app) newCmd() *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
-	f.StringVarP(&file, "file", "f", "", "manifest to create the VM from (rig.yaml)")
 	f.StringVar(&envFile, "env", "", "host file of KEY=VALUE credentials to inject on start")
 	f.StringVar(&image, "image", envOr("RIG_IMAGE", defaultImage), "base image alias")
-	f.StringVar(&profile, "profile", envOr("RIG_PROFILE", "default"),
-		"Incus profile the VM inherits its NIC and root disk from; rig apply isolates the same one")
+	f.StringVar(&profile, "profile", envOr("RIG_PROFILE", policy.DefaultProfile),
+		"Incus profile the VM inherits its NIC and root disk from; rig setup isolates the same one")
 	f.IntVar(&cpus, "cpus", envInt("RIG_CPUS", 8), "vCPUs")
 	f.StringVar(&memory, "memory", envOr("RIG_MEMORY", "16GiB"), "RAM")
 	f.StringVar(&disk, "disk", envOr("RIG_DISK", "40GiB"), "root disk size")
 	f.BoolVar(&start, "start", false, "start it once created")
-	f.BoolVar(&noGPU, "no-gpu", false,
-		"never claim the GPU for this VM — for CPU-only work, and so starting it cannot take the card from this host's desktop")
+	f.BoolVar(&gpu, "gpu", false,
+		"give it this host's NVIDIA card on start (RIG_PCI, else discovered); implies --image "+gpuImage+" unless one is named")
 	return cmd
 }
 
 // afterNew is what every creation ends with: the isolation check, and the
 // start when asked for.
 func (a *app) afterNew(name, profile string, start bool) error {
-	// Isolation is inherited from the default profile. Verify it landed
+	// Isolation is inherited from the profile. Verify it landed
 	// rather than assuming: a new VM with no ACL is the failure this
 	// project exists to prevent, and it is silent.
 	inst, _, err := a.c.Instance(name)
@@ -342,8 +331,8 @@ func (a *app) afterNew(name, profile string, start bool) error {
 		return err
 	}
 	if !policy.Isolated(inst, a.cfg.ACL) {
-		fix := "rig apply"
-		if profile != "default" {
+		fix := "rig setup"
+		if profile != policy.DefaultProfile {
 			fix += " --profile " + profile
 		}
 		note("WARNING: %s did NOT inherit network isolation.", name)
@@ -376,7 +365,7 @@ func (a *app) startCmd() *cobra.Command {
 	var noWait, allowUnisolated bool
 	cmd := &cobra.Command{
 		Use:     "start <vm>",
-		Short:   "Claim the card, start the VM, inject credentials",
+		Short:   "Claim the VM's devices, start it, inject credentials",
 		GroupID: "vm",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -412,7 +401,7 @@ func (a *app) start(name string, timeout time.Duration, wait, allowUnisolated bo
 		return err
 	}
 	if len(wanted) == 0 {
-		note("%s wants no host devices; leaving the card where it is", name)
+		note("%s wants no host devices", name)
 	}
 	// A pinned CPU set is checked against this host before anything moves:
 	// it must name CPUs that exist and leave the host a core of its own.
@@ -683,28 +672,21 @@ func (a *app) releaseCmd() *cobra.Command {
 	return cmd
 }
 
-func (a *app) applyCmd() *cobra.Command {
+func (a *app) setupCmd() *cobra.Command {
 	var dryRun bool
-	var profile, file string
+	var profile string
 	cmd := &cobra.Command{
-		Use:     "apply [-f rig.yaml]",
-		Short:   "Reconcile the isolation ACL and the profile NIC, and a VM to its manifest",
+		Use:     "setup",
+		Short:   "Set up this host: the isolation ACL and the rig profile",
 		GroupID: "card",
-		Long: "Declares the policy — the egress reject ranges and the three NIC keys —\n" +
-			"and reconciles Incus to it. `incus admin init --preseed` does not cover\n" +
-			"network ACLs, so this is the only way to get them onto a clean host.\n\n" +
-			"With -f, also brings the VM the manifest names to what the file says:\n" +
-			"its devices, credential file, size and ports. The VM has to exist\n" +
-			"already; `rig new -f` is what creates one.",
+		Long: "Declares the isolation policy (the egress reject ranges and the three\n" +
+			"NIC keys) and reconciles Incus to it: the ACL, and a profile of rig's\n" +
+			"own, created from `default`'s NIC and root disk when it does not exist,\n" +
+			"with the ACL on its NIC. rig's VMs use that profile, so nothing else on\n" +
+			"this host's Incus changes. Safe to run again; it changes only what\n" +
+			"differs.",
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			var m *manifest.Manifest
-			if file != "" {
-				var err error
-				if m, err = manifest.Load(file); err != nil {
-					return err
-				}
-			}
 			changes, err := policy.Apply(a.c, a.cfg.ACL, profile, dryRun)
 			if err != nil {
 				for _, ch := range changes {
@@ -713,7 +695,7 @@ func (a *app) applyCmd() *cobra.Command {
 				return err
 			}
 			if len(changes) == 0 {
-				fmt.Println("already reconciled; nothing to do.")
+				fmt.Println("already set up; nothing to do.")
 			} else {
 				if dryRun {
 					fmt.Println("dry run, nothing applied:")
@@ -734,6 +716,9 @@ func (a *app) applyCmd() *cobra.Command {
 			}
 			var stragglers []string
 			for i := range instances {
+				if instances[i].Config[managedKey] != "true" {
+					continue
+				}
 				unisolated, noEgress := policy.Report(&instances[i], a.cfg.ACL)
 				if len(unisolated) > 0 {
 					stragglers = append(stragglers,
@@ -744,19 +729,57 @@ func (a *app) applyCmd() *cobra.Command {
 				}
 			}
 			if len(stragglers) > 0 {
-				fmt.Println("\ninstances not covered (an instance's own NIC override wins over the profile; not changed):")
+				fmt.Println("\nrig VMs not covered (an instance's own NIC override wins over the profile; not changed):")
 				for _, s := range stragglers {
 					fmt.Println(s)
 				}
 			}
-			if m == nil {
-				return nil
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "report what would change without changing it")
+	cmd.Flags().StringVar(&profile, "profile", envOr("RIG_PROFILE", policy.DefaultProfile), "profile to reconcile")
+	return cmd
+}
+
+func (a *app) applyCmd() *cobra.Command {
+	var dryRun, start bool
+	var profile, file string
+	cmd := &cobra.Command{
+		Use:     "apply -f rig.yaml",
+		Short:   "Create the VM a manifest describes, or bring it back in line with it",
+		GroupID: "vm",
+		Long: "Creates the VM rig.yaml names when it does not exist, building its image\n" +
+			"from `flake:` when that is missing. When it exists, brings it to what the\n" +
+			"file says: devices, credential file, size, ports, network, volumes.\n" +
+			"Safe to run again; it changes only what differs.\n\n" +
+			"It does not start or stop anything (--start starts it), and it never\n" +
+			"recreates a VM: that would wipe its disk. A change that needs a new VM,\n" +
+			"such as a new image, is reported, and `rig delete -f` then `rig apply -f`\n" +
+			"makes it. A change a running VM cannot take waits for its next start.",
+		Args: cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if file == "" {
+				return errors.New("rig apply needs -f rig.yaml.\n  Setting up the host (the ACL and the rig profile) is:  rig setup")
+			}
+			m, err := manifest.Load(file)
+			if err != nil {
+				return err
+			}
+			name := m.Guest.Name
+			inst, _, err := a.c.Instance(name)
+			if err != nil {
+				// Not there yet: this is a create.
+				if dryRun {
+					fmt.Printf("%s does not exist; rig apply -f would create it from %s (image %s).\n", name, m.Path, m.ImageAlias())
+					return nil
+				}
+				if err := a.newFromManifest(m, profile); err != nil {
+					return err
+				}
+				return a.afterNew(name, profile, start)
 			}
 			if dryRun {
-				inst, _, err := a.c.Instance(m.Guest.Name)
-				if err != nil {
-					return fmt.Errorf("no instance %s yet.\n  Create it from the file:  rig new -f %s", m.Guest.Name, m.Path)
-				}
 				want, err := desired(m)
 				if err != nil {
 					return err
@@ -773,42 +796,64 @@ func (a *app) applyCmd() *cobra.Command {
 				}
 				drift = append(drift, volDrift...)
 				if len(drift) == 0 {
-					fmt.Printf("\n%s matches %s; nothing to do.\n", m.Guest.Name, m.Path)
+					fmt.Printf("%s matches %s; nothing to do.\n", name, m.Path)
 				} else {
-					fmt.Printf("\n%s would change:\n", m.Guest.Name)
+					fmt.Printf("%s would change:\n", name)
 					for _, d := range drift {
 						fmt.Printf("  %s\n", d)
 					}
 				}
 				return nil
 			}
-			changes, err = a.reconcileManifest(m)
+			changes, err := a.reconcileManifest(m)
 			if len(changes) == 0 && err == nil {
-				fmt.Printf("\n%s matches %s; nothing to do.\n", m.Guest.Name, m.Path)
+				fmt.Printf("%s matches %s; nothing to do.\n", name, m.Path)
 			} else if len(changes) > 0 {
-				fmt.Printf("\n%s reconciled to %s:\n", m.Guest.Name, m.Path)
+				fmt.Printf("%s reconciled to %s:\n", name, m.Path)
 				for _, ch := range changes {
 					fmt.Printf("  %s\n", ch)
 				}
 			}
-			return err
+			if err != nil || !start {
+				return err
+			}
+			if inst, _, err = a.c.Instance(name); err == nil && inst.Running() {
+				return nil
+			}
+			return a.startInstance(name, 3*time.Minute, true)
 		},
 	}
+	cmd.Flags().StringVarP(&file, "file", "f", "", "the manifest (rig.yaml)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "report what would change without changing it")
-	cmd.Flags().StringVar(&profile, "profile", envOr("RIG_PROFILE", "default"), "profile to reconcile")
-	cmd.Flags().StringVarP(&file, "file", "f", "", "manifest whose VM to reconcile as well")
+	cmd.Flags().BoolVar(&start, "start", false, "start it afterwards, if it is not running")
+	cmd.Flags().StringVar(&profile, "profile", envOr("RIG_PROFILE", policy.DefaultProfile),
+		"Incus profile a new VM inherits its NIC and root disk from; rig setup isolates the same one")
 	return cmd
 }
 
 func (a *app) rmCmd() *cobra.Command {
 	var force, dropVolumes bool
+	var file string
 	cmd := &cobra.Command{
-		Use:     "rm <vm>",
+		Use:     "rm <vm> | rm -f rig.yaml",
+		Aliases: []string{"delete"},
 		GroupID: "vm",
-		Short:   "Delete a stopped VM that rig created",
-		Args:    cobra.ExactArgs(1),
+		Short:   "Delete a stopped VM that rig created (also: rig delete -f rig.yaml)",
+		Args:    cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			name := args[0]
+			var name string
+			switch {
+			case file != "" && len(args) == 0:
+				m, err := manifest.Load(file)
+				if err != nil {
+					return err
+				}
+				name = m.Guest.Name
+			case file == "" && len(args) == 1:
+				name = args[0]
+			default:
+				return errors.New("name the VM, or pass -f rig.yaml, not both")
+			}
 			if err := a.requireInstance(name); err != nil {
 				return err
 			}
@@ -856,6 +901,7 @@ func (a *app) rmCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().StringVarP(&file, "file", "f", "", "the manifest naming the VM")
 	cmd.Flags().BoolVar(&force, "force", false, "stop it first if it is running")
 	cmd.Flags().BoolVar(&dropVolumes, "volumes", false,
 		"also delete the volumes it mounts, and everything on them (by default they are kept)")
@@ -1404,7 +1450,10 @@ func sameDevice(dev incus.Device, d devices.Decl) bool {
 func guestProbe(d devices.Decl) (cmd, label string) {
 	switch d.Kind {
 	case manifest.KindGPU:
-		return "gpu-check", "gpu visible in guest"
+		// gpu-check comes with rig.nixosModules.nvidia; an image without it
+		// has no driver for the card either, which is the thing to say.
+		return "command -v gpu-check >/dev/null || { echo 'no NVIDIA driver in this image: build it with rig.nixosModules.nvidia'; exit 1; }; gpu-check",
+			"gpu visible in guest"
 	case manifest.KindPCI:
 		ids := hostdev.IDs(d.PCI)
 		if ids == "" {

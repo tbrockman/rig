@@ -1,8 +1,33 @@
 # Design notes
 
 Decisions and why, what was learned proving them, and what is still weak.
-Written 2026-08-23; last updated 2026-09-20. `README.md` says what this is;
-`CLAUDE.md` is how to use it.
+Written 2026-08-23; last updated 2026-09-23. `README.md` says what this is;
+`docs/DEV_NOTES.md` has the facts the code depends on.
+
+## 2026-09-23: from agent sandbox to grants
+
+rig began as one NVIDIA card and a coding agent, and its defaults said so:
+`rig new` claimed the card unless told `--no-gpu`, an instance with no
+device record wanted the card, the base image carried the NVIDIA driver and
+docker, `rig init` wrote a CUDA project, and host setup put the isolation on
+Incus's `default` profile. Running a DAW with no network and a USB controller
+showed the model was really "a VM gets only what it is granted". So the
+defaults moved to nothing: a VM gets no devices unless a manifest or `--gpu`
+asks, the base image is minimal with `nvidia`, `docker` and `desktop` as
+modules, `rig init` writes a manifest and a guest flake, and rig's VMs use a
+`rig` profile of their own, seeded from `default`'s NIC and root disk, so
+installing rig changes nothing about instances it did not create. The CUDA
+agent project lives on as `examples/cuda-agent`.
+
+The verbs followed. `rig new -f` created and `rig apply -f` updated, while plain
+`rig apply` set up the host: three meanings on two verbs. Now `rig apply -f` is
+create-or-update in kubectl's sense, `rig delete -f` removes, `rig new` is the
+imperative quick create, and host setup is `rig setup`. Unlike kubectl, apply
+never recreates a VM (that wipes its disk) and never starts one (that claims
+devices); it reports what needs either. The manifest's `build:` became
+`flake:`, a flake reference with nixos-rebuild's `#name`: Compose's `build:` is
+a Dockerfile's directory, and a field that looks like Compose's but means
+something else is worse than a different name.
 
 ## Goal
 
@@ -44,7 +69,7 @@ discovered, so moving the card needs no config change.
 - **No state store.** Incus is the source of truth; everything is derived. The
   only persistent artefact is a lock file.
 - **No Terraform.** Nix + `incus admin init --preseed`, except preseed does not
-  cover `network_acls` — hence `rig apply`.
+  cover `network_acls` — hence `rig setup`.
 - **Dynamic vfio binding.** Static binding needs boot-framebuffer workarounds
   when the dGPU is firmware-primary.
 - **Go, not shell.** Typed, testable, and the Incus REST API is reachable
@@ -100,7 +125,7 @@ discovered, so moving the card needs no config change.
   entry, not a package. See "Host devices are declared, not coded".
 - **The manifest is intent; Incus stays the record.** `rig.yaml` reads as a
   Compose file because that is the shape people and models already know, and
-  `rig new -f` records everything it reads on the instance, so later verbs
+  `rig apply -f` records everything it reads on the instance, so later verbs
   need no file. The `host:` block repeats per project, deliberately: one file
   then describes everything a VM needs, and a checkout on another machine can
   see the addresses it was written for. Unknown keys are errors.
@@ -171,11 +196,11 @@ Rejected: a Containerfile-style imperative layer list. The guest is a VM, Incus
 does not build VM images that way, and NixOS already has the declarative
 mechanism — the base is a flake already.
 
-`base/flake.nix` now exposes `nixosModules.gpu-dev` and `lib.mkGuest`, so a
-project can ship an optional guest flake adding its own modules. `rig image
+`base/flake.nix` exposes `lib.mkGuest` and the optional modules (`nvidia`,
+`docker`, `desktop`), so a project can ship a guest flake adding its own. `rig image
 build` already took `--flake`/`--attr`/`--alias` and `rig new` already took
 `--image`, so no new verbs were needed; the missing piece was only that the base
-was not importable. `project-template/guest/` is the worked example.
+was not importable. `project-template/guest/` is what `rig init` writes.
 
 It also dissolves the two-PATH wart below: a wrapper in `systemPackages` lands
 in `/run/current-system/sw/bin`, which both the login shell and the agent unit
@@ -202,8 +227,8 @@ Two things worth keeping from it. The failure arrives as ENOSPC from something
 unrelated, long after the cause, so the symptom points nowhere near the bug. And
 a bare path only helps if the directory is a **git working tree** — otherwise
 nix falls back to copying everything, so `git init` is load-bearing rather than
-incidental. `project-template` uses `path:.` and gets away with it only because
-that tree never accumulates build output.
+incidental. `examples/cuda-agent` uses `path:.` and gets away with it only
+because that tree never accumulates build output.
 
 ## What `verify` could not see (found 2026-09-01, fixed)
 
@@ -451,7 +476,7 @@ What remains:
    "the internet is a bit broken", because the bridge resolver keeps working.
    See `internal/policy`.
 5. **An ACL's rules cannot be edited while it is attached** — Incus flushes an
-   nftables chain it never created and fails. `rig apply` detaches, rewrites
+   nftables chain it never created and fails. `rig setup` detaches, rewrites
    and reattaches, and refuses while a consumer is running. See
    `policy.rewriteACL`.
 
@@ -478,7 +503,7 @@ What remains:
 ## What has been verified
 
 - CoW clones: `rig new` takes 1.5 s and adds no pool usage.
-- `rig image build` builds and imports `nixos-gpu-base`, stamping it with the
+- `rig image build` builds and imports the guest image, stamping it with the
   store path it came from. A rebuild that changes nothing is a no-op, and
   `rig doctor` reports a VM created from an older image.
 - **Passthrough verified in-guest:** RTX 4080 SUPER, 16376 MiB, driver
@@ -509,7 +534,7 @@ What remains:
 `vm-isolate` egress-rejects `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
 `169.254.0.0/16` and `100.64.0.0/10` (CGNAT/Tailscale — not covered by RFC1918
 and a real gap once), with `egress.action=allow` and `ingress.action=reject` on
-the NIC. Declared in `internal/policy`, reconciled by `rig apply`.
+the NIC. Declared in `internal/policy`, reconciled by `rig setup`.
 
 Before it was attached, the guest could reach the host's sshd on all five
 addresses the host holds — including its tailnet address — plus the LAN gateway,
@@ -592,9 +617,9 @@ Tailscale and docker.)
    same argument applies to IPv4 once there is any appetite for the churn.
 5. **It is NVIDIA-only, and one card.** The CLI is parameterised (`--flake`,
    `--attr`, `--alias`, `--profile`, `RIG_*`) and nothing names a particular
-   host, but the vendor is everywhere: discovery greps PCI vendor `10de`,
-   `base/gpu-dev.nix` is `hardware.nvidia`, the default return recipe names
-   the NVIDIA modules, and `project-template` is CUDA. The host side is now
+   host, but for a GPU the vendor is fixed: discovery greps PCI vendor `10de`,
+   the only driver module is `base/nvidia.nix`, and the default return recipe
+   names the NVIDIA modules. The host side is now
    data — a manifest can name another driver's modules — but another vendor is
    still a second driver in the image, not a flag. Two cards would need the
    manifest's `gpu` kind to stop discovering and start being told.

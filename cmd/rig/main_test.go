@@ -289,7 +289,7 @@ host:
     desk-usb: { kind: pci, pci: "0000:3c:00.3", id: "1022:1111" }
 guest:
   name: myproj
-  build: ./guest
+  flake: ./guest
   cpus: 4
   memory: 8GiB
   env_file: ` + env + `
@@ -364,7 +364,7 @@ func TestSameDeviceIgnoresWhatIncusAdds(t *testing.T) {
 // does not carry, and the gpu probe is the image's own check.
 func TestGuestProbeShapes(t *testing.T) {
 	cmd, label := guestProbe(devices.Decl{Name: "gpu", Kind: "gpu"})
-	if cmd != "gpu-check" || label == "" {
+	if !strings.HasSuffix(cmd, "; gpu-check") || !strings.Contains(cmd, "rig.nixosModules.nvidia") || label == "" {
 		t.Errorf("gpu probe = %q %q", cmd, label)
 	}
 	cmd, label = guestProbe(devices.Decl{Name: "mouse", Kind: "usb", ID: "1234:5678"})
@@ -383,7 +383,7 @@ func TestStaleLockIsRecognisedAndNamesTheLock(t *testing.T) {
 	if !ok || input != "path:/home/me/.cache/rig/base-abc-dirty?narHash=sha256-2Inh%3D" {
 		t.Fatalf("staleLock = %q, %v", input, ok)
 	}
-	hint := staleLockHint("path:/home/me/proj/guest#nixosConfigurations.gpubase.config.system.build.qemuImage", input)
+	hint := staleLockHint("path:/home/me/proj/guest#nixosConfigurations.guest.config.system.build.qemuImage", input)
 	for _, want := range []string{"rm /home/me/proj/guest/flake.lock", "/home/me/.cache/rig/base-abc-dirty\n"} {
 		if !strings.Contains(hint, want) {
 			t.Errorf("hint should contain %q:\n%s", want, hint)
@@ -443,9 +443,9 @@ func TestNetworkPlanMasksInheritedNICsAndLiftsOnlyThoseMasks(t *testing.T) {
 	}
 }
 
-// rig init writes the card's identity so the first start can check it, and
-// leaves the line out rather than inventing one when the card was not found.
-// Either way the result must be a manifest that parses.
+// rig init shows the card, identity included, as a commented example, and
+// leaves the id line out rather than inventing one when it could not be read.
+// Either way the result must be a manifest that parses and grants nothing.
 func TestFillManifestWritesTheCardIdentityOrNone(t *testing.T) {
 	tmpl, err := os.ReadFile("../../project-template/rig.yaml")
 	if err != nil {
@@ -457,8 +457,14 @@ func TestFillManifestWritesTheCardIdentityOrNone(t *testing.T) {
 		if err != nil {
 			t.Fatalf("id %q: filled template does not parse: %v", id, err)
 		}
-		if got := m.Host.Devices["gpu"].ID; got != id {
-			t.Errorf("id %q: manifest has %q", id, got)
+		if m.Guest.Name != "proj" || len(m.Host.Devices) != 0 || len(m.Guest.Devices) != 0 {
+			t.Errorf("id %q: the template must grant nothing: %+v", id, m)
+		}
+		if id != "" && !strings.Contains(filled, "#   id: "+id) {
+			t.Errorf("id %q: the card's identity is not in the example", id)
+		}
+		if !strings.Contains(filled, "#   pci: 0000:2b:00.0") {
+			t.Error("the card's address is not in the example")
 		}
 		if strings.Contains(filled, "GPU_ID") || strings.Contains(filled, "GPU_PCI") {
 			t.Errorf("id %q: a placeholder survived", id)
@@ -518,5 +524,48 @@ func TestTerminalForwarderIsRecognisedByItsArguments(t *testing.T) {
 		if got := isTerminalForwarder(tc.args); got != tc.want {
 			t.Errorf("%v: got %v", tc.args, got)
 		}
+	}
+}
+
+// --with nvidia grants the card the template shows, --with desktop also lends
+// input, and --image swaps the flake for an alias; each result must parse and
+// say exactly that.
+func TestInitVariantsWriteManifestsThatSayWhatWasChosen(t *testing.T) {
+	tmpl, err := os.ReadFile("../../project-template/rig.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := fillManifest(string(tmpl), "proj", "0000:2b:00.0", "10de:abcd")
+
+	m, err := manifest.Parse([]byte(uncommentLine(grantCard(base), "input: host")))
+	if err != nil {
+		t.Fatalf("granted: %v", err)
+	}
+	gpu := m.Host.Devices["gpu"]
+	if gpu.PCI != "0000:2b:00.0" || gpu.ID != "10de:abcd" || gpu.Return == nil || len(gpu.Return.Modules) != 4 {
+		t.Errorf("gpu not granted as the template shows it: %+v", gpu)
+	}
+	if len(m.Guest.Devices) != 1 || m.Guest.Devices[0] != "gpu" || m.Guest.Input != manifest.InputHost {
+		t.Errorf("guest: %+v", m.Guest)
+	}
+
+	m, err = manifest.Parse([]byte(useImage(base, "rig-nvidia")))
+	if err != nil || m.Guest.Image != "rig-nvidia" || m.Guest.Flake != "" {
+		t.Fatalf("image: %+v %v", m, err)
+	}
+}
+
+func TestInitModules(t *testing.T) {
+	if _, err := parseWith([]string{"cuda"}); err == nil {
+		t.Error("an unknown module must be refused")
+	}
+	mods, _ := parseWith([]string{"desktop", "docker"})
+	if !mods["nvidia"] {
+		t.Error("desktop runs on the card, so it brings nvidia")
+	}
+	flake := "outputs = { rig, ... }: {\n  nixosConfigurations.guest = " + mkGuestLine + ";\n};"
+	got, ok := addModules(flake, mods)
+	if !ok || !strings.Contains(got, "rig.lib.mkGuest [ rig.nixosModules.docker rig.nixosModules.desktop ./guest.nix ]") {
+		t.Errorf("modules: %s", got)
 	}
 }

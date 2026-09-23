@@ -37,10 +37,12 @@ func (a *app) hostCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "host",
 		GroupID: "card",
-		Short:   "Move devices between this host and VMs",
-		Long: "For a host that also uses the card for its own desktop. Assumes another\n" +
-			"GPU — an iGPU, typically — drives the console, so the card can leave for\n" +
-			"a VM and come back without taking the only display with it.\n\n" +
+		Short:   "Move devices and input between this host and VMs",
+		Long: "The verbs that touch this host rather than a guest. `return` and `free`\n" +
+			"are what rig stop and rig start run for each device a manifest declares.\n" +
+			"`desktop`, `headless` and `status` are for a host whose own desktop uses\n" +
+			"the NVIDIA card a VM is given, with another GPU (an iGPU, typically)\n" +
+			"driving the console. `input` lends the keyboard and mouse.\n\n" +
 			"`desktop`, `headless`, `return` and `free` write to sysfs or stop units\n" +
 			"and need root: they re-exec themselves under sudo, printing the command\n" +
 			"first. `status` does not.\n\n" +
@@ -141,7 +143,7 @@ func (a *app) hostCmd() *cobra.Command {
 	cmd.AddCommand(a.hostInputCmd())
 	cmd.AddCommand(
 		&cobra.Command{
-			Use: "status", Short: "Where the card is", Args: cobra.NoArgs,
+			Use: "status", Short: "Where the NVIDIA card is, and which VMs hold devices", Args: cobra.NoArgs,
 			RunE: func(*cobra.Command, []string) error {
 				s, err := card()
 				if err != nil {

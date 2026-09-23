@@ -19,7 +19,7 @@ import (
 
 // The manifest is declared intent; Incus is what is true. These helpers turn
 // one into the other and report where they differ. Nothing here is the only
-// copy of anything: what `rig new -f` reads from the file it records on the
+// copy of anything: what `rig apply -f` reads from the file it records on the
 // instance, so every later verb works from Incus alone and the file is
 // consulted again only to reconcile or to report drift.
 
@@ -95,26 +95,26 @@ func configDrift(inst *incus.Instance, want map[string]string) []string {
 	return out
 }
 
-// ensureImage makes the manifest's image exist: a `build:` is built when its
+// ensureImage makes the manifest's image exist: a `flake:` is built when its
 // alias is missing, an `image:` has to be there already.
 func (a *app) ensureImage(m *manifest.Manifest) error {
 	alias := m.ImageAlias()
 	if a.c.ImageExists(alias) {
 		return nil
 	}
-	if m.Guest.Build == "" {
+	if m.Guest.Flake == "" {
 		return fmt.Errorf("no such image: %s\n  Build it:  rig image build --alias %s", alias, alias)
 	}
-	dir := m.Resolve(m.Guest.Build)
-	note("no image %s yet; building it from %s", alias, dir)
-	return a.buildImage(dir, true, envOr("RIG_FLAKE_ATTR", "gpubase"), alias, false)
+	ref, attr := m.FlakeRef()
+	note("no image %s yet; building it from %s#%s", alias, ref, attr)
+	return a.buildImage(ref, true, attr, alias, false)
 }
 
 // newFromManifest creates the instance the file describes.
 func (a *app) newFromManifest(m *manifest.Manifest, profile string) error {
 	name := m.Guest.Name
 	if a.c.Exists(name) {
-		return fmt.Errorf("%s already exists.\n  Reconcile it to the file instead:  rig apply -f %s", name, m.Path)
+		return fmt.Errorf("%s already exists", name)
 	}
 	if err := checkCPUs(m); err != nil {
 		return err
@@ -183,7 +183,7 @@ func (a *app) reconcileManifest(m *manifest.Manifest) ([]string, error) {
 	name := m.Guest.Name
 	inst, _, err := a.c.Instance(name)
 	if err != nil {
-		return nil, fmt.Errorf("no instance %s yet.\n  Create it from the file:  rig new -f %s", name, m.Path)
+		return nil, fmt.Errorf("no instance %s", name)
 	}
 	if err := checkCPUs(m); err != nil {
 		return nil, err
@@ -194,7 +194,10 @@ func (a *app) reconcileManifest(m *manifest.Manifest) ([]string, error) {
 	}
 	var changes []string
 	for _, key := range sortedKeys(want) {
-		if inst.Config[key] == want[key] {
+		// The image a VM was made from is a fact about its disk, which apply
+		// never replaces; recording the file's would make doctor measure the
+		// old disk against the new image. The note below says what to do.
+		if inst.Config[key] == want[key] || key == imageKey {
 			continue
 		}
 		if inst.Running() && strings.HasPrefix(key, "limits.") {
@@ -264,7 +267,7 @@ func (a *app) reconcileManifest(m *manifest.Manifest) ([]string, error) {
 		return changes, fmt.Errorf("volumes: %w", err)
 	}
 	if inst.Config[imageKey] != "" && inst.Config[imageKey] != want[imageKey] {
-		changes = append(changes, "note: the image alias changed; an existing VM keeps its disk, so only a new VM is made from "+want[imageKey])
+		changes = append(changes, "note: the image changed to "+want[imageKey]+"; a VM keeps the disk it was made with, so this takes a new one:  rig delete -f "+m.Path+" && rig apply -f "+m.Path)
 	}
 	return changes, nil
 }

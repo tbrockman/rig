@@ -1,10 +1,12 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -25,79 +27,219 @@ import (
 
 func (a *app) initCmd() *cobra.Command {
 	var force bool
+	var with []string
+	var image string
 	cmd := &cobra.Command{
 		Use:     "init <dir>",
 		GroupID: "vm",
-		Short:   "Write the project template into a directory",
-		Long: "Writes the project template into <dir>: a CUDA devShell flake, a\n" +
-			"correctness test for the passed-through card, run-agent, and under\n" +
-			"guest/ an optional guest image flake for what the project needs the\n" +
-			"machine itself to have.\n\n" +
+		Short:   "Write a rig.yaml and a guest image flake into a directory",
+		Long: "Writes a starting point into <dir>: a rig.yaml that grants nothing\n" +
+			"yet, with this host's NVIDIA card as a commented example when there is\n" +
+			"one, and under guest/ the flake the VM's image is built from.\n\n" +
+			"--with adds rig's optional guest modules: nvidia (the driver; also grants\n" +
+			"the card in rig.yaml), docker, desktop (an X11 session on the card; implies\n" +
+			"nvidia, and lends the host's keyboard and mouse). --image names an image\n" +
+			"already built instead, and writes no guest/.\n\n" +
 			"guest/flake.nix takes its rig base from the build of rig that wrote it:\n" +
 			"a release tag on GitHub for a release build, or a copy of the embedded\n" +
-			"base under your cache directory for a development build. Change it if\n" +
-			"the project should track a different rig.\n\n" +
+			"base under your cache directory for a development build.\n\n" +
 			"Then:\n" +
-			"  rig new <vm> --env ~/.config/rig/<vm>.env --start\n" +
-			"  rig push <vm> <dir>\n" +
-			"  rig exec --dir /work/<dir> <vm> nix develop \"path:.\" -c make run",
+			"  rig apply -f <dir>/rig.yaml --start",
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			dir := args[0]
+			mods, err := parseWith(with)
+			if err != nil {
+				return err
+			}
+			if image != "" && len(mods) > 0 {
+				return errors.New("--with adds modules to guest/flake.nix, which --image leaves out; choose one")
+			}
 			if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 && !force {
 				return fmt.Errorf("%s is not empty; refusing to write over it (--force writes anyway)", dir)
 			}
-			base, err := baseFlakeRef()
-			if err != nil {
-				return err
-			}
-			// The guest lock is regenerated on the first build against whatever
-			// the rig input resolves to; the one in the checkout pins a relative
-			// path that means nothing outside it.
-			skip := func(p string) bool { return p == "guest/flake.lock" }
+			skip := func(p string) bool { return image != "" && (p == "guest" || p == ".gitignore") }
 			if err := rig.WriteTree(rig.ProjectTemplate(), dir, skip); err != nil {
 				return err
 			}
-			gf := filepath.Join(dir, "guest", "flake.nix")
-			b, err := os.ReadFile(gf)
-			if err != nil {
-				return err
+			var base string
+			if image == "" {
+				if base, err = baseFlakeRef(); err != nil {
+					return err
+				}
+				if err := writeGuest(dir, base, mods); err != nil {
+					return err
+				}
 			}
-			updated, ok := retargetRigInput(string(b), base)
-			if !ok {
-				return fmt.Errorf("no inputs.rig.url line in %s to point at the base", gf)
-			}
-			if err := os.WriteFile(gf, []byte(updated), 0o644); err != nil {
-				return err
-			}
-			// The manifest names the project and this host's card. The card
-			// is discovered the way a claim discovers it, so the file agrees
-			// with what `rig start` would have done without one.
+
+			// The manifest names the project, and shows this host's card: found
+			// the way `kind: gpu` without an address finds it, and granted only
+			// when nvidia was asked for.
 			name := projectName(dir)
 			pci, err := devices.DiscoverPCI(a.c, a.cfg)
+			id := hostdev.IDs(pci)
 			if err != nil {
-				pci = "0000:00:00.0"
-				note("WARNING: could not find the card: %v", err)
-				note("         Put its address in rig.yaml (lspci -D).")
+				pci, id = examplePCI, exampleID
 			}
 			mf := filepath.Join(dir, manifest.DefaultFile)
-			b, err = os.ReadFile(mf)
+			b, err := os.ReadFile(mf)
 			if err != nil {
 				return err
 			}
-			filled := fillManifest(string(b), name, pci, hostdev.IDs(pci))
-			if err := os.WriteFile(mf, []byte(filled), 0o644); err != nil {
+			text := fillManifest(string(b), name, pci, id)
+			if mods["nvidia"] {
+				text = grantCard(text)
+			}
+			if mods["desktop"] {
+				text = uncommentLine(text, "input: host")
+			}
+			if image != "" {
+				text = useImage(text, image)
+			}
+			if _, err := manifest.Parse([]byte(text)); err != nil {
+				return fmt.Errorf("the rig.yaml init wrote does not parse; this is a bug in rig: %w", err)
+			}
+			if err := os.WriteFile(mf, []byte(text), 0o644); err != nil {
 				return err
 			}
-			note("wrote the project template to %s", dir)
-			note("guest/flake.nix takes its rig base from %s", base)
-			note("rig.yaml names the VM %s and the card at %s", name, pci)
-			note("next:  rig new -f %s --start && rig push %s %s", mf, name, dir)
+
+			note("wrote %s", mf)
+			if image == "" {
+				note("guest/flake.nix builds on %s%s", base, moduleNote(mods))
+			} else {
+				note("the VM is made from the image %s", image)
+			}
+			switch {
+			case mods["nvidia"] && pci == examplePCI:
+				note("WARNING: no NVIDIA card found; rig.yaml grants a made-up one. Put yours in (lspci -Dnn).")
+			case mods["nvidia"]:
+				note("rig.yaml grants the card at %s", pci)
+			case pci != examplePCI:
+				note("the card at %s is in rig.yaml, commented out", pci)
+			}
+			note("next:  rig apply -f %s --start", mf)
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "write into a non-empty directory, overwriting files of the same name")
+	cmd.Flags().StringSliceVar(&with, "with", nil, "optional guest modules: nvidia, docker, desktop")
+	cmd.Flags().StringVar(&image, "image", "", "use this image alias instead of writing a guest flake")
 	return cmd
+}
+
+// guestModules are rig's optional modules, as `rig init --with` names them.
+var guestModules = []string{"nvidia", "docker", "desktop"}
+
+// parseWith reads --with. desktop brings nvidia, since the session runs on
+// the card.
+func parseWith(with []string) (map[string]bool, error) {
+	mods := map[string]bool{}
+	for _, w := range with {
+		w = strings.TrimSpace(w)
+		if !slices.Contains(guestModules, w) {
+			return nil, fmt.Errorf("--with %q: the modules are %s", w, strings.Join(guestModules, ", "))
+		}
+		mods[w] = true
+	}
+	if mods["desktop"] {
+		mods["nvidia"] = true
+	}
+	return mods, nil
+}
+
+// writeGuest points guest/flake.nix at base and adds the chosen modules; with
+// desktop, guest.nix gets the session's user.
+func writeGuest(dir, base string, mods map[string]bool) error {
+	gf := filepath.Join(dir, "guest", "flake.nix")
+	b, err := os.ReadFile(gf)
+	if err != nil {
+		return err
+	}
+	flake, ok := retargetRigInput(string(b), base)
+	if !ok {
+		return fmt.Errorf("no inputs.rig.url line in %s to point at the base", gf)
+	}
+	if flake, ok = addModules(flake, mods); !ok {
+		return fmt.Errorf("no mkGuest line in %s to add modules to", gf)
+	}
+	if err := os.WriteFile(gf, []byte(flake), 0o644); err != nil {
+		return err
+	}
+	if !mods["desktop"] {
+		return nil
+	}
+	gn := filepath.Join(dir, "guest", "guest.nix")
+	b, err = os.ReadFile(gn)
+	if err != nil {
+		return err
+	}
+	user := os.Getenv("USER")
+	if user == "" || user == "root" {
+		user = "me"
+	}
+	text := strings.Replace(string(b), `  # rig.desktop.user = "me";`, `  rig.desktop.user = "`+user+`";`, 1)
+	return os.WriteFile(gn, []byte(text), 0o644)
+}
+
+const mkGuestLine = "rig.lib.mkGuest [ ./guest.nix ]"
+
+// addModules puts the chosen modules into the template's mkGuest list.
+// desktop already imports nvidia, so it is not listed twice.
+func addModules(flake string, mods map[string]bool) (string, bool) {
+	if !strings.Contains(flake, mkGuestLine) {
+		return flake, false
+	}
+	var list []string
+	for _, m := range guestModules {
+		if mods[m] && !(m == "nvidia" && mods["desktop"]) {
+			list = append(list, "rig.nixosModules."+m)
+		}
+	}
+	list = append(list, "./guest.nix")
+	return strings.Replace(flake, mkGuestLine, "rig.lib.mkGuest [ "+strings.Join(list, " ")+" ]", 1), true
+}
+
+func moduleNote(mods map[string]bool) string {
+	var on []string
+	for _, m := range guestModules {
+		if mods[m] {
+			on = append(on, m)
+		}
+	}
+	if len(on) == 0 {
+		return ""
+	}
+	return ", with " + strings.Join(on, ", ")
+}
+
+// grantCard un-comments the template's gpu device and gives it to the VM.
+func grantCard(text string) string {
+	lines := strings.Split(text, "\n")
+	in := false
+	for i, l := range lines {
+		switch {
+		case l == "    # gpu:":
+			in = true
+		case in && !strings.HasPrefix(l, "    #   "):
+			in = false
+		}
+		if in {
+			lines[i] = "    " + strings.TrimPrefix(l, "    # ")
+		}
+	}
+	return uncommentLine(strings.Join(lines, "\n"), "devices: [gpu]")
+}
+
+// uncommentLine turns the template's "  # <prefix>..." into "  <prefix>...".
+func uncommentLine(text, prefix string) string {
+	return strings.Replace(text, "  # "+prefix, "  "+prefix, 1)
+}
+
+var flakeLineRE = regexp.MustCompile(`(?m)^  flake: .*$`)
+
+// useImage replaces the template's flake: line with image: alias.
+func useImage(text, alias string) string {
+	return flakeLineRE.ReplaceAllString(text, "  image: "+alias)
 }
 
 // projectName is the instance name a directory suggests: its basename, with
@@ -121,6 +263,13 @@ func projectName(dir string) string {
 	return name
 }
 
+// The card rig.yaml shows when this host has none to show: made up, so
+// nobody's hardware is in a file rig writes.
+const (
+	examplePCI = "0000:2b:00.0"
+	exampleID  = "10de:abcd"
+)
+
 // fillManifest replaces the template's placeholders. A card whose identity
 // could not be read gets no id line: the field is optional for a gpu, and a
 // made-up one would only fail the first start.
@@ -130,7 +279,7 @@ func fillManifest(text, name, pci, id string) string {
 	if id == "" {
 		var keep []string
 		for _, line := range strings.Split(text, "\n") {
-			if strings.TrimSpace(line) != "id: GPU_ID" {
+			if !strings.Contains(line, "GPU_ID") {
 				keep = append(keep, line)
 			}
 		}

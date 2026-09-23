@@ -3,3 +3,8 @@
 
 # Per-user Claude Code permissions; the shared allowlist is settings.json.
 /.claude/settings.local.json
+
+# Guest flakes in this checkout lock against base/, which changes with every
+# edit to it; a committed lock would be stale by the next commit.
+/project-template/guest/flake.lock
+/examples/*/guest/flake.lock

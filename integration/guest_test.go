@@ -20,7 +20,7 @@ import (
 // packages behind it, because the logic under test — what `rig agent start`
 // writes, what `rig push` refuses, what `rig forward` tears down — lives in
 // the commands and is only honest end to end. None of it needs the card, so
-// the VM is made --no-gpu and the card stays where it was.
+// the VM is made without --gpu and the card stays where it was.
 
 // rigBin is the binary `make` left in the repo root. The Makefile builds it
 // before this suite runs; a stale one would test yesterday's rig.
@@ -92,7 +92,7 @@ func TestGuestVerbs(t *testing.T) {
 
 	teardown(t, name)
 	t.Cleanup(func() { teardown(t, name) })
-	mustRig(t, "new", name, "--no-gpu", "--cpus", "2", "--memory", "4GiB", "--env", envFile)
+	mustRig(t, "new", name, "--cpus", "2", "--memory", "4GiB", "--env", envFile)
 	mustRig(t, "start", name)
 
 	t.Run("agent start refuses a guest with no agent binary", func(t *testing.T) {

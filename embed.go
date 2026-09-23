@@ -14,18 +14,15 @@ import (
 )
 
 // assets holds base/ and project-template/. The patterns are explicit rather
-// than `all:` so a build product left in a checkout — project-template's
-// compiled vectoradd, a nix `result` link — can never be embedded by accident.
+// than `all:` so a build product left in a checkout, a nix `result` link, can
+// never be embedded by accident.
 // A test holds this list to what git tracks.
 //
-//go:embed base/flake.nix base/flake.lock base/gpu-dev.nix base/desktop.nix
+//go:embed base/flake.nix base/flake.lock base/base.nix base/nvidia.nix
+//go:embed base/docker.nix base/desktop.nix
 //go:embed base/rig-input/main.go
-//go:embed project-template/flake.nix project-template/flake.lock
-//go:embed project-template/Makefile project-template/README.md
-//go:embed project-template/run-agent project-template/vectoradd.cu
 //go:embed project-template/.gitignore project-template/rig.yaml
-//go:embed project-template/guest/flake.nix project-template/guest/flake.lock
-//go:embed project-template/guest/guest.nix
+//go:embed project-template/guest/flake.nix project-template/guest/guest.nix
 var assets embed.FS
 
 // Base is the base image definition, rooted at its flake.
