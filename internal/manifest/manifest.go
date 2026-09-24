@@ -55,8 +55,8 @@ type Host struct {
 // one at a time and the host loses it meanwhile; usb attaches one USB device
 // by identity, and the host keeps its controller.
 type Device struct {
-	// gpu: an NVIDIA card (the guest needs rig.nixosModules.nvidia). pci: any
-	// PCI function, such as a USB controller. usb: one USB device, by id.
+	// `gpu`: an NVIDIA card (the guest needs rig.nixosModules.nvidia). `pci`: any
+	// PCI function, such as a USB controller. `usb`: one USB device, by id.
 	Kind string `yaml:"kind" jsonschema:"required,enum=gpu,enum=pci,enum=usb"`
 	// The PCI address, from lspci -D, for gpu and pci. It must be alone in its
 	// IOMMU group.

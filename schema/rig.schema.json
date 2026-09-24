@@ -91,7 +91,7 @@
             "pci",
             "usb"
           ],
-          "description": "gpu: an NVIDIA card (the guest needs rig.nixosModules.nvidia). pci: any PCI function, such as a USB controller. usb: one USB device, by id."
+          "description": "`gpu`: an NVIDIA card (the guest needs rig.nixosModules.nvidia). `pci`: any PCI function, such as a USB controller. `usb`: one USB device, by id."
         },
         "pci": {
           "type": "string",

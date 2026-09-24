@@ -113,7 +113,7 @@ rig delete -f rig.yaml           # remove it; its volumes stay unless --volumes
 <!-- fields: generated from internal/manifest by `make generate` -->
 | Field | |
 |---|---|
-| `host.devices.<name>.kind` | gpu: an NVIDIA card (the guest needs rig.nixosModules.nvidia). pci: any PCI function, such as a USB controller. usb: one USB device, by id. |
+| `host.devices.<name>.kind` | `gpu`: an NVIDIA card (the guest needs rig.nixosModules.nvidia). `pci`: any PCI function, such as a USB controller. `usb`: one USB device, by id. |
 | `host.devices.<name>.pci` | The PCI address, from lspci -D, for gpu and pci. It must be alone in its IOMMU group. |
 | `host.devices.<name>.id` | For usb, vendor:product from lsusb. For gpu and pci, vendor:device from lspci -nn: what must be at the address, since a BIOS change can renumber the bus. Required for pci. |
 | `host.devices.<name>.return` | How the host takes a gpu or pci device back after rig stop. Without it, the device stays on vfio-pci, which suits hardware the host never uses. |
