@@ -50,6 +50,30 @@ This creates the `vm-isolate` ACL and the `rig` profile (the NIC and root disk
 of `default`, with the ACL on the NIC). rig's VMs use that profile; nothing
 else on the host is touched.
 
+**NixOS hosts: DHCP needs one firewall rule.** The ACL makes the kernel run
+conntrack at the bridge layer. For a broadcast frame the bridge conntrack
+drops its entry again (it cannot confirm cloned skbs), so a guest's DHCP
+DISCOVER reaches the host firewall with no state; NixOS's nftables firewall
+treats stateless packets as invalid and drops them before dnsmasq sees them.
+The guest then boots with a link-local address and `rig start` reports "no
+IPv4 address". A VM without the ACL gets a lease, which is the tell. Mark DHCP
+requests as untracked before conntrack runs:
+
+```nix
+networking.nftables.tables.rig-dhcp = {
+  family = "bridge";
+  content = ''
+    chain pre {
+      type filter hook prerouting priority -300; policy accept;
+      udp dport 67 notrack
+    }
+  '';
+};
+```
+
+Unicast traffic keeps its state, so this changes nothing else. Ubuntu's
+default firewall does not filter by conntrack state and has no such problem.
+
 ## 4. The guest image
 
 ```bash
