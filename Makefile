@@ -25,6 +25,11 @@ generate: FORCE
 test-integration: rig FORCE
 	go test -tags integration ./integration/ -v -timeout 40m
 
+# rig's witmproxy plugin. Its signed component is committed under
+# internal/proxy/plugin, so this is only for changing the plugin.
+plugin: FORCE
+	$(MAKE) -C plugin
+
 # Onto PATH, for use from any directory: no verb assumes it runs from this
 # checkout, and the only thing tying a command to it is a path you type.
 install: FORCE
@@ -34,4 +39,4 @@ clean: FORCE
 	rm -f $(BINS)
 
 FORCE:
-.PHONY: all test generate test-integration install clean FORCE
+.PHONY: all test generate test-integration plugin install clean FORCE

@@ -130,10 +130,31 @@
           },
           "then": {
             "not": {
-              "required": [
-                "ports"
+              "anyOf": [
+                {
+                  "required": [
+                    "ports"
+                  ]
+                },
+                {
+                  "required": [
+                    "proxy"
+                  ]
+                }
               ]
             }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "proxy"
+            ]
+          },
+          "then": {
+            "required": [
+              "env_file"
+            ]
           }
         }
       ],
@@ -214,6 +235,17 @@
             "host"
           ],
           "description": "host: lend this host's keyboard and mouse to the guest as events from start to stop, toggled with both Ctrl keys. The guest needs rig.nixosModules.desktop."
+        },
+        "agent": {
+          "type": "string",
+          "enum": [
+            "claude-code"
+          ],
+          "description": "Which coding agent `rig agent` runs in this guest: claude-code, the default when left out. The harness decides the binary, how it is installed and launched, and which credentials it authenticates with."
+        },
+        "proxy": {
+          "$ref": "#/$defs/Proxy",
+          "description": "The host's proxy (witmproxy), which this guest reaches over a second NIC that leads nowhere else. Its one job so far is credentials the guest never holds: see proxy.credentials. Set up once per host with `rig proxy setup`."
         }
       },
       "additionalProperties": false,
@@ -317,6 +349,35 @@
       ],
       "description": "Port is one published port, in Compose's terms: Published is the host side, Target the guest side, each a port or an inclusive range \"a-b\"."
     },
+    "Proxy": {
+      "properties": {
+        "credentials": {
+          "additionalProperties": {
+            "items": {
+              "type": "string",
+              "pattern": "^(?:([A-Z]+(?:,[A-Z]+)*) )?((?:\\*\\.)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)(/[^\\s?#]*)?$"
+            },
+            "type": "array",
+            "minItems": 1
+          },
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "type": "object",
+          "description": "Variables from env_file whose values the guest never sees, each with the endpoints the value may be sent to. The guest gets a stand-in; the proxy puts the real value into HTTPS requests to those endpoints, and nowhere else, wherever the stand-in occurs in a header or the URL. An endpoint is \"[METHOD[,METHOD] ]host[/path]\": the host alone is every request to it; a path covers itself and everything below it; *.host covers the host and its subdomains. A guest that leaks everything it has leaks a string that works only through this proxy, only there: ANTHROPIC_API_KEY: [POST api.anthropic.com/v1/messages]"
+        },
+        "egress": {
+          "type": "string",
+          "enum": [
+            "internet"
+          ],
+          "description": "What else the guest may reach through the proxy. Left out, nothing: the proxy dials the credentials' hosts and refuses the rest. internet: everything the isolated NIC may reach, with this host and the LAN still refused, judged on the address after resolution. For the tools under the agent, which inherit its HTTPS_PROXY: cargo, git, nix and npm reach their registries through the proxy or not at all."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "Proxy is guest.proxy: what the host's proxy does for this guest."
+    },
     "Return": {
       "properties": {
         "modules": {
@@ -329,7 +390,7 @@
         },
         "reset": {
           "type": "boolean",
-          "description": "Reset the device before the host driver binds it. A card handed back from a guest may not initialise without it."
+          "description": "Reset the device before the host driver binds it. A card handed back from a guest may not initialise without it. rig start moves the device onto vfio-pci before the VM starts, so its stop leaves it there for the reset; both steps run under sudo."
         },
         "alive": {
           "not": {

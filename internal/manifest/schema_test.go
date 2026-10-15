@@ -74,11 +74,12 @@ func TestGeneratedFilesAreCurrent(t *testing.T) {
 // string. Everything else validate() refuses, the schema must refuse too, so
 // an editor flags it before rig does.
 var schemaCannotSay = map[string]bool{
-	"wanted device not declared": true,
-	"duplicate pci":              true,
-	"unequal ranges":             true,
-	"port out of range":          true,
-	"wildcard host ip":           true,
+	"wanted device not declared":        true,
+	"duplicate pci":                     true,
+	"unequal ranges":                    true,
+	"port out of range":                 true,
+	"wildcard host ip":                  true,
+	"proxy egress without a credential": true,
 }
 
 func TestSchemaAgreesWithValidate(t *testing.T) {

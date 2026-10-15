@@ -1,0 +1,24 @@
+[package]
+name = "rig-witmproxy-plugin"
+version = "0.2.0"
+edition = "2024"
+authors = ["Theodore Brockman"]
+description = "rig's witmproxy plugin: puts a guest's real credentials into requests to the endpoints its manifest grants, in place of the stand-ins the guest holds"
+license = "AGPL-3.0-only"
+repository = "https://github.com/tbrockman/rig"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wit-bindgen = { version = "0.61.1", features = ["async-spawn"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[package.metadata.component]
+package = "joinezco:rig"
+
+[profile.release]
+opt-level = "s"
+lto = true

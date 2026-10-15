@@ -67,13 +67,17 @@ func Validate(file string) error {
 
 // Count returns how many variables the file defines.
 func Count(file string) int {
-	f, err := os.Open(file)
+	content, err := os.ReadFile(file)
 	if err != nil {
 		return 0
 	}
-	defer f.Close()
+	return CountIn(content)
+}
+
+// CountIn returns how many variables env file content defines.
+func CountIn(content []byte) int {
 	n := 0
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(strings.NewReader(string(content)))
 	for scanner.Scan() {
 		if assignment.MatchString(strings.TrimSpace(scanner.Text())) {
 			n++
@@ -82,20 +86,33 @@ func Count(file string) int {
 	return n
 }
 
-// Inject pushes the file into the guest at GuestPath, root-owned and 0600.
-func Inject(c *incus.Client, instance, file string) (int, error) {
+// Prepare validates the file and returns its content, for a caller that
+// changes what the guest gets before writing it (internal/proxy swaps the
+// values the guest must never hold for stand-ins).
+func Prepare(file string) ([]byte, error) {
 	if err := Validate(file); err != nil {
-		return 0, err
+		return nil, err
 	}
-	content, err := os.ReadFile(file)
-	if err != nil {
-		return 0, err
-	}
+	return os.ReadFile(file)
+}
+
+// Write puts env file content into the guest at GuestPath, root-owned and
+// 0600, and returns how many variables it defines.
+func Write(c *incus.Client, instance string, content []byte) (int, error) {
 	if err := c.Mkdir(instance, path.Dir(GuestPath), 0o700); err != nil {
 		return 0, err
 	}
 	if err := c.WriteFile(instance, GuestPath, content, 0o600); err != nil {
 		return 0, err
 	}
-	return Count(file), nil
+	return CountIn(content), nil
+}
+
+// Inject pushes the file into the guest at GuestPath, as it is.
+func Inject(c *incus.Client, instance, file string) (int, error) {
+	content, err := Prepare(file)
+	if err != nil {
+		return 0, err
+	}
+	return Write(c, instance, content)
 }

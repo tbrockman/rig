@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tbrockman/rig/internal/incus"
 	"github.com/tbrockman/rig/internal/manifest"
@@ -202,5 +203,36 @@ func TestCheckIdentityWithoutADeclaredID(t *testing.T) {
 	}
 	if err := CheckIdentity(Decl{Name: "mouse", Kind: manifest.KindUSB, ID: "1234:5678"}); err != nil {
 		t.Errorf("a usb device is found by identity already: %v", err)
+	}
+}
+
+// The user's rig and the root handback watcher share the lock, so it has to
+// open whoever created it. flock needs only a read-only descriptor.
+func TestFileLockTakesALockItCannotWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rig.lock")
+	if err := os.WriteFile(path, nil, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := FileLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := make(chan struct{})
+	go func() {
+		if u, err := FileLock(path); err == nil {
+			close(second)
+			u()
+		}
+	}()
+	select {
+	case <-second:
+		t.Fatal("a second holder got the lock while the first held it")
+	case <-time.After(200 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case <-second:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second holder never got the lock")
 	}
 }

@@ -222,6 +222,11 @@ func (r *Runner) Run() (*Report, error) {
 	}
 	r.guestChecks()
 
+	if ip := policy.ProxyIPOf(inst); ip != "" {
+		r.logf("\n--- the proxy NIC: the host proxy, and nothing else ---")
+		r.proxyChecks(ip)
+	}
+
 	r.logf("\n--- bypass ---")
 	r.bypassChecks()
 
@@ -430,6 +435,19 @@ func (r *Runner) guestChecks() {
 	// string forces a real fetch, because that URL has never been seen before.
 	r.guestAssert("nix fetches from the cache",
 		`nix store prefetch-file --json "https://cache.nixos.org/nix-cache-info?rigverify=$RANDOM$RANDOM" >/dev/null`)
+}
+
+// proxyChecks prove the second NIC is what rig made it: the address rig
+// pinned, no route through it, and the host's other services out of reach on
+// the bridge address even though sshd listens on every address. Whether the
+// proxy itself answers is `rig doctor`'s question, not isolation's.
+func (r *Runner) proxyChecks(ip string) {
+	r.guestAssert("proxy NIC has the address rig pinned",
+		fmt.Sprintf("ip -4 -o addr show dev %s | grep -q 'inet %s/'", policy.ProxyGuestNIC, ip))
+	r.guestAssert("proxy NIC carries no default route",
+		fmt.Sprintf("! ip -4 route show default | grep -q 'dev %s'", policy.ProxyGuestNIC))
+	r.guestAssert("host tcp/22 unreachable on the bridge address",
+		fmt.Sprintf("! timeout 5 bash -c 'exec 3<>/dev/tcp/%s/22' 2>/dev/null", policy.ProxyAddr))
 }
 
 func (r *Runner) bypassChecks() {

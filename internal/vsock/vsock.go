@@ -81,3 +81,17 @@ func (l *Listener) Accept() (*os.File, error) {
 }
 
 func (l *Listener) Close() error { return unix.Close(l.fd) }
+
+// PeerCID is the context ID of the guest on the other end of an accepted
+// connection: which VM is talking, for a listener every VM can reach.
+func PeerCID(conn *os.File) (uint32, error) {
+	sa, err := unix.Getpeername(int(conn.Fd()))
+	if err != nil {
+		return 0, err
+	}
+	vm, ok := sa.(*unix.SockaddrVM)
+	if !ok {
+		return 0, fmt.Errorf("not a vsock peer: %T", sa)
+	}
+	return vm.CID, nil
+}

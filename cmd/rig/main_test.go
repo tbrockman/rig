@@ -7,14 +7,18 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/tbrockman/rig/internal/agent"
 	"github.com/tbrockman/rig/internal/creds"
 	"github.com/tbrockman/rig/internal/devices"
 	"github.com/tbrockman/rig/internal/hostdev"
 	"github.com/tbrockman/rig/internal/incus"
 	"github.com/tbrockman/rig/internal/manifest"
+	"github.com/tbrockman/rig/internal/policy"
+	"github.com/tbrockman/rig/internal/proxy"
 )
 
 func envFileAt(t *testing.T, content string, mode os.FileMode) string {
@@ -318,6 +322,14 @@ guest:
 	if want[portsKey] != `["47989:47989/tcp","47998-48000:47998-48000/udp"]` {
 		t.Errorf("ports recorded as %s", want[portsKey])
 	}
+	// No proxy asked for records as nothing, present, so adding one later
+	// reads as drift and removing it again too.
+	if v, ok := want[proxy.InstanceKey]; !ok || v != "" {
+		t.Errorf("proxy record = %q, %v; want present and empty", v, ok)
+	}
+	if v, ok := want[agent.HarnessKey]; !ok || v != "" {
+		t.Errorf("harness record = %q, %v; want present and empty (the default)", v, ok)
+	}
 
 	// Change one thing in the file: exactly that key drifts, and the path the
 	// file records for itself never counts.
@@ -327,6 +339,41 @@ guest:
 	drift := configDrift(inst, changed)
 	if len(drift) != 1 || !strings.HasPrefix(drift[0], "limits.cpu: 4 -> 8") {
 		t.Errorf("drift = %v, want only limits.cpu", drift)
+	}
+}
+
+// A manifest's proxied credentials are recorded canonically, so the same
+// file never drifts from itself, and a change to them is one drift line.
+func TestDesiredRecordsProxiedCredentials(t *testing.T) {
+	env := envFileAt(t, "ANTHROPIC_API_KEY=sk-ant-real\n", 0o600)
+	m, err := manifest.Parse([]byte(`
+guest:
+  name: agent
+  image: rig-base
+  env_file: ` + env + `
+  proxy:
+    credentials:
+      ANTHROPIC_API_KEY: [api.anthropic.com]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := desired(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want[proxy.InstanceKey] != `{"ANTHROPIC_API_KEY":["api.anthropic.com"]}` {
+		t.Errorf("recorded %q", want[proxy.InstanceKey])
+	}
+	inst := &incus.Instance{Name: "agent", Config: want}
+	if drift := configDrift(inst, want); len(drift) != 0 {
+		t.Fatalf("drifts from itself: %v", drift)
+	}
+	m.Guest.Proxy.Credentials["ANTHROPIC_API_KEY"] = append(m.Guest.Proxy.Credentials["ANTHROPIC_API_KEY"], "console.anthropic.com")
+	changed, _ := desired(m)
+	drift := configDrift(inst, changed)
+	if len(drift) != 1 || !strings.HasPrefix(drift[0], proxy.InstanceKey+":") {
+		t.Errorf("drift = %v, want only the proxy record", drift)
 	}
 }
 
@@ -345,6 +392,64 @@ func TestReturnArgsCarryTheWholeRecipe(t *testing.T) {
 	}
 	if got := strings.Join(freeArgs(full), " "); got != "host free --pci=0000:2b:00.0 --unit=gdm --modules=nvidia_drm,nvidia" {
 		t.Errorf("free args = %q", got)
+	}
+}
+
+// What --kill-holders hands to sudo must parse back as the same node and
+// every PID, or the root half ends fewer processes than it was asked to.
+func TestKillArgsRoundTripThroughTheRootVerb(t *testing.T) {
+	args := killArgs("/dev/nvidia0", []int{4242, 4343})
+	if got := strings.Join(args, " "); got != "host kill --node=/dev/nvidia0 --pid=4242 --pid=4343" {
+		t.Errorf("kill args = %q", got)
+	}
+	host := (&app{}).hostCmd()
+	kill, rest, err := host.Find(args[1:])
+	if err != nil || kill.Name() != "kill" {
+		t.Fatalf("no kill verb under host: %v", err)
+	}
+	if err := kill.ParseFlags(rest); err != nil {
+		t.Fatal(err)
+	}
+	node, _ := kill.Flags().GetString("node")
+	pids, _ := kill.Flags().GetIntSlice("pid")
+	if node != "/dev/nvidia0" || len(pids) != 2 || pids[0] != 4242 || pids[1] != 4343 {
+		t.Errorf("parsed back as node %q, pids %v", node, pids)
+	}
+}
+
+// The park rig start hands to sudo must parse back as the same device, and
+// carry --kill-holders only when the start was asked to end holders.
+func TestParkArgsRoundTripThroughTheRootVerb(t *testing.T) {
+	if got := strings.Join(parkArgs("0000:2b:00.0", false), " "); got != "host park --pci=0000:2b:00.0" {
+		t.Errorf("park args = %q", got)
+	}
+	args := parkArgs("0000:2b:00.0", true)
+	host := (&app{}).hostCmd()
+	park, rest, err := host.Find(args[1:])
+	if err != nil || park.Name() != "park" {
+		t.Fatalf("no park verb under host: %v", err)
+	}
+	if err := park.ParseFlags(rest); err != nil {
+		t.Fatal(err)
+	}
+	pci, _ := park.Flags().GetString("pci")
+	kill, _ := park.Flags().GetBool("kill-holders")
+	if pci != "0000:2b:00.0" || !kill {
+		t.Errorf("parsed back as pci %q, kill-holders %v", pci, kill)
+	}
+}
+
+// Only a device whose recipe resets it is parked: one without a recipe
+// stays wherever Incus leaves it, one whose recipe skips the reset keeps
+// Incus's own rebind, and a USB device is never unbound from anything.
+func TestParkClaimedParksOnlyWhatResets(t *testing.T) {
+	claimed := []devices.Decl{
+		{Name: "bare", Kind: "pci", PCI: "0000:3c:00.3"},
+		{Name: "noreset", Kind: "pci", PCI: "0000:3c:00.4", Return: &devices.Return{Alive: "usb*"}},
+		{Name: "key", Kind: "usb", ID: "1234:5678", Return: &devices.Return{Reset: true}},
+	}
+	if err := parkClaimed(false)(claimed); err != nil {
+		t.Errorf("nothing here resets, yet: %v", err)
 	}
 }
 
@@ -412,7 +517,7 @@ func TestNetworkPlanMasksInheritedNICsAndLiftsOnlyThoseMasks(t *testing.T) {
 			"root": {"type": "disk"},
 		},
 	}
-	devices, changes := networkPlan(withNIC, profileNICs, true)
+	devices, changes := networkPlan(withNIC, profileNICs, true, nil)
 	if devices["eth0"].Type() != "none" {
 		t.Errorf("the profile's eth0 must be masked, got %v", devices["eth0"])
 	}
@@ -431,10 +536,10 @@ func TestNetworkPlanMasksInheritedNICsAndLiftsOnlyThoseMasks(t *testing.T) {
 		},
 		ExpandedDevices: map[string]incus.Device{"eth0": {"type": "none"}, "other": {"type": "none"}},
 	}
-	if _, changes := networkPlan(masked, profileNICs, true); len(changes) != 0 {
+	if _, changes := networkPlan(masked, profileNICs, true, nil); len(changes) != 0 {
 		t.Errorf("already without a NIC: want no changes, got %v", changes)
 	}
-	devices, changes = networkPlan(masked, profileNICs, false)
+	devices, changes = networkPlan(masked, profileNICs, false, nil)
 	if _, ok := devices["eth0"]; ok || len(changes) != 1 {
 		t.Errorf("the mask over the profile's eth0 must be lifted: devices=%v changes=%v", devices, changes)
 	}
@@ -583,5 +688,145 @@ func TestPointAtSchemaRewritesOnlyTheComment(t *testing.T) {
 	}
 	if strings.SplitN(got, "\n", 2)[1] != strings.SplitN(string(tmpl), "\n", 2)[1] {
 		t.Error("more than the comment changed")
+	}
+}
+
+// holdingFull starts a process with /dev/full open, standing in for one that
+// holds a card, and waits for its exec so it holds the node when it is looked at.
+func holdingFull(t *testing.T) (pid int, done <-chan error) {
+	t.Helper()
+	f, err := os.Open("/dev/full")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	cmd := exec.Command("sleep", "60")
+	cmd.Stdin = f
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ch := make(chan error, 1)
+	go func() { ch <- cmd.Wait() }()
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	for deadline := time.Now().Add(5 * time.Second); hostdev.Describe(cmd.Process.Pid).Args == ""; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the holder never started")
+		}
+	}
+	return cmd.Process.Pid, ch
+}
+
+func inUse(pid int) error {
+	return fmt.Errorf("operation failed: Failed to start device \"gpu\": Cannot use device \"/dev/full\", "+
+		"1 processes are still attached to it:\n\t%d", pid)
+}
+
+func running(done <-chan error) bool {
+	select {
+	case <-done:
+		return false
+	case <-time.After(200 * time.Millisecond):
+		return true
+	}
+}
+
+// Incus refuses a start while a host process holds the card and names PIDs
+// alone. Without --kill-holders nothing is ended, and the refusal says what
+// holds the card and how to go on.
+func TestStartPastHoldersNamesThemAndEndsNothingUnasked(t *testing.T) {
+	pid, done := holdingFull(t)
+	calls := 0
+	err := startPastHolders("daw", false, func() error { calls++; return inUse(pid) })
+	if err == nil || calls != 1 {
+		t.Fatalf("calls %d, err %v", calls, err)
+	}
+	for _, want := range []string{"daw was not started", fmt.Sprintf("sleep 60 (pid %d", pid), "rig start --kill-holders daw"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal lacks %q:\n%v", want, err)
+		}
+	}
+	if !running(done) {
+		t.Error("the holder was ended without --kill-holders")
+	}
+}
+
+// With --kill-holders the holders are ended and the start tried again.
+func TestStartPastHoldersEndsThemAndStarts(t *testing.T) {
+	pid, done := holdingFull(t)
+	calls := 0
+	err := startPastHolders("daw", true, func() error {
+		if calls++; calls == 1 {
+			return inUse(pid)
+		}
+		return nil
+	})
+	if err != nil || calls != 2 {
+		t.Fatalf("calls %d, err %v", calls, err)
+	}
+	if running(done) {
+		t.Error("the holder is still running")
+	}
+}
+
+// A holder that is back after being ended is something restarting it, and
+// ending the new one would only race that, with a blocked unbind for losing.
+// So it is named and left alone.
+func TestStartPastHoldersStopsWhenTheyComeBack(t *testing.T) {
+	first, _ := holdingFull(t)
+	second, secondDone := holdingFull(t)
+	calls := 0
+	err := startPastHolders("daw", true, func() error {
+		if calls++; calls == 1 {
+			return inUse(first)
+		}
+		return inUse(second)
+	})
+	if err == nil || calls != 2 || !strings.Contains(err.Error(), "held again") {
+		t.Fatalf("calls %d, err %v", calls, err)
+	}
+	if !running(secondDone) {
+		t.Error("the replacement was ended too")
+	}
+}
+
+// The proxy NIC comes and goes with the manifest's proxy: added at the
+// address rig picked, put back to rig's settings when changed by hand, and
+// removed when the manifest stops proxying; a network: none VM loses it with
+// the rest.
+func TestNetworkPlanAddsAndRemovesTheProxyNIC(t *testing.T) {
+	profileNICs := map[string]bool{"eth0": true}
+	bare := &incus.Instance{Name: "agent", Devices: map[string]incus.Device{},
+		ExpandedDevices: map[string]incus.Device{"eth0": {"type": "nic", "network": "incusbr0"}}}
+	want := policy.ProxyNIC("agent", "10.207.0.5")
+	devices, changes := networkPlan(bare, profileNICs, false, want)
+	if d := devices[policy.ProxyDevice]; d["ipv4.address"] != "10.207.0.5" || d["security.acls"] != policy.ProxyACLName("agent") || d["security.ipv4_filtering"] != "true" {
+		t.Errorf("proxy NIC = %v", d)
+	}
+	if len(changes) != 1 || !strings.Contains(changes[0], "10.207.0.5") {
+		t.Errorf("changes = %v", changes)
+	}
+
+	loosened := policy.ProxyNIC("agent", "10.207.0.5")
+	loosened["security.ipv4_filtering"] = "false"
+	tampered := &incus.Instance{Name: "agent", Devices: map[string]incus.Device{policy.ProxyDevice: loosened},
+		ExpandedDevices: map[string]incus.Device{"eth0": {"type": "nic"}, policy.ProxyDevice: loosened}}
+	devices, changes = networkPlan(tampered, profileNICs, false, want)
+	if devices[policy.ProxyDevice]["security.ipv4_filtering"] != "true" || len(changes) != 1 {
+		t.Errorf("a loosened NIC was not put back: %v %v", devices[policy.ProxyDevice], changes)
+	}
+	if _, changes := networkPlan(tampered, profileNICs, false, loosened); len(changes) != 0 {
+		t.Errorf("the same NIC again is a change: %v", changes)
+	}
+
+	devices, changes = networkPlan(tampered, profileNICs, false, nil)
+	if _, ok := devices[policy.ProxyDevice]; ok || len(changes) != 1 {
+		t.Errorf("not proxied any more, yet: %v %v", devices, changes)
+	}
+	devices, _ = networkPlan(tampered, profileNICs, true, nil)
+	if _, ok := devices[policy.ProxyDevice]; ok {
+		t.Error("network: none kept the proxy NIC")
+	}
+	if ip := policy.ProxyIPOf(tampered); ip != "10.207.0.5" {
+		t.Errorf("ProxyIPOf = %q", ip)
 	}
 }

@@ -60,7 +60,7 @@ func (a *app) imageBuildCmd() *cobra.Command {
 					// No checkout here — a `go install`ed rig, most likely.
 					// Build the base this binary carries, and say so: the
 					// operator should know which definition became the image.
-					dir, err := materializeBase()
+					dir, err := baseCacheDir()
 					if err != nil {
 						return err
 					}
@@ -83,6 +83,14 @@ func (a *app) imageBuildCmd() *cobra.Command {
 // and points alias at it. Shared by `rig image build` and a manifest's
 // `flake:`, so the two cannot drift apart in what they stamp on an image.
 func (a *app) buildImage(flake string, named bool, attr, alias string, keepPrevious bool) error {
+	// A development build's project flakes take their base from the copy
+	// under the cache directory (rig init). It is derived from this binary
+	// and nothing else, so it is rewritten before every build: a `make` at
+	// the same commit keeps the same cache key, and a project built against
+	// the copy an older binary left there would get that binary's base.
+	if _, err := materializeBase(); err != nil {
+		return err
+	}
 	ref, err := flakeRef(flake, named)
 	if err != nil {
 		return err

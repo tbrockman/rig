@@ -23,7 +23,20 @@
     # project's: a rig verb that fails on a fresh guest until someone installs
     # a package by hand is the provisioning-by-memory this image exists to end.
     socat
+    # `rig doctor` proves a proxied credential's host is reached through the
+    # proxy by asking curl whose certificate it saw.
+    curl
   ];
+
+  # The proxy NIC, for a manifest that proxies credentials (guest.proxy). rig
+  # gives it a MAC of its own, so it is proxy0 whichever slot it lands in,
+  # and rig sets its address at each start: the host pins that address to
+  # the NIC, so there is nothing to negotiate, and DHCP on it would only add
+  # a route to a bridge that leads to the host proxy and nowhere else.
+  services.udev.extraRules = ''
+    SUBSYSTEM=="net", ACTION=="add", ATTR{address}=="02:52:49:47:*", NAME="proxy0"
+  '';
+  networking.dhcpcd.denyInterfaces = [ "proxy0" ];
 
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
   nix.settings.trusted-users = [ "root" "@wheel" ];

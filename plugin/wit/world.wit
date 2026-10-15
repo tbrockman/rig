@@ -1,0 +1,308 @@
+package witmproxy:plugin@0.0.8;
+
+interface capabilities {
+    use wasi:http/types@0.3.0.{request, response};
+    /// The shared capability scope model. `scope.when` gates whether a plugin
+    /// runs for an event; `scope.allow` gates every call on a granted
+    /// resource. `capability-error` is what a resource method returns when the
+    /// capability was never granted or the call fell outside `allow`.
+    use ezco:ezcap/types@0.1.0.{scope, capability-error};
+
+    // TODO:
+    // resource http-client {} <- an HTTP client for making outbound requests
+    // resource key-value-client {} <- a simple key-value store client
+    // resource sql-client {} <- a SQLite/? database client
+    // resource queue-client {} <- a mpsc queue
+    // resource custom {} <- for user-defined capabilities
+
+    /// A dumb and simple logging resource (for writing to stdout/stderr)
+    /// TODO: replace with official wasi-logging when available
+    resource logger {
+        info: async func(message: string) -> result<_, capability-error>;
+        warn: async func(message: string) -> result<_, capability-error>;
+        error: async func(message: string) -> result<_, capability-error>;
+        debug: async func(message: string) -> result<_, capability-error>;
+    }
+
+    /// A resource for annotating/labeling content
+    resource annotator-client {
+        /// Annotate the provided content (extract and store features + metadata)
+        annotate: async func(content: content) -> result<_, capability-error>;
+    }
+
+    /// A resource for storing key-value pairs local to the plugin (sandboxed and inaccessible elsewhere)
+    resource local-storage-client {
+        set: async func(key: string, value: list<u8>) -> result<_, capability-error>;
+        get: async func(key: string) -> result<option<list<u8>>, capability-error>;
+        delete: async func(key: string) -> result<_, capability-error>;
+    }
+
+    /// A resource for accessing the current system time (wasi:clocks)
+    resource clock-client {
+        /// Returns the current time as a Unix timestamp in seconds
+        now-seconds: async func() -> result<u64, capability-error>;
+        /// Returns the current time as a Unix timestamp in milliseconds
+        now-millis: async func() -> result<u64, capability-error>;
+        /// Returns the host's local time zone offset from UTC, in seconds
+        /// (east of UTC is positive). Combine with `now-seconds` to reason
+        /// about the user's local wall-clock time (working hours, day
+        /// boundaries) without shipping a time zone database in the guest.
+        utc-offset-seconds: async func() -> result<s32, capability-error>;
+    }
+
+    /// A capability provider, which only returns capabilities that have been granted by the user
+    resource capability-provider {
+        // http: func() -> option<http-client>;
+        // kv: func() -> option<key-value-client>;
+        // sql: func() -> option<sql-client>;
+        // queue: func() -> option<queue-client>;
+        logger: async func() -> option<logger>;
+        annotator: async func() -> option<annotator-client>;
+        local-storage: async func() -> option<local-storage-client>;
+        clock: async func() -> option<clock-client>;
+    }
+
+    /// How a granted capability may be used, as CEL (see `ezco:ezcap/types.scope`).
+    ///
+    /// For `handle-event` capabilities `when` is evaluated once per event, with
+    /// the event bound (`request`, `response`, `content`, `connect`, `time`), to
+    /// decide whether the plugin runs at all — the cheap pre-instantiation
+    /// filter. For provider capabilities (logger, annotator, local storage,
+    /// clock) `allow` is evaluated before every call on the resource, with
+    /// `call.method`, `call.args.*` (typed from this interface), `caller.plugin`
+    /// and `state.*` bound; a refused call returns `denied(sentence)`.
+    ///
+    /// ```text
+    /// logger:        allow: "state.calls < 100"
+    /// local-storage: allow: "call.args.key.startsWith('seen/')"
+    /// ```
+    ///
+    /// Scopes are configured by the user and may be narrower than requested; a
+    /// narrowing only ever appends clauses.
+
+    /// The different kinds of events that can be handled by plugins
+    variant event-kind {
+        /// The associated capability determines which connections should be intercepted by the proxy
+        ///
+        /// If you do not request this capability, you are not guaranteed to receive any further
+        /// request/response events related to connections you wish to handle.
+        connect,
+        // The associated capability determines which HTTP requests should be handled by the plugin
+        request,
+        // The associated capability determines which HTTP responses should be handled by the plugin
+        response,
+        // The associated capability determines which inbound content should be handled by the plugin
+        inbound-content,
+        // The associated capability determines which timer events should be handled by the plugin.
+        // Timer events are generated periodically by the host based on CRON expressions in the capability scope.
+        timer,
+    }
+
+    /// The different kinds of capabilities that can be requested by plugins
+    variant capability-kind {
+        /// A capability to handle specific events
+        handle-event(event-kind),
+        /// A capability to log messages
+        logger,
+        /// A capability to annotate content (extract and store features + metadata)
+        annotator,
+        /// A capability to store local key-value pairs
+        local-storage,
+        /// A capability to access the current system time (wasi:clocks)
+        clock,
+    }
+
+    /// A capability requested by the plugin
+    record capability {
+        /// The kind of capability being requested
+        kind: capability-kind,
+        /// The scope in which the capability applies (may be narrowed by the user)
+        scope: scope,
+    }
+
+    type keyed-values = tuple<string, list<string>>;
+    type request-query = keyed-values;
+    type request-header = keyed-values;
+
+    /// The context of an HTTP request (essentially, everything except the body)
+    record request-context {
+        scheme: string,
+        host: string,
+        path: string,
+        query: list<request-query>,
+        method: string,
+        headers: list<request-header>,
+    }
+
+    /// A response along with its associated request context
+    record contextual-response {
+        /// The HTTP response
+        response: response,
+        // TODO: turn request-context into a resource to avoid copying and modifications
+        request: request-context,
+    }
+
+    /// The context of a timer event, generated periodically by the host
+    record timer-context {
+        /// The current Unix timestamp in seconds when the timer fired
+        timestamp: u64,
+    }
+
+    /// The different types of events that can be handled (and returned) by plugins
+    variant event {
+        request(request),
+        response(contextual-response),
+        inbound-content(content),
+        timer(timer-context),
+    }
+
+    /// A work-in-progress resource representing abstract byte stream content
+    /// Primarily exists to hide compression of the underlying body, 
+    /// providing a simple interface for plugins to interact with 
+    /// without having to worry about compression details 
+    /// (which could be wasteful or conflicting in the case of serial plugin execution).
+    /// 
+    /// Still requires handling content encodings (UTF-8, UTF-16, etc) manually.
+    resource content {
+        /// Returns the content type of the content, ex: "text/html; charset=utf-8"
+        content-type: async func() -> string;
+
+        /// Returns the context of the request this content is a response to.
+        ///
+        /// Content is scoped by content type alone at the CEL layer (see
+        /// [CelContent]), which is not enough for a plugin that rewrites
+        /// pages for one site: it needs to know which host and path the
+        /// bytes came from, and to recognise (and leave alone) responses it
+        /// synthesised itself. The `request` variable is also bound in the
+        /// scope expression of `inbound-content` events for the same reason.
+        request-context: async func() -> request-context;
+
+        /// Take the body, consuming this `content` and yielding both the byte
+        /// stream and a fresh, body-less `content` that retains everything
+        /// else (status, headers, encoding).
+        ///
+        /// A stream is readable exactly once, so this MOVES the resource
+        /// rather than leaving a silently-empty one behind: the old handle is
+        /// gone, which makes a double-take unrepresentable instead of
+        /// returning `none` the second time. Mirrors `wasi:http`'s
+        /// `request.consume-body`, which made the same shift away from WASI
+        /// 0.2's dynamically-enforced "call at most once".
+        ///
+        /// Unlike `wasi:http`, the replacement handle comes from the host
+        /// rather than a guest-side constructor, because `content` carries
+        /// response parts the guest has no way to rebuild.
+        ///
+        /// Supply the new body with `set-body`.
+        consume-body: static async func(this: content) -> tuple<stream<u8>, content>;
+
+        /// Replace the body in place, leaving the content otherwise untouched.
+        /// Use this when you are supplying a body without reading the old one.
+        set-body: async func(content: stream<u8>);
+    }
+}
+
+interface witm-plugin {
+    use capabilities.{capability, capability-kind, capability-provider, event};
+
+    /// Why a plugin could not handle an event.
+    ///
+    /// Reporting failure is deliberately NOT a capability: a plugin's only
+    /// channel used to be `logger`, which an operator can decline to grant, so
+    /// a plugin fell silent exactly when it was least trusted. This is data,
+    /// and cannot be withheld.
+    ///
+    /// Shaped as a variant rather than a string so the host can act on the
+    /// cases it can do something about. Following `wasi:http`'s `error-code`,
+    /// the catch-all carries unstructured text that is explicitly not part of
+    /// the contract: match on the variant, never on the message.
+    variant plugin-error {
+        /// The user-supplied configuration was unusable. The host can flag the
+        /// plugin as misconfigured and point the operator at its config form
+        /// rather than failing every request in the same way.
+        invalid-configuration(option<string>),
+        /// A capability the plugin needs was not granted, or was scoped away
+        /// from this event. The host can surface which one to grant.
+        capability-unavailable(capability-kind),
+        /// Anything else. The message is for a human reading logs; do not
+        /// depend on its content.
+        internal-error(option<string>),
+    }
+
+    /// A tag representing a key-value pair of metadata
+    record tag {
+        key: string,
+        value: string,
+    }
+
+    /// Declared configuration lives in the shared package: a manifest's
+    /// `configuration` is a list of `input-schema`, and `plugin.create` takes
+    /// the user's `user-input`s. `input-type.secret` exists for credentials.
+    use ezco:ezcap/forms@0.1.0.{file-input, input-type, actual-input, input-schema, user-input};
+
+    variant configure-error {
+        invalid-inputs(list<user-input>),
+        other(string),
+    }
+
+    /// A manifest describing the plugin, any requested capabilities, and metadata.
+    record plugin-manifest {
+        /// The name of the plugin
+        name: string,
+        /// The plugin author's namespace (use for scoping)
+        namespace: string,
+        /// The publishing plugin author
+        author: string,
+        /// The plugin version
+        version: string,
+        /// A short description of the plugin
+        description: string,
+        /// The plugin license
+        license: string,
+        /// The plugin homepage URL
+        url: string,
+        /// The plugin author's public key (for verifying the plugin)
+        publickey: list<u8>,
+        /// The capabilities requested by the plugin
+        capabilities: list<capability>,
+        /// Additional plugin metadata
+        metadata: list<tag>,
+        /// Configuration options available to the user, declared as [InputSchema]s
+        configuration: list<input-schema>,
+    }
+
+    /// A function called by the host to retrieve the plugins manifest.
+    ///
+    /// Used by the host to fetch (and verify) all necessary information about the plugin,
+    /// including requested capabilities, before instantiating and executing it.
+    ///
+    /// The public key will be used by the host to verify the WASM components signature,
+    /// ensuring the plugin has not been tampered with.
+    ///
+    /// If the manifest is invalid or cannot be verified, the host will not load the plugin.
+    manifest: async func() -> plugin-manifest;
+
+    /// A plugin resource, instantiated per-event with user-supplied configuration.
+    resource plugin {
+        /// Create a new plugin instance with the given configuration.
+        /// Called by the host before each event is handled.
+        create: static async func(config: list<user-input>) -> result<plugin, configure-error>;
+
+        /// Handle an event using this plugin instance.
+        ///
+        /// The capability provider can be used to access additional host capabilities (for example, logging or local storage) within the plugin.
+        /// Because requested capabilities may not necessarily be granted, the plugin is responsible for checking and handling whether a capability they require is available.
+        ///
+        /// The handler may return the event as is, perform modifications, return a new event entirely (so long as the event output is valid given the input),
+        /// or return `None` to abandon any further event processing (likely resulting in an HTTP error from the perspective of the host).
+        ///
+        /// * [Request] events must return either [Request] or [Response] events.
+        /// * [Response] events must return [Response] events.
+        /// * [InboundContent] events must return [InboundContent] events.
+        handle: async func(ev: event, cp: capability-provider) -> result<option<event>, plugin-error>;
+    }
+}
+
+world plugin {
+    import capabilities;
+    export witm-plugin;
+}

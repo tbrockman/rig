@@ -2,6 +2,7 @@ package hostdev
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -262,5 +263,345 @@ func TestBackNeedsAHostDriverAndTheSignOfLife(t *testing.T) {
 	}
 	if _, ok := Back(usb, ""); !ok {
 		t.Fatal("with no sign of life in the recipe, a host driver is enough")
+	}
+}
+
+// holding starts a process with node open as its stdin, the way a program
+// holds a card, and reaps it when it exits so an ended one leaves no zombie
+// holding a PID. script runs under sh when set, else the process is a sleep.
+func holding(t *testing.T, node, script string) (*exec.Cmd, <-chan error) {
+	t.Helper()
+	cmd := exec.Command("sleep", "60")
+	if script != "" {
+		cmd = exec.Command("sh", "-c", script)
+	}
+	if node != "" {
+		f, err := os.Open(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		cmd.Stdin = f
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	return cmd, done
+}
+
+// execed waits until pid is running name with its command line in place, so
+// what a test reads or signals is that program and not the fork before it.
+func execed(t *testing.T, pid int, name string) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if p := Describe(pid); p.Name == name && p.Args != "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d never became %s", pid, name)
+		}
+	}
+}
+
+func exited(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("still running")
+		return nil
+	}
+}
+
+// Only a listed process that holds the node is ended. The list comes from
+// Incus a moment earlier, and anything on it that has let go since, or is a
+// PID reused by something else, must be left alone.
+func TestEndTermsWhatHoldsTheNodeAndSparesTheRest(t *testing.T) {
+	holder, holderDone := holding(t, "/dev/full", "")
+	bystander, bystanderDone := holding(t, "", "")
+	execed(t, holder.Process.Pid, "sleep")
+	execed(t, bystander.Process.Pid, "sleep")
+
+	if err := End("/dev/full", []int{holder.Process.Pid, bystander.Process.Pid}, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := exited(t, holderDone); err == nil || !strings.Contains(err.Error(), "terminated") {
+		t.Errorf("the holder should have ended on SIGTERM, got %v", err)
+	}
+	select {
+	case err := <-bystanderDone:
+		t.Errorf("a process not holding the node was ended: %v", err)
+	default:
+	}
+}
+
+// A holder that ignores SIGTERM gets SIGKILL once the grace period is out,
+// rather than End reporting success or waiting forever.
+func TestEndKillsWhatIgnoresTerm(t *testing.T) {
+	stubborn, done := holding(t, "/dev/full", `trap "" TERM; exec sleep 60`)
+	execed(t, stubborn.Process.Pid, "sleep") // so the trap is set before the signal arrives
+	if err := End("/dev/full", []int{stubborn.Process.Pid}, 300*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := exited(t, done); err == nil || !strings.Contains(err.Error(), "killed") {
+		t.Errorf("should have taken SIGKILL, got %v", err)
+	}
+}
+
+// The root verb ends processes for holding a device and nothing else, so a
+// path that is not a device node under /dev is refused before any signal.
+func TestEndRefusesWhatIsNotADeviceNode(t *testing.T) {
+	for _, node := range []string{"/etc/hostname", "/dev/../etc/hostname", "dev/full", "/dev"} {
+		if err := End(node, []int{os.Getpid()}, time.Second); err == nil {
+			t.Errorf("%s accepted", node)
+		}
+	}
+}
+
+// Incus names holders by PID alone; the message has to say what they are.
+func TestDescribeNamesAProcessAndAGoneOne(t *testing.T) {
+	cmd, done := holding(t, "", "")
+	execed(t, cmd.Process.Pid, "sleep")
+	p := Describe(cmd.Process.Pid)
+	if p.Name != "sleep" || p.Args != "sleep 60" || p.User == "" {
+		t.Errorf("got %+v", p)
+	}
+	if s := p.String(); !strings.HasPrefix(s, "sleep 60 (pid ") {
+		t.Errorf("String() = %q", s)
+	}
+	_ = cmd.Process.Kill()
+	exited(t, done)
+	if s := Describe(cmd.Process.Pid).String(); !strings.HasSuffix(s, "(gone)") {
+		t.Errorf("an exited process reads as %q", s)
+	}
+}
+
+// boundTo points a fake device's driver link at a fake driver directory with
+// an unbind node, the way sysfs shows a bound device.
+func boundTo(t *testing.T, dev, driver string) string {
+	t.Helper()
+	drv := filepath.Join(filepath.Dir(dev), "..", "drivers", driver)
+	if err := os.MkdirAll(drv, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{filepath.Join(drv, "unbind"), filepath.Join(dev, "reset"), filepath.Join(dev, "driver_override")} {
+		if err := os.WriteFile(f, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(drv, filepath.Join(dev, "driver")); err != nil {
+		t.Fatal(err)
+	}
+	return drv
+}
+
+// Incus rebinds a card to nvidia by itself when its VM stops, with no reset.
+// The driver is bound and the card is dead, and Return used to call that
+// "already on nvidia". It has to go through the whole return instead.
+func TestReturnRedoesADeviceBoundButNotAlive(t *testing.T) {
+	dev := fakeDevice(t, pci)
+	drv := boundTo(t, dev, "nvidia")
+	// The card comes up once it has been reset, and not before.
+	go func() {
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			if b, _ := os.ReadFile(filepath.Join(dev, "reset")); string(b) == "1" {
+				os.MkdirAll(filepath.Join(dev, "drm", "card1"), 0o755)
+				return
+			}
+		}
+	}()
+	if err := (Spec{PCI: pci, Reset: true, Alive: "drm/card*"}).Return(); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(drv, "unbind")); string(b) != pci {
+		t.Errorf("not unbound from the dead driver first: unbind got %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dev, "driver_override")); string(b) != "\n" {
+		t.Errorf("driver_override left as %q", b)
+	}
+}
+
+// A device that is on its driver and alive is left alone: resetting a card
+// the host is using would take the display with it.
+func TestReturnLeavesAWorkingDeviceAlone(t *testing.T) {
+	dev := fakeDevice(t, pci)
+	boundTo(t, dev, "nvidia")
+	if err := os.MkdirAll(filepath.Join(dev, "drm", "card1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Spec{PCI: pci, Reset: true, Alive: "drm/card*"}).Return(); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dev, "reset")); len(b) != 0 {
+		t.Errorf("a working device was reset")
+	}
+}
+
+// fakeDevNodes points the package at an empty /dev and an nvidia driver
+// that has the card as minor, when minor is set, and returns the /dev.
+func fakeDevNodes(t *testing.T, minor string) string {
+	t.Helper()
+	dev, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gpus := t.TempDir()
+	oldDev, oldGPUs := devRoot, nvidiaProcRoot
+	devRoot, nvidiaProcRoot = dev, gpus
+	t.Cleanup(func() { devRoot, nvidiaProcRoot = oldDev, oldGPUs })
+	if minor != "" {
+		if err := os.MkdirAll(filepath.Join(gpus, pci), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		info := "Model: \t\t Fake Card\nDevice Minor: \t " + minor + "\nGPU Excluded:\t No\n"
+		if err := os.WriteFile(filepath.Join(gpus, pci, "information"), []byte(info), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dev
+}
+
+// kernelBindsVfio stands in for the kernel: once a device has been unbound
+// with vfio-pci named as its override, its driver link moves to vfio-pci.
+func kernelBindsVfio(t *testing.T, devs ...string) {
+	t.Helper()
+	vfio := filepath.Join(filepath.Dir(filepath.Dir(devs[0])), "drivers", "vfio-pci")
+	if err := os.MkdirAll(vfio, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		bound := map[string]bool{}
+		for deadline := time.Now().Add(10 * time.Second); len(bound) < len(devs) && time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			for _, dev := range devs {
+				override, _ := os.ReadFile(filepath.Join(dev, "driver_override"))
+				unbind, _ := os.ReadFile(filepath.Join(dev, "driver", "unbind"))
+				if bound[dev] || string(override) != "vfio-pci" || string(unbind) != filepath.Base(dev) {
+					continue
+				}
+				os.Remove(filepath.Join(dev, "driver"))
+				os.Symlink(vfio, filepath.Join(dev, "driver"))
+				bound[dev] = true
+			}
+		}
+	}()
+}
+
+// A card and its audio function are taken off their host drivers together,
+// as VFIO needs the whole group, and each is checked to be on vfio-pci
+// rather than trusted to be.
+func TestParkMovesTheGroupOntoVfio(t *testing.T) {
+	card := fakeDevice(t, pci)
+	root := filepath.Dir(card)
+	audio := filepath.Join(root, "0000:2b:00.1")
+	if err := os.MkdirAll(audio, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	group := filepath.Join(root, "group13", "devices")
+	for addr, class := range map[string]string{pci: "0x030000", "0000:2b:00.1": "0x040300"} {
+		if err := os.MkdirAll(filepath.Join(group, addr), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(group, addr, "class"), []byte(class+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, dev := range []string{card, audio} {
+		if err := os.Symlink(filepath.Join(root, "group13"), filepath.Join(dev, "iommu_group")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	boundTo(t, card, "nvidia")
+	boundTo(t, audio, "snd_hda_intel")
+	fakeDevNodes(t, "0")
+	kernelBindsVfio(t, card, audio)
+
+	s := Spec{PCI: pci}
+	if err := s.Park(false); err != nil {
+		t.Fatal(err)
+	}
+	for _, dev := range []string{card, audio} {
+		if b, _ := os.ReadFile(filepath.Join(dev, "driver_override")); string(b) != "vfio-pci" {
+			t.Errorf("%s: driver_override = %q, want vfio-pci", filepath.Base(dev), b)
+		}
+	}
+	if !s.Parked() {
+		t.Error("parked, yet not reported parked")
+	}
+}
+
+// A device already on vfio-pci, as rig restart leaves it, is not touched.
+func TestParkLeavesAParkedDeviceAlone(t *testing.T) {
+	dev := fakeDevice(t, pci)
+	boundTo(t, dev, "vfio-pci")
+	if err := (Spec{PCI: pci}).Park(false); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dev, "driver_override")); len(b) != 0 {
+		t.Errorf("driver_override written on a parked device: %q", b)
+	}
+}
+
+// Unbinding a card something holds blocks until it lets go, so a held card
+// is refused with its holder named, and nothing is unbound.
+func TestParkRefusesWhileTheCardIsHeld(t *testing.T) {
+	dev := fakeDevice(t, pci)
+	drv := boundTo(t, dev, "nvidia")
+	nodes := fakeDevNodes(t, "3")
+	node := filepath.Join(nodes, "nvidia3")
+	if err := os.WriteFile(node, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	holder, _ := holding(t, node, "")
+	execed(t, holder.Process.Pid, "sleep")
+
+	err := (Spec{PCI: pci}).Park(false)
+	if err == nil {
+		t.Fatal("parked a card that a process holds")
+	}
+	if !strings.Contains(err.Error(), node) || !strings.Contains(err.Error(), "--kill-holders") {
+		t.Errorf("the refusal should name the node and the way past it: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(drv, "unbind")); len(b) != 0 {
+		t.Errorf("unbound anyway: %q", b)
+	}
+}
+
+// What blocks an unbind is the card's own nodes: its DRM nodes and its own
+// /dev/nvidiaN. /dev/nvidiactl is shared by every card, and a daemon such as
+// nvidia-persistenced keeping it open must not stop a start Incus would allow.
+func TestBlockersAreTheCardsOwnNodes(t *testing.T) {
+	fakeDevice(t, pci)
+	nodes := fakeDevNodes(t, "3")
+	if err := os.MkdirAll(filepath.Join(nodes, "dri", "by-path"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"dri/card1", "nvidia3", "nvidiactl"} {
+		if err := os.WriteFile(filepath.Join(nodes, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("../card1", filepath.Join(nodes, "dri", "by-path", "pci-"+pci+"-card")); err != nil {
+		t.Fatal(err)
+	}
+	pids := map[string]int{}
+	for _, name := range []string{"dri/card1", "nvidia3", "nvidiactl"} {
+		p, _ := holding(t, filepath.Join(nodes, name), "")
+		execed(t, p.Process.Pid, "sleep")
+		pids[name] = p.Process.Pid
+	}
+
+	held := Spec{PCI: pci}.blockers()
+	if len(held) != 2 {
+		t.Fatalf("blockers = %v, want the DRM node and nvidia3 only", held)
+	}
+	for _, name := range []string{"dri/card1", "nvidia3"} {
+		got := held[filepath.Join(nodes, name)]
+		if len(got) != 1 || got[0] != pids[name] {
+			t.Errorf("%s held by %v, want [%d]", name, got, pids[name])
+		}
 	}
 }

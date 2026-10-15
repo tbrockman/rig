@@ -20,16 +20,11 @@ package agent
 
 import (
 	"crypto/rand"
-	_ "embed"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 )
-
-//go:embed run.sh
-var runner []byte
 
 // Dir holds everything about one agent run. On disk, not tmpfs: the transcript
 // has to outlive a VM stop or --resume has nothing to resume from.
@@ -39,6 +34,7 @@ const (
 	PromptPath = Dir + "/prompt"
 	InboxPath  = Dir + "/inbox"
 	DonePath   = Dir + "/DONE"
+	EventsPath = Dir + "/events.jsonl"
 	SessionKey = "user.rig.agent.session"
 	Unit       = "rig-agent"
 )
@@ -65,9 +61,9 @@ func Pending(inbox string) int {
 	return 1
 }
 
-// NewSessionID returns a UUIDv4. Claude requires a UUID for --session-id, and
-// rig generates it rather than letting the guest do it, because rig is what has
-// to remember it across a crash.
+// NewSessionID returns a UUIDv4: the shape an agent CLI that takes a session
+// id asks for. rig generates it rather than letting the guest do it, because
+// rig is what has to remember it across a crash.
 func NewSessionID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -87,7 +83,7 @@ func NewSessionID() (string, error) {
 //
 // It reaches the agent by a detour. The unit runs the runner under a login
 // shell, so that /etc/profile sets up the nix environment — the store paths
-// `nix develop` needs, the certificate bundle claude needs to speak TLS. But
+// `nix develop` needs, the certificate bundle the agent needs to speak TLS. But
 // NixOS's /etc/profile exports PATH absolutely, so whatever the unit set is
 // discarded at that point (measured: a unit started with PATH=/marker/bin
 // ran its login shell with no /marker/bin in sight). So the unit passes this
@@ -100,30 +96,6 @@ func NewSessionID() (string, error) {
 // One constant rather than a literal at the use site, because the preflight
 // has to look down exactly the PATH the runner will use.
 const UnitPATH = "/root/.nix-profile/bin:/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/bin"
-
-// InstallHint is the command that puts the agent binary where the unit will
-// find it.
-//
-// The unfree opt-in is not decoration. claude-code is unfree, and a flake
-// reference does not read ~/.config/nixpkgs/config.nix — flake evaluation is
-// pure — so the base image's own `nixpkgs.config.allowUnfree` does not apply
-// either. A plain `nix profile install nixpkgs#claude-code` in a rig guest
-// fails with a wall of text whose three suggested fixes are all for the
-// non-flake path.
-const InstallHint = "NIXPKGS_ALLOW_UNFREE=1 nix profile install --impure nixpkgs#claude-code"
-
-// ClaudeProbe asks whether the agent binary is on the unit's PATH.
-//
-// `rig agent` runs bare `claude`, so a guest without it fails in the least
-// legible way rig has: systemd starts the unit, the runner dies instantly,
-// Restart=on-failure tries again, and the operator sees a restart loop with
-// "last exit 127" and no explanation. The binary is a project decision — it
-// comes from a project flake or `nix profile install`, not from the base image —
-// so its absence is an ordinary state to be in, and worth one clear sentence
-// rather than a diagnosis.
-func ClaudeProbe() string {
-	return "PATH=" + UnitPATH + " command -v claude || true"
-}
 
 // UnitOpts are the knobs that decide how the unit survives trouble.
 type UnitOpts struct {
@@ -189,9 +161,6 @@ func SystemdRun(o UnitOpts) []string {
 	return append(args, "--", "/run/current-system/sw/bin/bash", "-lc", RunnerPath)
 }
 
-// Runner is the wrapper script rig installs into the guest.
-func Runner() []byte { return runner }
-
 // Status is the bounded answer to "how is it going" — everything here is a
 // handful of bytes, so asking is cheap enough to do often.
 type Status struct {
@@ -202,73 +171,7 @@ type Status struct {
 	LastExit string
 	Inbox    int    // messages queued, not yet delivered
 	StatusMD string // whatever the agent wrote for us
-	Events   int    // lines in events.jsonl
-}
-
-// LastError returns the most recent error the agent reported, from a tail of
-// the event stream.
-//
-// It exists because an agent that cannot authenticate looks identical to one
-// that crashed: the unit restart-loops, `last exit` is 1, and the reason is
-// buried in a megabyte of JSON. Surfacing it turns "why did it stop" into one
-// command.
-func LastError(streamJSON string) string {
-	var last string
-	for _, line := range strings.Split(streamJSON, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "{") {
-			continue
-		}
-		var ev struct {
-			Type    string   `json:"type"`
-			IsError bool     `json:"is_error"`
-			Errors  []string `json:"errors"`
-			Result  string   `json:"result"`
-		}
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			continue
-		}
-		if ev.Type != "result" {
-			continue
-		}
-		// Whether a run failed is a field, not a word in its prose. This used
-		// to fall back to searching the result text for "failed", which read a
-		// successful mission's own summary — "a diagnosis that a fix failed to
-		// confirm" — and presented it to the operator under "last error". The
-		// run had is_error false and subtype success.
-		//
-		// errors[] is still checked first and independently: the OAuth failure
-		// this function exists for arrives with subtype "success" and a
-		// populated errors[], so trusting is_error alone would miss it.
-		switch {
-		case len(ev.Errors) > 0:
-			last = ev.Errors[len(ev.Errors)-1]
-		case ev.IsError:
-			last = ev.Result
-		default:
-			// A clean result is the end of the story: an error from a run that
-			// was later retried successfully is history, not the reason this
-			// one stopped.
-			last = ""
-		}
-	}
-	return last
-}
-
-// ExplainError adds the fix to errors whose cause is not obvious from the text.
-func ExplainError(msg string) string {
-	if strings.Contains(msg, "OAuth session expired") {
-		return msg + "\n" +
-			"      The credential snapshot is stale. Refreshing an OAuth session rotates\n" +
-			"      its refresh token, so another consumer of the same credential — a\n" +
-			"      Claude Code session on the host — invalidates this copy when it\n" +
-			"      refreshes. Re-snapshot it and inject it without a VM restart:\n" +
-			"        rig creds <vm> <env-file>\n" +
-			"      A unit still retrying picks it up on its next try; one that gave up\n" +
-			"      resumes with `rig agent start`. A token from `claude setup-token`\n" +
-			"      avoids this entirely."
-	}
-	return msg
+	Events   int    // lines in EventsPath
 }
 
 // NoEvents is what the guest prints when there is no event log at all. It
@@ -276,32 +179,25 @@ func ExplainError(msg string) string {
 // which look identical from an empty read and want different reactions.
 const NoEvents = "__rig_no_events__"
 
-// TailSpeechCmd reads the agent's own words out of the event log, filtering in
-// the guest *before* the tail rather than after it.
+// TailCmd reads the lines of the event log that contain match, filtering in
+// the guest *before* the tail rather than after it. It is the mechanics behind
+// a harness's TailSpeechCmd and TailResultsCmd; the harness supplies the match,
+// since the log's format is its own, and its parser still decides what counts.
 //
-// Tailing raw bytes and filtering here looks equivalent and is not. A single
-// tool result — a build log, a file read — is routinely hundreds of kilobytes,
-// so a fixed byte window often holds nothing but tool traffic, and `rig agent
-// log` then reported "nothing said yet" about an agent that had been talking
-// for hours. Filtering first means the window holds only assistant events, so
-// it always spans real speech. The grep is a prefilter, not a parser:
-// AssistantText still decides what counts.
-func TailSpeechCmd(limitBytes int) string {
-	return tailCmd("assistant", limitBytes)
-}
-
-// TailResultsCmd reads the run's result events, where a failure reason lives.
-// Same reasoning as TailSpeechCmd: a crash whose last megabyte is tool output
-// would otherwise report no reason at all.
-func TailResultsCmd(limitBytes int) string {
-	return tailCmd("result", limitBytes)
-}
-
-func tailCmd(evType string, limitBytes int) string {
-	log := Dir + "/events.jsonl"
+// Tailing raw bytes and filtering afterwards looks equivalent and is not. A
+// single tool result — a build log, a file read — is routinely hundreds of
+// kilobytes, so a fixed byte window often holds nothing but tool traffic, and
+// `rig agent log` then reported "nothing said yet" about an agent that had been
+// talking for hours. Filtering first means the window holds only the lines
+// asked for, so it always spans real speech; on the other read, a crash whose
+// last megabyte is tool output would otherwise report no reason at all.
+//
+// match is a grep basic regular expression, single-quoted into the command, so
+// it must not contain a single quote.
+func TailCmd(match string, limitBytes int) string {
 	return fmt.Sprintf(
-		`test -s %[1]s || { echo %[2]s; exit 0; }; grep -a '"type":"%[3]s"' %[1]s | tail -c %[4]d`,
-		log, NoEvents, evType, limitBytes)
+		`test -s %[1]s || { echo %[2]s; exit 0; }; grep -a '%[3]s' %[1]s | tail -c %[4]d`,
+		EventsPath, NoEvents, match, limitBytes)
 }
 
 // Probe is the scalar half of `agent status`: what systemd knows about the
@@ -383,42 +279,4 @@ func Age(sec int64) string {
 	default:
 		return fmt.Sprintf("%dd %dh", sec/86400, (sec%86400)/3600)
 	}
-}
-
-// AssistantText pulls the agent's own words out of a stream-json tail, dropping
-// tool calls and everything else. This is what makes reading progress cheap:
-// the raw event log is megabytes, and almost none of it is worth an operator's
-// attention.
-func AssistantText(streamJSON string, limit int) []string {
-	var out []string
-	for _, line := range strings.Split(streamJSON, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || !strings.HasPrefix(line, "{") {
-			continue
-		}
-		var ev struct {
-			Type    string `json:"type"`
-			Message struct {
-				Content []struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"content"`
-			} `json:"message"`
-		}
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			continue // a truncated first line is expected when tailing bytes
-		}
-		if ev.Type != "assistant" {
-			continue
-		}
-		for _, c := range ev.Message.Content {
-			if c.Type == "text" && strings.TrimSpace(c.Text) != "" {
-				out = append(out, strings.TrimSpace(c.Text))
-			}
-		}
-	}
-	if limit > 0 && len(out) > limit {
-		out = out[len(out)-limit:]
-	}
-	return out
 }

@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -76,7 +77,9 @@ type Return struct {
 	// the NVIDIA driver needs this.
 	Modules []string `yaml:"modules,omitempty"`
 	// Reset the device before the host driver binds it. A card handed back
-	// from a guest may not initialise without it.
+	// from a guest may not initialise without it. rig start moves the device
+	// onto vfio-pci before the VM starts, so its stop leaves it there for the
+	// reset; both steps run under sudo.
 	Reset bool `yaml:"reset,omitempty"`
 	// A glob under the device's sysfs directory that exists once the host
 	// driver has really brought it up: drm/card* for a card, usb* for a USB
@@ -126,6 +129,90 @@ type Guest struct {
 	// start to stop, toggled with both Ctrl keys. The guest needs
 	// rig.nixosModules.desktop.
 	Input string `yaml:"input,omitempty" jsonschema:"enum=host"`
+	// Which coding agent `rig agent` runs in this guest: claude-code, the
+	// default when left out. The harness decides the binary, how it is
+	// installed and launched, and which credentials it authenticates with.
+	Agent string `yaml:"agent,omitempty" jsonschema:"enum=claude-code"`
+	// The host's proxy (witmproxy), which this guest reaches over a second
+	// NIC that leads nowhere else. Its one job so far is credentials the
+	// guest never holds: see proxy.credentials. Set up once per host with
+	// `rig proxy setup`.
+	Proxy *Proxy `yaml:"proxy,omitempty"`
+}
+
+// Proxy is guest.proxy: what the host's proxy does for this guest. Opt-in,
+// like everything else, and nothing without a credentials: entry.
+type Proxy struct {
+	// Variables from env_file whose values the guest never sees, each with
+	// the endpoints the value may be sent to. The guest gets a stand-in; the
+	// proxy puts the real value into HTTPS requests to those endpoints, and
+	// nowhere else, wherever the stand-in occurs in a header or the URL. An
+	// endpoint is "[METHOD[,METHOD] ]host[/path]": the host alone is every
+	// request to it; a path covers itself and everything below it; *.host
+	// covers the host and its subdomains. A guest that leaks everything it
+	// has leaks a string that works only through this proxy, only there:
+	//   ANTHROPIC_API_KEY: [POST api.anthropic.com/v1/messages]
+	Credentials map[string][]string `yaml:"credentials,omitempty"`
+	// What else the guest may reach through the proxy. Left out, nothing:
+	// the proxy dials the credentials' hosts and refuses the rest. internet:
+	// everything the isolated NIC may reach, with this host and the LAN
+	// still refused, judged on the address after resolution. For the tools
+	// under the agent, which inherit its HTTPS_PROXY: cargo, git, nix and
+	// npm reach their registries through the proxy or not at all.
+	Egress string `yaml:"egress,omitempty" jsonschema:"enum=internet"`
+}
+
+// Endpoint is one place a proxied credential may be sent, parsed from the
+// form rig.yaml takes.
+type Endpoint struct {
+	Host    string   // lower case; a "*." prefix covers the subdomains and the apex
+	Methods []string // upper case; empty is any
+	Path    string   // "" is any; otherwise starts with /, no query, no trailing /
+}
+
+// ParseEndpoint reads "[METHOD[,METHOD] ]host[/path]".
+func ParseEndpoint(s string) (Endpoint, error) {
+	m := endpointRE.FindStringSubmatch(strings.TrimSpace(s))
+	if m == nil {
+		return Endpoint{}, fmt.Errorf("%q is not an endpoint: \"[METHOD[,METHOD] ]host[/path]\", such as api.example.com, POST api.example.com/v1/messages, or *.example.com", s)
+	}
+	e := Endpoint{Host: m[2], Path: strings.TrimRight(m[3], "/")}
+	if m[1] != "" {
+		e.Methods = strings.Split(m[1], ",")
+	}
+	return e, nil
+}
+
+// String renders the endpoint canonically, so the same intent is the same
+// string.
+func (e Endpoint) String() string {
+	s := e.Host + e.Path
+	if len(e.Methods) > 0 {
+		s = strings.Join(e.Methods, ",") + " " + s
+	}
+	return s
+}
+
+// Harnesses are the agents rig knows how to run; the first is the default.
+var Harnesses = []string{"claude-code"}
+
+// Proxied reports whether the manifest asks for any credential to be held
+// by the proxy rather than the guest.
+func (m *Manifest) Proxied() bool {
+	return m.Guest.Proxy != nil && len(m.Guest.Proxy.Credentials) > 0
+}
+
+// EgressInternet is guest.proxy.egress asking for everything the isolated
+// NIC may reach, through the proxy too.
+const EgressInternet = "internet"
+
+// ProxyEgress is guest.proxy.egress, "" when left out or when nothing is
+// proxied.
+func (m *Manifest) ProxyEgress() string {
+	if m.Guest.Proxy == nil {
+		return ""
+	}
+	return m.Guest.Proxy.Egress
 }
 
 // NetworkNone asks for a VM with no network device.
@@ -403,6 +490,13 @@ var (
 	nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}$`)
 	pciRE  = regexp.MustCompile(`^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$`)
 	usbRE  = regexp.MustCompile(`^[0-9a-f]{4}:[0-9a-f]{4}$`)
+	// A variable an env file can define, as a shell reads one.
+	varRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	// Where a credential may be sent: optional methods, a DNS name of at
+	// least two labels (lower case, no scheme or port; *. for subdomains),
+	// and an optional path. The host is matched exactly, so api.example.com
+	// does not cover example.com or the other way round.
+	endpointRE = regexp.MustCompile(`^(?:([A-Z]+(?:,[A-Z]+)*) )?((?:\*\.)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)(/[^\s?#]*)?$`)
 )
 
 // Kinds rig knows. The set is the whole vocabulary: everything else in rig is
@@ -441,8 +535,43 @@ func (m *Manifest) validate() error {
 	default:
 		return fmt.Errorf("guest.input %q: leave it out, or say %q to lend the guest this host's keyboard and mouse", m.Guest.Input, InputHost)
 	}
+	if m.Guest.Agent != "" && !slices.Contains(Harnesses, m.Guest.Agent) {
+		return fmt.Errorf("guest.agent %q: rig knows %s; leave it out for %s", m.Guest.Agent, strings.Join(Harnesses, ", "), Harnesses[0])
+	}
 	if m.Guest.Network == NetworkNone && len(m.Guest.Ports) > 0 {
 		return fmt.Errorf("guest.network is %q but guest.ports publishes %d port(s): a published port needs a network device", NetworkNone, len(m.Guest.Ports))
+	}
+	if m.Guest.Proxy != nil {
+		switch m.Guest.Proxy.Egress {
+		case "", EgressInternet:
+		default:
+			return fmt.Errorf("guest.proxy.egress %q: leave it out for the credentials' hosts only, or say %q for everything the isolated NIC may reach", m.Guest.Proxy.Egress, EgressInternet)
+		}
+		if m.Guest.Proxy.Egress != "" && !m.Proxied() {
+			return fmt.Errorf("guest.proxy.egress without guest.proxy.credentials: the proxy exists for a credential; a guest with none reaches the internet over its own NIC")
+		}
+	}
+	if m.Proxied() {
+		if m.Guest.EnvFile == "" {
+			return fmt.Errorf("guest.proxy.credentials names variables, but there is no guest.env_file for them to come from")
+		}
+		if m.Guest.Network == NetworkNone {
+			return fmt.Errorf("guest.network is %q but guest.proxy asks for a proxy: the proxy is reached over the network device", NetworkNone)
+		}
+		for _, name := range sortedKeys(m.Guest.Proxy.Credentials) {
+			endpoints := m.Guest.Proxy.Credentials[name]
+			if !varRE.MatchString(name) {
+				return fmt.Errorf("guest.proxy.credentials: %q is not a variable name an env file can define", name)
+			}
+			if len(endpoints) == 0 {
+				return fmt.Errorf("guest.proxy.credentials.%s: names no endpoints; the real value would never be sent anywhere", name)
+			}
+			for _, e := range endpoints {
+				if _, err := ParseEndpoint(e); err != nil {
+					return fmt.Errorf("guest.proxy.credentials.%s: %w", name, err)
+				}
+			}
+		}
 	}
 	seenVol, seenPath := map[string]bool{}, map[string]bool{}
 	for _, v := range m.Guest.Volumes {

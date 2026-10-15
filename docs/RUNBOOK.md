@@ -50,6 +50,21 @@ This creates the `vm-isolate` ACL and the `rig` profile (the NIC and root disk
 of `default`, with the ACL on the NIC). rig's VMs use that profile; nothing
 else on the host is touched.
 
+**A host firewall can drop the guest's traffic before the ACL sees it.** ufw's
+default forward policy is DROP and its stock rules pass only ICMP echo, so a
+guest pings the internet and reaches nothing else; the kernel log shows
+`[UFW BLOCK] IN=incusbr0 OUT=<uplink>`. Let the bridge out through the
+default route's interface (`ip route get 1.1.1.1` names it); the ACL still
+rejects the private ranges:
+
+```bash
+sudo ufw route allow in on incusbr0 out on <uplink>
+```
+
+The rule is keyed on the interface name, and a BIOS change that renumbers the
+PCI bus renames the uplink too, after which the rule matches nothing. `rig
+verify` reports it as `expected reachable, got blocked`.
+
 **NixOS hosts: DHCP needs one firewall rule.** The ACL makes the kernel run
 conntrack at the bridge layer. For a broadcast frame the bridge conntrack
 drops its entry again (it cannot confirm cloned skbs), so a guest's DHCP
@@ -131,11 +146,55 @@ sudo fuser -v /dev/nvidia*          # should print nothing
 ```
 
 Afterwards `rig host desktop` and `rig host headless` move the card between
-the desktop and VMs without a reboot. If your only monitor is on the card, you
+the desktop and VMs without a reboot. `rig start` names anything on the host
+still holding the card, and `rig start --kill-holders` ends it; for a display
+manager's shell, stop the display manager instead, which `unit:
+display-manager` in the card's `return:` does on every start. If your only monitor is on the card, you
 have a console only while no VM holds it; put the console on a second GPU, or
 be certain of SSH.
 
-## 6. Tests
+## 6. Proxied credentials (optional)
+
+Only for a manifest with `guest.proxy.credentials`: a credential the guest
+never holds, which a proxy on this host puts into requests for it. Each
+guest gets a [witmproxy](https://witmproxy.rs) instance of its own, in your
+user scope: rig makes it at the guest's first start with witmproxy's own
+installer (`witm service install --user --instance rig-<vm>`), starts and
+stops it with the VM, removes it with `rig rm`. No root for any of that.
+Once per host:
+
+```bash
+cargo install witmproxy            # or a release binary; `witm` on PATH, with --user
+rig proxy setup                    # the bridge rigproxy0, witm, lingering; the ufw rule under sudo
+```
+
+`rig proxy setup` also does the two things the proxies need of the host,
+saying what it does; `--dry-run` only says. The proxies are units of your
+systemd user manager, which stops at logout unless it lingers, so setup
+lets it linger: on systemd 256 and later that is yours to grant and no root
+is involved; an older logind asks an admin, and setup then prints the root
+form, `sudo loginctl enable-linger $USER`. And a host firewall knows
+nothing of the new bridge: with ufw active, setup admits the one range a
+guest may reach on it, its proxy's port, under sudo with the rule printed
+first (`rig doctor` reports the drops while it is missing):
+
+```bash
+sudo ufw allow in on rigproxy0 to 10.207.0.1 port 3102:3354 proto tcp
+```
+
+Another firewall is yours to open the same way.
+
+The guest at `10.207.0.<n>` reaches its proxy at `10.207.0.1:<3100+n>` and
+nothing else: the NIC's ACL allows that port alone, and the proxy's policy
+(`~/.local/state/witmproxy/instances/rig-<vm>/policy.toml`, written by rig)
+forbids everything but HTTPS to the hosts the manifest names, from that
+guest (or, with `egress: internet`, permits that guest everything else
+too), with the isolation ACL's reject list forbidden to anyone. A VM that
+proxies credentials needs the image built after the proxy NIC settings
+reached `base/` (section 4). `rig doctor <vm>` checks every piece; `rig
+proxy log <vm>` shows what its proxy carried and refused.
+
+## 7. Tests
 
 ```bash
 make test              # go vet and unit tests; no daemon needed

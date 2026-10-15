@@ -66,12 +66,14 @@ func fieldsTable(s *jsonschema.Schema) string {
 	b.WriteString("| Field | |\n|---|---|\n")
 	// Markdown would take a | for a cell border and <name> for an HTML tag.
 	cell := strings.NewReplacer("|", "\\|", "<", "&lt;", ">", "&gt;").Replace
+	// Blocks with fields of their own, and the definition each reflects to.
+	nested := map[string]string{"return": "Return", "proxy": "Proxy"}
 	rows := func(prefix, def string) {
 		for name, p := range s.Definitions[def].Properties.FromOldest() {
 			fmt.Fprintf(&b, "| `%s%s` | %s |\n", prefix, name, cell(p.Description))
-			if name == "return" {
-				for sub, q := range s.Definitions["Return"].Properties.FromOldest() {
-					fmt.Fprintf(&b, "| `%sreturn.%s` | %s |\n", prefix, sub, cell(q.Description))
+			if sub, ok := nested[name]; ok {
+				for field, q := range s.Definitions[sub].Properties.FromOldest() {
+					fmt.Fprintf(&b, "| `%s%s.%s` | %s |\n", prefix, name, field, cell(q.Description))
 				}
 			}
 		}
@@ -141,11 +143,27 @@ func (Guest) JSONSchemaExtend(s *jsonschema.Schema) {
 	prop(s, "name").Pattern = nameRE.String()
 	prop(s, "devices").Items.Pattern = nameRE.String()
 	s.AnyOf = []*jsonschema.Schema{required("image"), required("flake")}
-	// A published port needs a network device.
 	s.AllOf = []*jsonschema.Schema{
-		whenConst("network", NetworkNone, &jsonschema.Schema{Not: required("ports")}),
+		// A published port, and the proxy, need a network device.
+		whenConst("network", NetworkNone, &jsonschema.Schema{Not: &jsonschema.Schema{
+			AnyOf: []*jsonschema.Schema{required("ports"), required("proxy")},
+		}}),
+		// A proxied credential comes from the env file.
+		{If: required("proxy"), Then: required("env_file")},
 	}
 }
+
+func (Proxy) JSONSchemaExtend(s *jsonschema.Schema) {
+	p := prop(s, "credentials")
+	p.PropertyNames = &jsonschema.Schema{Pattern: varRE.String()}
+	p.AdditionalProperties = &jsonschema.Schema{
+		Type:     "array",
+		MinItems: ptr(uint64(1)),
+		Items:    &jsonschema.Schema{Type: "string", Pattern: endpointRE.String()},
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
 
 func (CPUs) JSONSchema() *jsonschema.Schema {
 	return &jsonschema.Schema{OneOf: []*jsonschema.Schema{

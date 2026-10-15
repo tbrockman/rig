@@ -6,7 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -209,6 +211,7 @@ func (c *Client) SetDevices(name string, devices map[string]Device) error {
 	return c.PutWithETag("/1.0/instances/"+url.PathEscape(name), body, etag)
 }
 
+// SetConfigKey sets one key of an instance's config; an empty value removes it.
 func (c *Client) SetConfigKey(name, key, value string) error {
 	inst, etag, err := c.Instance(name)
 	if err != nil {
@@ -218,7 +221,11 @@ func (c *Client) SetConfigKey(name, key, value string) error {
 	for k, v := range inst.Config {
 		config[k] = v
 	}
-	config[key] = value
+	if value == "" {
+		delete(config, key)
+	} else {
+		config[key] = value
+	}
 	body := map[string]any{
 		"architecture": inst.Architecture,
 		"config":       config,
@@ -246,6 +253,37 @@ func (c *Client) setState(name, action string, timeoutSec int, force bool) error
 		"timeout": timeoutSec,
 		"force":   force,
 	})
+}
+
+// InUse is Incus refusing to start a VM because host processes still have an
+// NVIDIA card mapped. It checks before it unbinds the card, because the unbind
+// blocks while anything holds it, so a refusal leaves the card where it was.
+type InUse struct {
+	Device string // the instance's device, e.g. gpu
+	Node   string // e.g. /dev/nvidia0
+	PIDs   []int
+}
+
+var inUseRe = regexp.MustCompile(`Failed to start device "([^"]*)": Cannot use device "([^"]+)", \d+ processes are still attached to it:((?:\s+\d+)+)`)
+
+// DeviceInUse recognises that refusal in a start's error. Incus says it only
+// in text, so this matches Incus 6.0's wording; if that changes, it stops
+// matching and the error is reported as Incus wrote it.
+func DeviceInUse(err error) (InUse, bool) {
+	if err == nil {
+		return InUse{}, false
+	}
+	m := inUseRe.FindStringSubmatch(err.Error())
+	if m == nil {
+		return InUse{}, false
+	}
+	u := InUse{Device: m[1], Node: m[2]}
+	for _, f := range strings.Fields(m[3]) {
+		if pid, err := strconv.Atoi(f); err == nil {
+			u.PIDs = append(u.PIDs, pid)
+		}
+	}
+	return u, true
 }
 
 type instanceState struct {
@@ -425,9 +463,16 @@ func (c *Client) DeleteACL(name string) error {
 // --- networks ------------------------------------------------------------
 
 type Network struct {
-	Name   string            `json:"name"`
-	Type   string            `json:"type"`
-	Config map[string]string `json:"config"`
+	Name        string            `json:"name"`
+	Type        string            `json:"type"`
+	Description string            `json:"description,omitempty"`
+	Config      map[string]string `json:"config"`
+}
+
+// CreateNetwork makes a managed network. Incus brings a bridge up as soon as
+// it exists, so the address is live when this returns.
+func (c *Client) CreateNetwork(n *Network) error {
+	return c.Post("/1.0/networks", n, nil)
 }
 
 func (c *Client) Network(name string) (*Network, error) {

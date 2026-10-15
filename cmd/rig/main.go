@@ -32,6 +32,7 @@ import (
 	"github.com/tbrockman/rig/internal/manifest"
 	"github.com/tbrockman/rig/internal/policy"
 	"github.com/tbrockman/rig/internal/ports"
+	"github.com/tbrockman/rig/internal/proxy"
 	"github.com/tbrockman/rig/internal/pushguard"
 	"github.com/tbrockman/rig/internal/volumes"
 )
@@ -101,7 +102,7 @@ func main() {
 		a.newCmd(), a.startCmd(), a.stopCmd(), a.restartCmd(), a.rmCmd(),
 		a.statusCmd(), a.doctorCmd(), a.verifyCmd(), a.logsCmd(),
 		a.execCmd(), a.shellCmd(), a.pushCmd(), a.pullCmd(), a.agentCmd(),
-		a.credsCmd(),
+		a.credsCmd(), a.proxyCmd(),
 		a.mountCmd(), a.unmountCmd(), a.forwardCmd(),
 		a.claimCmd(), a.releaseCmd(), a.applyCmd(), a.setupCmd(), a.hostCmd(), a.imageCmd(),
 	)
@@ -362,12 +363,23 @@ func (a *app) afterNew(name, profile string, start bool) error {
 func (a *app) startCmd() *cobra.Command {
 	var timeout time.Duration
 	var envFile string
-	var noWait, allowUnisolated bool
+	var noWait, allowUnisolated, killHolders bool
 	cmd := &cobra.Command{
 		Use:     "start <vm>",
 		Short:   "Claim the VM's devices, start it, inject credentials",
 		GroupID: "vm",
-		Args:    cobra.ExactArgs(1),
+		Long: "Claims the devices the VM's record declares, stopping any host unit a\n" +
+			"device's return: recipe names, then starts the VM, lends it this host's\n" +
+			"input when its manifest asks, and injects its credentials.\n\n" +
+			"A device whose recipe resets it is parked on vfio-pci before the start,\n" +
+			"once its identity has been checked. Incus hands a device back at stop to\n" +
+			"the driver it had at start, unreset; parked, that is vfio-pci, and the\n" +
+			"return resets it before the host driver loads.\n\n" +
+			"For a VM whose devices have a return: recipe it also leaves a watcher,\n" +
+			"the transient unit rig-handback-<vm>, that hands them back if the VM\n" +
+			"stops without rig stop: the guest powering itself off, or incus stop.\n\n" +
+			"The steps that touch this host run under sudo, printing the command first.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if err := a.requireInstance(args[0]); err != nil {
 				return err
@@ -375,7 +387,7 @@ func (a *app) startCmd() *cobra.Command {
 			if err := a.setEnvFile(args[0], envFile); err != nil {
 				return err
 			}
-			return a.start(args[0], timeout, !noWait, allowUnisolated)
+			return a.start(args[0], timeout, !noWait, allowUnisolated, killHolders)
 		},
 	}
 	cmd.Flags().StringVar(&envFile, "env", "",
@@ -384,14 +396,16 @@ func (a *app) startCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noWait, "no-wait", false, "return as soon as Incus reports it started")
 	cmd.Flags().BoolVar(&allowUnisolated, "allow-unisolated", false,
 		"start even with no isolation ACL — the guest will reach this host and the LAN")
+	cmd.Flags().BoolVar(&killHolders, "kill-holders", false,
+		"end host processes that hold a card the VM needs (SIGTERM, then SIGKILL) and start anyway")
 	return cmd
 }
 
 func (a *app) startInstance(name string, timeout time.Duration, wait bool) error {
-	return a.start(name, timeout, wait, false)
+	return a.start(name, timeout, wait, false, false)
 }
 
-func (a *app) start(name string, timeout time.Duration, wait, allowUnisolated bool) error {
+func (a *app) start(name string, timeout time.Duration, wait, allowUnisolated, killHolders bool) error {
 	inst, _, err := a.c.Instance(name)
 	if err != nil {
 		return err
@@ -402,6 +416,11 @@ func (a *app) start(name string, timeout time.Duration, wait, allowUnisolated bo
 	}
 	if len(wanted) == 0 {
 		note("%s wants no host devices", name)
+	}
+	// Proxied credentials need witmproxy on this host: found now, with the
+	// VM still stopped, rather than once it is up with nothing to work with.
+	if err := a.proxyPreflight(inst); err != nil {
+		return err
 	}
 	// A pinned CPU set is checked against this host before anything moves:
 	// it must name CPUs that exist and leave the host a core of its own.
@@ -420,9 +439,13 @@ func (a *app) start(name string, timeout time.Duration, wait, allowUnisolated bo
 	if err := freeWanted(wanted); err != nil {
 		return err
 	}
-	if err := devices.Start(a.c, a.cfg, name, allowUnisolated, int(timeout.Seconds())); err != nil {
+	claimAndStart := func() error {
+		return devices.Start(a.c, a.cfg, name, allowUnisolated, int(timeout.Seconds()), parkClaimed(killHolders))
+	}
+	if err := startPastHolders(name, killHolders, claimAndStart); err != nil {
 		return err
 	}
+	a.startHandback(name, wanted)
 	if !wait {
 		a.startInput(name, wait)
 		return nil
@@ -459,7 +482,7 @@ func (a *app) start(name string, timeout time.Duration, wait, allowUnisolated bo
 		note("         The guest started without them.")
 		return nil
 	}
-	n, err := creds.Inject(a.c, name, envFile)
+	n, err := a.injectCredentials(name, envFile)
 	if err != nil {
 		return err
 	}
@@ -508,7 +531,9 @@ func (a *app) credsCmd() *cobra.Command {
 			"relative path resolves against your current directory, and the\n" +
 			"absolute path is what gets recorded and printed.\n\n" +
 			"A running agent is left alone: it picks the new credential up when it\n" +
-			"next restarts. Nothing here reads or logs the secret itself.",
+			"next restarts. A proxied credential (guest.proxy) reaches it sooner: the\n" +
+			"stand-in the guest holds stays, and its proxy takes the new value, so\n" +
+			"nothing in the guest changes. Nothing here reads or logs the secret itself.",
 		Args: cobra.ExactArgs(2),
 		RunE: func(_ *cobra.Command, args []string) error {
 			name, envFile := args[0], args[1]
@@ -536,13 +561,17 @@ func (a *app) credsCmd() *cobra.Command {
 			if err := a.setEnvFile(name, envFile); err != nil {
 				return err
 			}
-			n, err := creds.Inject(a.c, name, abs)
+			n, err := a.injectCredentials(name, abs)
 			if err != nil {
 				return err
 			}
 			note("injected %d credential(s) from %s into %s (tmpfs; gone on stop)",
 				n, abs, creds.GuestPath)
-			note("a running agent keeps its current process; it authenticates fresh on its next restart")
+			if inst.Config[proxy.InstanceKey] != "" {
+				note("a running agent keeps its current process, and the swap has reached it already: its stand-in is unchanged and its proxy holds the new value")
+			} else {
+				note("a running agent keeps its current process; it authenticates fresh on its next restart")
+			}
 			return nil
 		},
 	}
@@ -565,7 +594,10 @@ func (a *app) stopCmd() *cobra.Command {
 			"--timeout expires — a desktop session swallows the power button — the\n" +
 			"plug is pulled, because a VM left running with the host's devices\n" +
 			"inside it is worse than lost guest state. --force skips the asking.\n\n" +
-			"--keep-devices leaves everything attached, as stop always did before.",
+			"--keep-devices leaves everything attached, as stop always did before.\n\n" +
+			"A VM that stops without rig stop has its devices handed back by the\n" +
+			"watcher rig start left (rig host handback). On a VM already stopped,\n" +
+			"rig stop hands back whatever is still attached.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if err := a.requireInstance(args[0]); err != nil {
@@ -592,6 +624,10 @@ func (a *app) stopForce(name string, timeout time.Duration, keep, force bool) er
 		return err
 	}
 	stopInput(name)
+	// Its credentials leave the proxy with it; the next start puts them back.
+	if inst, _, err := a.c.Instance(name); err == nil {
+		a.proxyRevoke(inst)
+	}
 	if keep {
 		inst, _, err := a.c.Instance(name)
 		if err == nil && len(inst.PassthroughDevices()) > 0 {
@@ -599,11 +635,7 @@ func (a *app) stopForce(name string, timeout time.Duration, keep, force bool) er
 		}
 		return nil
 	}
-	detached, err := devices.Detach(a.c, a.cfg, name, false)
-	if err != nil {
-		return err
-	}
-	return returnDetached(detached)
+	return a.handBack(name)
 }
 
 func (a *app) restartCmd() *cobra.Command {
@@ -785,7 +817,7 @@ func (a *app) applyCmd() *cobra.Command {
 					return err
 				}
 				drift := configDrift(inst, want)
-				netDrift, err := a.reconcileNetwork(inst, m.Guest.Network == manifest.NetworkNone, true)
+				netDrift, err := a.reconcileNetwork(inst, m.Guest.Network == manifest.NetworkNone, m.Proxied(), true)
 				if err != nil {
 					return err
 				}
@@ -879,6 +911,7 @@ func (a *app) rmCmd() *cobra.Command {
 				return err
 			}
 			note("deleted %s", name)
+			a.proxyRemove(inst)
 			// Volumes outlive the VM on purpose, unless asked otherwise; either
 			// way, say which, so none is forgotten or mistaken for deleted.
 			pool := volumes.Pool(inst)
@@ -1172,7 +1205,7 @@ func (a *app) doctorCmd() *cobra.Command {
 						break
 					}
 					drift := configDrift(inst, want)
-					if netDrift, err := a.reconcileNetwork(inst, m.Guest.Network == manifest.NetworkNone, true); err == nil {
+					if netDrift, err := a.reconcileNetwork(inst, m.Guest.Network == manifest.NetworkNone, m.Proxied(), true); err == nil {
 						drift = append(drift, netDrift...)
 					}
 					if volDrift, err := volumes.Reconcile(a.c, inst, m.Guest.Volumes, true); err == nil {
@@ -1193,6 +1226,63 @@ func (a *app) doctorCmd() *cobra.Command {
 				info("base image", detail)
 			} else {
 				check("base image", true, detail)
+			}
+
+			// Proxied credentials: what the record asks, whether the guest's
+			// proxy is there and running. The values never print.
+			proxied, proxyErr := proxy.Decode(inst.Config[proxy.InstanceKey])
+			proxyIP := policy.ProxyIPOf(inst)
+			if proxyErr != nil {
+				check("proxied credentials", false, proxyErr.Error())
+			} else if len(proxied) > 0 {
+				asked := proxy.DescribeRecord(proxied)
+				check("proxy nic", proxyIP != "", firstNonEmpty(proxyIP, "none on "+policy.ProxyNetwork+":  rig apply -f, with the VM stopped"))
+				if inst.Config[proxy.EgressKey] == manifest.EgressInternet {
+					info("proxy egress", "internet: everything the isolated NIC may reach, through the proxy too; this host and the LAN refused")
+				} else {
+					info("proxy egress", "the credentials' hosts only (guest.proxy.egress: internet widens it)")
+				}
+				if err := proxy.WitmHasUserScope(); err != nil {
+					check("witmproxy", false, lastLine(err.Error()))
+				} else if proxyIP != "" {
+					pi := proxy.InstanceFor(name, proxyIP)
+					if on, known := proxy.Linger(); known && !on {
+						info("linger", "off: the proxies stop when you log out;  rig proxy setup")
+					}
+					// The host's firewall sits between a guest and its
+					// proxy; its status needs root, the kernel log does not.
+					if ports.HostFirewall() {
+						if n := proxy.RecentlyBlocked(); n > 0 {
+							check("host firewall", false, fmt.Sprintf("ufw dropped %d packet(s) from guests to their proxies in the last 10 minutes;  rig proxy setup admits them:  %s", n, proxy.UFWRule()))
+						} else {
+							info("host firewall", "ufw is active; no drops from guests in the last 10 minutes (rig proxy setup admits their proxy ports)")
+						}
+					}
+					switch {
+					case !pi.Installed() && !inst.Running():
+						info("proxy", pi.Name()+" at "+pi.ProxyBind()+" (made at start)")
+					case !pi.Installed():
+						check("proxy", false, pi.Name()+" was never made:  rig creds "+name+" <env-file>")
+					case !pi.Running() && !inst.Running():
+						info("proxy", pi.Name()+" at "+pi.ProxyBind()+" (stopped with the VM)")
+					case !pi.Running():
+						check("proxy", false, pi.Name()+" is not running while the VM is:  rig creds "+name+" <env-file>;  rig proxy log "+name)
+					default:
+						if c, err := pi.Connect(); err != nil {
+							check("proxy", false, lastLine(err.Error()))
+						} else {
+							check("proxy", true, pi.Name()+" at "+pi.ProxyBind())
+							if p, err := c.RigPlugin(); err != nil || p == nil {
+								check("proxy plugin", false, proxy.PluginID+" is not in it:  rig creds "+name+" <env-file>")
+							} else if !p.Enabled {
+								check("proxy plugin", false, proxy.PluginID+" "+p.Version+" is disabled:  rig creds "+name+" <env-file>")
+							} else {
+								check("proxy plugin", true, proxy.PluginID+" "+p.Version)
+							}
+							check("proxied credentials", true, asked)
+						}
+					}
+				}
 			}
 
 			if !inst.Running() {
@@ -1230,6 +1320,50 @@ func (a *app) doctorCmd() *cobra.Command {
 				if inst.Config[creds.InstanceKey] != "" {
 					_, err := a.c.Exec(name, "test -r "+creds.GuestPath, incus.ExecOpts{Timeout: 15 * time.Second})
 					check("credentials", err == nil, creds.GuestPath)
+				}
+				// Configured is not proven: ask the guest to fetch from one
+				// proxied host and show whose certificate it saw. The proxy's
+				// means the request went through it.
+				if len(proxied) > 0 && proxyErr == nil {
+					if proxyIP != "" {
+						out, err := a.c.Exec(name, proxy.GuestNICProbe(proxyIP), incus.ExecOpts{Timeout: 30 * time.Second})
+						check("proxy nic in guest", err == nil, lastLine(strings.TrimSpace(out)))
+					}
+					probed := map[string]bool{}
+					for _, v := range sortedKeys(proxied) {
+						e, err := manifest.ParseEndpoint(proxied[v][0])
+						if err != nil || strings.HasPrefix(e.Host, "*.") {
+							continue // a wildcard names no one host to fetch from
+						}
+						host := e.Host
+						if probed[host] {
+							continue
+						}
+						probed[host] = true
+						out, err := a.c.Exec(name, proxy.GuestProbe(policy.ProxyURLFor(proxyIP), host), incus.ExecOpts{Timeout: 45 * time.Second})
+						var exit *incus.ExitError
+						if errors.As(err, &exit) && exit.Code == 2 {
+							info("proxy for "+host, lastLine(out)+" (not proven; rebuild the image for curl)")
+							continue
+						}
+						check("proxy for "+host, err == nil, lastLine(firstNonEmpty(strings.TrimSpace(out), "intercepted")))
+					}
+					// And what it does with a host the manifest does not
+					// name: refuses it, or carries it when egress says so.
+					if proxyIP != "" {
+						internet := inst.Config[proxy.EgressKey] == manifest.EgressInternet
+						label := "proxy refuses the rest"
+						if internet {
+							label = "proxy to the internet"
+						}
+						out, err := a.c.Exec(name, proxy.GuestEgressProbe(policy.ProxyURLFor(proxyIP), internet), incus.ExecOpts{Timeout: 45 * time.Second})
+						var exit *incus.ExitError
+						if errors.As(err, &exit) && exit.Code == 2 {
+							info(label, lastLine(out)+" (not proven)")
+						} else {
+							check(label, err == nil, lastLine(firstNonEmpty(strings.TrimSpace(out), "ok")))
+						}
+					}
 				}
 			}
 

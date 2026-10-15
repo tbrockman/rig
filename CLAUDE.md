@@ -14,6 +14,7 @@ make                   # ./rig
 make test              # go vet (including the integration tag) and unit tests
 make generate          # schema/rig.schema.json and README's field table, from internal/manifest
 make test-integration  # real Incus and a real card; destructive, refuses if anything is up
+make plugin            # rebuild and sign plugin/ (Rust, wasm32-wasip2, wasmsign2); the result is committed
 ```
 
 Go 1.26, one module. Changes under `base/` reach a VM only through `rig image
@@ -58,8 +59,10 @@ survive). Nix sees only files git knows about, so `git add` a new file under
 | `internal/policy` | the isolation ACL and the `rig` profile |
 | `internal/ports`, `volumes`, `cpuset`, `input` | the other grants |
 | `internal/verify` | probing a live guest |
-| `internal/agent`, `creds`, `pushguard` | the agent unit, credential injection, push's overwrite guard |
+| `internal/agent`, `creds`, `pushguard` | the agent unit and the harness interface (`agent/claudecode` implements it), credential injection, push's overwrite guard |
+| `internal/proxy` | credentials the guest never holds: the rules, the guest's half, each guest's witmproxy instance and its API |
 | `internal/incus`, `vsock` | the Incus REST client; AF_VSOCK |
+| `plugin/` | rig's witmproxy plugin (Rust, `@joinezco/rig`); its signed build is embedded from `internal/proxy/plugin` |
 | `base/` | the guest image flake: `base.nix`, and opt-in `nvidia`, `docker`, `desktop` modules |
 | `project-template/` | what `rig init` writes: a `rig.yaml` and a guest flake |
 | `examples/cuda-agent/` | a GPU VM for an unattended agent |

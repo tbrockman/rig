@@ -1,8 +1,165 @@
 # Design notes
 
 Decisions and why, what was learned proving them, and what is still weak.
-Written 2026-08-23; last updated 2026-09-23. `README.md` says what this is;
+Written 2026-08-23; last updated 2026-10-15. `README.md` says what this is;
 `docs/DEV_NOTES.md` has the facts the code depends on.
+
+## 2026-10-15: the proxy as the guest's way out, opt-in
+
+The policy permitted the credentials' hosts and nothing else, which was
+too narrow by one fact: the agent's tools inherit its `HTTPS_PROXY`, so
+cargo, git, nix and npm reach their registries through the proxy or not at
+all, and under the allowlist not at all. The isolation asks only that the
+proxy never dial what the guest's own NIC may not, the private floor; what
+a guest may reach beyond that is its manifest's to say. So
+`guest.proxy.egress: internet` adds a permit for everything from the
+guest's address under the same forbid, and stays opt-in: nothing is granted
+by default, and a guest whose proxied traffic is one API has no reason to
+carry the rest. Interception is unchanged (the plugin's scope is every
+connection), so every tool under the agent must trust the proxy's CA; rig
+names the bundle for those that read a variable, cargo now among them, and
+`rig doctor` proves from inside the guest that an unnamed host is refused,
+or reached, as the manifest says.
+
+## 2026-10-09: a proxy per guest
+
+The multi-tenant shape below lasted a day. Two things argued against it.
+Tenant dispatch in witmproxy is by source address with a five-second cache
+that nothing invalidated when a mapping went away, and rig hands out the
+lowest free address, so a guest made within five seconds of its
+predecessor's deletion would have been its predecessor to the proxy and
+been given its credentials; fixed in witmproxy, but a process boundary
+cannot have that bug. And one shared instance is one plugin set, one CA and
+one policy default for the operator's own traffic and the guests' alike: a
+plugin uploaded by hand re-enables globally, anything the operator enables
+for themself handles guest traffic, and the default has to be permit for one
+and forbid for the other.
+
+So each guest has a witmproxy of its own: an *instance* (named,
+`rig-<vm>`) in the operator's *user scope* (`--user`, which witmproxy gained
+for this: state in the user's home, a `systemctl --user` unit, no root),
+made by rig at the first start that proxies credentials with witmproxy's
+own installer, stopped with the VM, removed with it. Its process, database,
+CA and policy are that guest's; the plugin is enabled for the whole
+instance with that guest's rules as its configuration, which needed one
+endpoint witmproxy lacked (`PUT /api/plugins/{ns}/{name}/config`). The
+ports follow from the guest's address, so nothing about the proxy is
+recorded on the instance; the NIC's ACL allows that one port, so a guest
+cannot reach another guest's proxy, and the policy says what that proxy
+dials: nothing by default, never the isolation ACL's reject list, HTTPS to
+the manifest's hosts from the guest's pinned address. Tenants and IP
+mappings left rig entirely.
+
+The cost is lifetime: a user unit ends with the session unless the
+operator's manager lingers. That turned out not to be root's: systemd 256
+lets a user linger themself, so `rig proxy setup` does it (2026-10-13).
+The one thing left to root, the ufw rule for the proxies' range, setup runs
+under sudo with the rule printed first, as the host verbs do, rather than
+only printing it as the published-ports rules are: setup is run once, by
+hand, where a password prompt is fine. The alternatives were a system template
+unit with a polkit rule (state still root's) or a root supervisor in
+witmproxy (orchestration it need not do). On macOS the equivalent, a
+LaunchDaemon with `UserName`, is noted in witmproxy and not written; a
+LaunchAgent lives with the login session there.
+
+Policy became data in witmproxy rather than a plugin capability. The sketch
+had plugins contribute rules under a CEL bound (`dst.port() == 443`) on what
+they might permit; a bound evaluated over a *pattern* is ill-defined, and
+the thing that knows both the credential and the client is rig, so rig
+writes `policy.toml` and the plugin never sees policy. The algebra is
+Cedar's, the shape Tailscale's, evaluated in the dialer per resolved
+address; witmproxy's `--upstream-deny` is now shorthand for one forbid.
+
+## 2026-10-08: credentials the guest never holds
+
+The README listed it under what does not hold: a guest can send out anything
+it has, and the one thing it has worth sending is its API key. Scoping the key
+was the whole answer. Now a manifest can say `guest.proxy.credentials:
+{ANTHROPIC_API_KEY: [POST api.anthropic.com/v1/messages]}`, and the key stays
+on the host: witmproxy runs there with rig's plugin (`plugin/`, `@joinezco/rig`,
+embedded in rig as a signed component), which puts the real value into HTTPS
+requests to the endpoints named, in place of the stand-in the guest was given.
+An endpoint is a host, and optionally the methods and the path below which
+the value may go, so a key can be good for one call and nothing else. The
+stand-in is random per start (and kept across `rig creds`, so a swapped value
+needs no agent restart), works through this proxy alone, and only there;
+`rig creds` rotates it with the key.
+
+witmproxy is the operator's service, not rig's child. Its own installer puts
+it in a system unit; it has tenants, per-tenant plugin enablement and
+configuration, and a management API; rig is a client of that API and a plugin
+in it. Each guest is a tenant, known by its address: a second NIC on a bridge
+of rig's own, `rigproxy0`, with no NAT, no routing, no DNS, and an ACL on the
+NIC that allows one thing, TCP to the proxy's port on the bridge address.
+The address is pinned to the NIC by Incus (`ipv4_filtering` drops anything
+the guest sends from another) and set in the guest by rig at each start, so
+an address is an identity the proxy can trust. Incus would lease it by DHCP
+too, and the first attempt relied on that, until the host's firewall turned
+out to drop the exchange: a guest talking to the host's own address on a
+bridge is ordinary INPUT traffic to the host, and ufw's default policy
+drops it. The proxy port needs one ufw rule for the same reason; DHCP did
+not need to. The plugin is installed disabled and
+enabled per tenant with that tenant's rules, so a client the proxy cannot
+name is never intercepted on rig's account. The agent gets `HTTPS_PROXY`
+through the env file it already sources, with the proxy's CA named for every
+tool that keeps its own trust store; the harness adds the line its runtime
+needs (`NODE_EXTRA_CA_CERTS` for Claude Code). Its traffic to the rest of
+the world keeps going out of its first NIC, under the isolation ACL,
+carrying stand-ins.
+
+A first cut (2026-10-06) read the Incus ACL ordering (rejects before allows,
+across every ACL on a NIC) as ruling out any IP path to a proxy on this
+host, and went over vsock: socat on the guest's loopback dialing the host,
+and a transient user unit of rig's own supervising witmproxy with a
+plugin-directory sidecar for its rules. It worked and was verified, and was
+replaced two days later: it duplicated what witmproxy already is, tied every
+guest's credentials to the operator's login session (a user unit ends with
+it unless lingering is on), and could not tell one guest from another. The
+ordering fact rules out a hole in the first NIC's ACL, not a second NIC: ACLs
+are per NIC, and a NIC of its own has an ACL with no reject in it to shadow
+anything. Running witmproxy inside the guest was never an option; the agent
+is root there.
+
+witmproxy gained what the shape needed. From the first cut: `--upstream-deny`
+(the ACL's reject list, judged on the address about to be dialed, after
+resolution, since a forward proxy reaches whatever its host reaches), a 421
+for a request inside an intercepted connection that names another host, a
+plugin-directory sidecar for configuration as files, and dialing the
+kernel's record of the original destination in transparent mode. For this
+cut: tenant resolution on the explicit listener, which its own code had left
+as "Phase 4", threaded through CONNECT and the MITM into every plugin
+dispatch, with the per-tenant effective plugin set and per-tenant
+configuration that existed but had no callers; a tenant-create endpoint;
+and `witm tenant create` using it rather than the registration placeholder.
+
+On the plugin's language: witmproxy's plugin world is `async func` with
+`stream` and `future` types. wit-bindgen-go 0.7.0 with a stock Go emits no
+exports for those, and its async support needs a patched Go toolchain, so
+the plugin is Rust, which is the toolchain `witm plugin new` scaffolds for.
+It lives in rig, with the WIT package vendored, and its signed build is
+committed, so building rig needs no Rust.
+
+The agent tooling became generic over a harness at the same time
+(`internal/agent.Harness`, implemented by `internal/agent/claudecode`, chosen
+by `guest.agent`): the binary, how it is installed and launched, how its
+event log is read, which credentials it authenticates with and where they
+go, and how it trusts an extra CA. The unit, the inbox, the session id and
+the restart policy are shared. Claude Code is the only implementation.
+
+What is weak: the key is usable from the guest at the endpoints it is meant
+for, which is its purpose, so an agent can still spend it there; only its
+leaving is prevented. Every HTTPS connection a proxied guest sends through
+the proxy is terminated by it, not only those to credential hosts, because a
+tenant can enable a plugin but not narrow its scope; a client that pins its
+server's certificate fails through the proxy. A response that echoes a
+credential back would echo the real one; none of the APIs this was written
+for do. A credential inside a request body is not rewritten, nor one inside
+Basic auth's base64. Only what sources `/run/rig/env` uses the proxy; the
+rest of the guest's traffic goes direct, carrying nothing. A VM that stops
+without `rig stop` leaves its tenant in the proxy until its next start, and
+`rig proxy status` names it. Uploading the plugin enables it globally, so
+`rig proxy setup` disables it right after; a `witm plugin add` by hand would
+not.
 
 ## 2026-09-23: from agent sandbox to grants
 
@@ -107,6 +264,10 @@ discovered, so moving the card needs no config change.
   guest flake at the base this build came from — a release names its tag on
   GitHub, a development build a copy under the cache directory — and
   `rig image build` falls back to that same copy when there is no `./base`.
+  Every build rewrites the copy first (2026-10-15): a `make` at the same
+  commit keeps the cache key, so a project's image was built against the
+  base an older binary had left there; the lock pinning the old copy fails
+  in nix's words, with rig's hint to remove it.
   The cost is that the template a binary writes is the template it was built
   with, which is the point: it is the one that binary's image build agrees
   with.
@@ -464,6 +625,19 @@ What remains:
    itself when detached from a stopped instance (2026-09-22), with
    `driver_override` set to `xhci_hcd`. `rig stop` now checks for a bound host
    driver and the recipe's sign of life before asking for root.
+   Read against the source (6.0.5, 2026-09-23): at every stop Incus rebinds
+   a device to the driver it had when the VM started, so the card stayed on
+   vfio-pci because it was parked there then. Taken from a host driver, it
+   goes back unreset, the dead adapter of 6. below. So `rig host return`
+   redoes a device that is bound without its sign of life, and `rig start`
+   leaves a watcher, `rig-handback-<vm>`, for a stop `rig stop` did not make.
+   That redo comes too late if the rebind itself does the damage: the first
+   stop after a start that took the card from nvidia, with the host's desktop
+   on it, froze the host hard before `rig stop` could act (2026-09-28). No log
+   survived, so the rebind is the likeliest cause rather than a proven one.
+   Since then `rig start` parks a device whose recipe resets on vfio-pci after
+   the claim has checked its identity, so the driver Incus restores is
+   vfio-pci and the reset always happens.
 2. **Starting a second VM with the same GPU hot-unplugs it from the running
    one.** Loud on the VM that failed to start, **silent on the victim** — it
    still shows RUNNING with a healthy IP. This is what `rig` prevents.

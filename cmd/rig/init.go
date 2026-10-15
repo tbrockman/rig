@@ -334,16 +334,25 @@ func releaseBaseRef(b build) (string, bool) {
 	return "github:" + repo + "/" + b.version + "?dir=base", true
 }
 
-// materializeBase writes the embedded base to the cache directory and returns
-// the path. Keyed by the build, so two rigs on one machine do not overwrite
-// each other's, and rewritten every time, because it is derived from the
-// binary and nothing else.
-func materializeBase() (string, error) {
+// baseCacheDir is where this build's copy of the embedded base goes. Keyed
+// by the build, so two rigs on one machine do not overwrite each other's.
+func baseCacheDir() (string, error) {
 	cache, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(cache, "rig", "base-"+buildKey(readBuild()))
+	return filepath.Join(cache, "rig", "base-"+buildKey(readBuild())), nil
+}
+
+// materializeBase writes the embedded base to the cache directory and returns
+// the path. Rewritten every time, because it is derived from the binary and
+// nothing else: `rig init` points a project at it, and `rig image build`
+// refreshes it before any build (cmd/rig/image.go).
+func materializeBase() (string, error) {
+	dir, err := baseCacheDir()
+	if err != nil {
+		return "", err
+	}
 	if err := rig.WriteTree(rig.Base(), dir, nil); err != nil {
 		return "", err
 	}

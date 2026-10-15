@@ -19,3 +19,9 @@ guest:
   disk: 40GiB
   env_file: ~/.config/rig/cuda-agent.env
   devices: [gpu]
+  # With witmproxy on the host (rig proxy setup), the key never enters the VM:
+  # the agent holds a stand-in, and the proxy puts the real key into this one
+  # call to Anthropic and nothing else.
+  # proxy:
+  #   credentials:
+  #     ANTHROPIC_API_KEY: [POST api.anthropic.com/v1/messages]

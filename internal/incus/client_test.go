@@ -121,6 +121,95 @@ func TestAsyncOperationFailureSurfaces(t *testing.T) {
 	}
 }
 
+// A start refused because host processes hold the card carries the holders
+// only in its text, as Incus 6.0 writes it: PIDs one per line, tab-indented.
+func TestDeviceInUseReadsTheRefusal(t *testing.T) {
+	f := newFake(t)
+	f.handle("PUT /1.0/instances/{name}/state", func(w http.ResponseWriter, r *http.Request) {
+		writeAsync(w, f.operation("op-start", map[string]any{
+			"err": "Failed to start device \"gpu\": Cannot use device \"/dev/nvidia0\", " +
+				"2 processes are still attached to it:\n\t4242\n\t4343",
+			"status": "Failure", "status_code": 400,
+		}), nil)
+	})
+	err := f.client().SetState("myvm", "start", 30)
+	got, ok := DeviceInUse(err)
+	if !ok {
+		t.Fatalf("not recognised: %v", err)
+	}
+	if got.Device != "gpu" || got.Node != "/dev/nvidia0" || len(got.PIDs) != 2 || got.PIDs[0] != 4242 || got.PIDs[1] != 4343 {
+		t.Errorf("got %+v", got)
+	}
+	for _, other := range []error{nil, errors.New("operation failed: Instance is running")} {
+		if _, ok := DeviceInUse(other); ok {
+			t.Errorf("%v is not a device in use", other)
+		}
+	}
+}
+
+// --- events and operations -------------------------------------------------
+
+// The handback watcher acts on an instance's stop event, so only lifecycle
+// events about that instance itself may come through as its, and the stream
+// has to end when Incus closes it, so the watcher knows to reconnect.
+func TestLifecycleEventsNameTheirInstance(t *testing.T) {
+	f := newFake(t)
+	f.handle("GET /1.0/events", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("type") != "lifecycle" {
+			t.Errorf("subscribed to %q", r.URL.RawQuery)
+		}
+		c := acceptWS(t, w, r)
+		if c == nil {
+			return
+		}
+		for _, ev := range []string{
+			`{"type":"logging","metadata":{"message":"hi"}}`,
+			`{"type":"lifecycle","metadata":{"action":"instance-shutdown","source":"/1.0/instances/other"}}`,
+			`{"type":"lifecycle","metadata":{"action":"instance-snapshot-created","source":"/1.0/instances/myvm/snapshots/s0"}}`,
+			`{"type":"lifecycle","metadata":{"action":"instance-shutdown","source":"/1.0/instances/myvm?project=default"}}`,
+		} {
+			c.Write(r.Context(), websocket.MessageText, []byte(ev))
+		}
+		c.Close(websocket.StatusNormalClosure, "")
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	events, err := f.client().LifecycleEvents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for ev := range events {
+		got = append(got, ev.Instance()+" "+ev.Action)
+	}
+	// A snapshot's event is about the snapshot, so it names no instance.
+	want := []string{"other instance-shutdown", " instance-snapshot-created", "myvm instance-shutdown"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// Between the stop and start halves of a restart Incus reports the instance
+// Stopped; an operation still running on it is what says it is not done.
+func TestBusyLooksForARunningOperationOnTheInstance(t *testing.T) {
+	f := newFake(t)
+	running := []any{map[string]any{"resources": map[string]any{"instances": []string{"/1.0/instances/other"}}}}
+	f.handle("GET /1.0/operations", func(w http.ResponseWriter, r *http.Request) {
+		writeSync(w, map[string]any{
+			"running": running,
+			"success": []any{map[string]any{"resources": map[string]any{"instances": []string{"/1.0/instances/myvm"}}}},
+		})
+	})
+	c := f.client()
+	if busy, err := c.Busy("myvm"); err != nil || busy {
+		t.Errorf("a finished operation, or one on another instance, is not busy: %v %v", busy, err)
+	}
+	running = append(running, map[string]any{"resources": map[string]any{"instances": []string{"/1.0/instances/myvm?project=default"}}})
+	if busy, err := c.Busy("myvm"); err != nil || !busy {
+		t.Errorf("a running operation on it is busy: %v %v", busy, err)
+	}
+}
+
 // --- instances -----------------------------------------------------------
 
 func TestCreateVMSendsTheProfileSecurebootAndARootDiskOverride(t *testing.T) {
@@ -255,6 +344,16 @@ func TestSetDevicesRoundTripsTheInstanceWithItsETag(t *testing.T) {
 	}
 	if body.Devices["gpu0"]["pci"] != "0000:01:00.0" {
 		t.Error("SetConfigKey must not touch devices")
+	}
+
+	if err := c.SetConfigKey("myvm", "user.rig.managed", ""); err != nil {
+		t.Fatal(err)
+	}
+	puts = f.all("PUT", "/1.0/instances/myvm")
+	body.Config = nil
+	decode(t, puts[len(puts)-1].Body, &body)
+	if _, ok := body.Config["user.rig.managed"]; ok {
+		t.Errorf("an empty value must remove the key, got %v", body.Config)
 	}
 }
 

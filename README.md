@@ -42,7 +42,8 @@ supported.
   group. GPUs must be NVIDIA (`rig.nixosModules.nvidia` is the driver). A
   second GPU (an iGPU will do) lets the host keep a display while a VM has the
   card.
-- Optional: `sshfs` for `rig mount`.
+- Optional: `sshfs` for `rig mount`; [witmproxy](https://witmproxy.rs)
+  running as a service for `proxy.credentials` (docs/RUNBOOK.md).
 
 ## Install
 
@@ -118,7 +119,7 @@ rig delete -f rig.yaml           # remove it; its volumes stay unless --volumes
 | `host.devices.<name>.id` | For usb, vendor:product from lsusb. For gpu and pci, vendor:device from lspci -nn: what must be at the address, since a BIOS change can renumber the bus. Required for pci. |
 | `host.devices.<name>.return` | How the host takes a gpu or pci device back after rig stop. Without it, the device stays on vfio-pci, which suits hardware the host never uses. |
 | `host.devices.<name>.return.modules` | Kernel modules to unload before the unbind and reload after the reset; the NVIDIA driver needs this. |
-| `host.devices.<name>.return.reset` | Reset the device before the host driver binds it. A card handed back from a guest may not initialise without it. |
+| `host.devices.<name>.return.reset` | Reset the device before the host driver binds it. A card handed back from a guest may not initialise without it. rig start moves the device onto vfio-pci before the VM starts, so its stop leaves it there for the reset; both steps run under sudo. |
 | `host.devices.<name>.return.alive` | A glob under the device's sysfs directory that exists once the host driver has really brought it up: drm/card* for a card, usb* for a USB controller. |
 | `host.devices.<name>.return.unit` | A host systemd unit that uses the device, such as display-manager: stopped before a VM claims it, started after it comes back. |
 | `guest.name` | The VM's name in Incus. |
@@ -133,6 +134,10 @@ rig delete -f rig.yaml           # remove it; its volumes stay unless --volumes
 | `guest.volumes` | Named Incus volumes mounted in the guest. They outlive the VM, so data survives it being recreated; host directories are refused. |
 | `guest.network` | none: no network device at all. Left out, the VM gets the isolated NIC, which reaches the internet but not this host or the LAN. |
 | `guest.input` | host: lend this host's keyboard and mouse to the guest as events from start to stop, toggled with both Ctrl keys. The guest needs rig.nixosModules.desktop. |
+| `guest.agent` | Which coding agent `rig agent` runs in this guest: claude-code, the default when left out. The harness decides the binary, how it is installed and launched, and which credentials it authenticates with. |
+| `guest.proxy` | The host's proxy (witmproxy), which this guest reaches over a second NIC that leads nowhere else. Its one job so far is credentials the guest never holds: see proxy.credentials. Set up once per host with `rig proxy setup`. |
+| `guest.proxy.credentials` | Variables from env_file whose values the guest never sees, each with the endpoints the value may be sent to. The guest gets a stand-in; the proxy puts the real value into HTTPS requests to those endpoints, and nowhere else, wherever the stand-in occurs in a header or the URL. An endpoint is "[METHOD[,METHOD] ]host[/path]": the host alone is every request to it; a path covers itself and everything below it; *.host covers the host and its subdomains. A guest that leaks everything it has leaks a string that works only through this proxy, only there: ANTHROPIC_API_KEY: [POST api.anthropic.com/v1/messages] |
+| `guest.proxy.egress` | What else the guest may reach through the proxy. Left out, nothing: the proxy dials the credentials' hosts and refuses the rest. internet: everything the isolated NIC may reach, with this host and the LAN still refused, judged on the address after resolution. For the tools under the agent, which inherit its HTTPS_PROXY: cargo, git, nix and npm reach their registries through the proxy or not at all. |
 <!-- /fields -->
 
 `rig init` starts the file with a `# yaml-language-server: $schema=…` line, so
@@ -159,6 +164,39 @@ rig agent log cuda-agent         # what it said, minus the tool calls
 
 Keep credential files outside any repository (`~/.config/rig/`).
 
+### Credentials the guest never holds
+
+The key in that file is the one thing in the VM worth taking, and an agent
+with the permission prompts off can send it anywhere. With
+[witmproxy](https://witmproxy.rs) on the host, it need not be in the VM:
+
+```yaml
+guest:
+  env_file: ~/.config/rig/cuda-agent.env
+  proxy:
+    credentials:
+      ANTHROPIC_API_KEY: [POST api.anthropic.com/v1/messages]
+```
+
+`rig start` then injects a stand-in under that name, hands the agent
+`HTTPS_PROXY`, and tells the guest's proxy the real value and where it may
+go. A `POST` to that path leaves the host with the real key in it; a request
+anywhere else, or any other call there, leaves with the stand-in, which
+nothing accepts. An endpoint is `[METHOD[,METHOD] ]host[/path]`: the host
+alone is every request to it, a path covers itself and what is below it,
+`*.host` a site. Each guest has a proxy of its own: a witmproxy instance in
+your user scope (no root), made at the guest's first start, stopped with
+`rig stop`, removed with `rig rm`, holding that guest's credentials and
+nobody else's, with a policy that lets the guest reach the hosts its
+manifest names and nothing else, or, with `egress: internet`, everything
+its own NIC may reach, for the tools under the agent that inherit its
+`HTTPS_PROXY`. The guest reaches it over a second NIC on
+a bridge of rig's own that leads to that proxy and nowhere else, so the
+isolation is untouched and `rig verify` still holds. Set up once with `rig
+proxy setup` (docs/RUNBOOK.md). `rig doctor` proves the interception from
+inside the guest; `rig proxy status` says what each proxy holds (never the
+values); `rig creds` swaps a key without a restart, as before.
+
 ## Commands
 
 `rig --help` groups them; each has its own `--help`.
@@ -181,14 +219,15 @@ Keep credential files outside any repository (`~/.config/rig/`).
 | `mount`, `unmount` | A live view of a guest directory on the host |
 | `forward` | One TCP port, either direction, over vsock |
 | `creds` | Swap the credential in a running VM |
-| `agent install/start/status/log/send/stop` | Claude Code as a systemd unit that resumes its session after a crash |
+| `proxy setup/status/log` | The host proxies that hold proxied credentials, one per guest |
+| `agent install/start/status/log/send/stop` | The coding agent (Claude Code by default) as a systemd unit that resumes its session after a crash |
 
 | Grants and isolation | |
 |---|---|
 | `setup` | This host's isolation ACL and the `rig` profile, once |
 | `claim`, `release` | Attach a stopped VM's devices; take every device back |
 | `host input` | Lend the keyboard and mouse as events (both Ctrl keys toggle) |
-| `host return/free` | What `stop` and `start` run for each device (root) |
+| `host return/free/park/handback/kill` | What `stop` and `start` run for each device (root) |
 | `host desktop/headless/status` | Move the NVIDIA card between the host's desktop and VMs (root) |
 
 `verify` exits 2 for "could not be proven", which is not a pass; `exec`
@@ -204,6 +243,9 @@ What holds:
 - There's no sshd. Every way in (`exec`, `mount`, `forward`, `host input`) is
   vsock or the Incus socket, which the host opens and the guest can't.
 - Credentials go to tmpfs in the guest: never on its disk or in Incus config.
+  A credential under `proxy.credentials` never enters the guest at all: the
+  proxy puts it into requests to the endpoints named, and the guest holds a
+  stand-in that works nowhere else.
 - `host input` lends a keyboard and mouse as events rather than passing them
   through, so a guest can't reprogram a device and have it type into the host
   later.
@@ -211,7 +253,10 @@ What holds:
 What doesn't:
 
 - The public internet is reachable unless you use `network: none`. A guest can
-  send out anything it holds, including its credential, so scope the key.
+  send out anything it holds, so scope the key, or keep it out of the guest
+  with `proxy.credentials`. A proxied key is still *usable* from the guest, at
+  the endpoints it is meant for: what the proxy prevents is the key leaving,
+  not the agent spending it there.
 - The agent is root in the guest.
 - A passed-through device belongs to the guest. The IOMMU confines its DMA,
   but assume a guest could rewrite its firmware. Pass through only what you'd

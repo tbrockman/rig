@@ -46,6 +46,11 @@ guest:
   disk: 40GiB
   # devices: [gpu]
   # env_file: ~/.config/rig/PROJECT.env   # KEY=VALUE, injected to tmpfs on start
+  # agent: claude-code            # which harness `rig agent` runs; this is the default
+  # proxy:                        # credentials the guest never holds (rig proxy setup, once per host)
+  #   credentials:                # the guest gets a stand-in; the proxy puts the real value into
+  #     ANTHROPIC_API_KEY: [POST api.anthropic.com/v1/messages]   # these endpoints, and nowhere else
+  #   egress: internet            # and everything else its NIC may reach, for the agent's tools (cargo, git, nix)
   # volumes:                      # named volumes; they outlive the VM
   #   - "PROJECT-data:/srv/data"
   # ports:                        # host:guest/proto, published on the LAN

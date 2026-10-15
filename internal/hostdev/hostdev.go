@@ -2,9 +2,10 @@
 //
 // It is the only code in the project that touches the host itself, needs
 // root, and can take the display out from under the person running it. The
-// privileged half does sysfs and systemctl and nothing else, so the code
-// running as root is as small as it can be; discovery, and the guard that
-// refuses while a VM still holds the device, happen unprivileged in the caller.
+// privileged half does sysfs, systemctl, and signals to the processes holding
+// a device, and nothing else, so the code running as root is as small as it
+// can be; discovery, and the guard that refuses while a VM still holds the
+// device, happen unprivileged in the caller.
 //
 // It was written for one card and one display manager. What was NVIDIA-specific
 // turned out to be three facts — which modules to cycle, whether to reset,
@@ -19,10 +20,15 @@ package hostdev
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -35,6 +41,8 @@ type Spec struct {
 	Modules []string
 	// Reset issues a function-level reset with no driver bound. On Ada the
 	// GSP firmware will not boot on top of what a guest left in the card.
+	// A device that resets is parked before its VM starts (see Park), or
+	// Incus's own rebind at stop would skip the reset.
 	Reset bool
 	// Alive is a glob under the device's sysfs directory that only exists once
 	// the driver has actually brought the device up. Empty means trust the bind.
@@ -56,62 +64,34 @@ func (s Spec) Status() {
 
 // Return rebinds the device to its host driver and starts its unit.
 //
+// A device already on a host driver is left there only when the recipe's sign
+// of life is present. Incus rebinds a device to its old driver by itself when
+// a VM stops, with no reset and no module reload, so a card can come back on
+// nvidia and dead; that one goes through the whole return like any other.
+//
 // The caller must have established that no instance still holds the device:
 // the rebind would otherwise race Incus and both sides lose.
 func (s Spec) Return() error {
-	if Driver(s.PCI) == "vfio-pci" {
+	driver, back := Back(s.PCI, s.Alive)
+	switch {
+	case back:
+		fmt.Printf("%s is already on %s.\n", s.PCI, driver)
+	case driver == "vfio-pci" || driver == "(none)":
 		fmt.Printf("returning %s to the host...\n", s.PCI)
-		// Order matters: unload stale modules while the device is still on
-		// vfio-pci, or the reloaded module grabs it mid-transition.
-		if len(s.Modules) > 0 {
-			run("modprobe", append([]string{"-r"}, s.Modules...)...)
+	default:
+		fmt.Printf("%s is on %s but did not come up (nothing matches %s); returning it again...\n",
+			s.PCI, driver, s.Alive)
+		// Unbinding a driver from a device something holds blocks until it
+		// lets go. Incus checks the same before it takes a card.
+		if held := s.Holders(); len(held) > 0 {
+			return fmt.Errorf("%s is held by %s, and unbinding it would block until they let go.\n"+
+				"End them, then run this again.", s.PCI, strings.Join(held, ", "))
 		}
-		// Everything in the IOMMU group left for the VM together, so it all
-		// comes back together: a card's audio function, most often.
-		members := s.group()
-		for _, addr := range members {
-			if Driver(addr) != "vfio-pci" {
-				continue
-			}
-			writeSysfs("/sys/bus/pci/drivers/vfio-pci/unbind", addr)
-			writeSysfs(sysfs(addr, "driver_override"), "\n")
+	}
+	if !back {
+		if err := s.rebind(); err != nil {
+			return err
 		}
-
-		// Reset before the driver loads, not after. With no driver bound this
-		// is the only moment the device can be cleared of what the guest left
-		// in it.
-		if s.Reset {
-			fmt.Println("resetting...")
-			if err := resetDevice(s.PCI); err != nil {
-				return fmt.Errorf("%w\n"+
-					"Without a reset the driver may bind to a device that will not "+
-					"initialise, which looks like a working device that does nothing.\n"+
-					"A reboot clears it.", err)
-			}
-		}
-
-		for i := len(s.Modules) - 1; i >= 0; i-- {
-			if out := run("modprobe", s.Modules[i]); out != "" {
-				fmt.Println(out)
-			}
-		}
-		for _, addr := range members {
-			writeSysfs("/sys/bus/pci/drivers_probe", addr)
-		}
-
-		// Binding is not working. Check the thing the device is for.
-		if s.Alive != "" && !waitAlive(s.PCI, s.Alive, 15*time.Second) {
-			msg := fmt.Sprintf("%s bound to %s but did not come up: nothing matches %s under its sysfs "+
-				"directory, so the host has a driver on a device that is not working.",
-				Driver(s.PCI), s.PCI, s.Alive)
-			if why := kernelComplaint(); why != "" {
-				msg += "\n\nThe kernel said:\n" + why
-			}
-			msg += "\n\nA reboot clears a device that a reset could not."
-			return fmt.Errorf("%s", msg)
-		}
-	} else {
-		fmt.Printf("%s is already on %s.\n", s.PCI, Driver(s.PCI))
 	}
 
 	if s.Unit != "" {
@@ -122,6 +102,62 @@ func (s Spec) Return() error {
 		fmt.Println("\nIf your monitor is on this device, switch it to that input.")
 	}
 	s.Status()
+	return nil
+}
+
+// rebind takes the device off whatever driver it is on, resets it, and binds
+// the host driver, then checks the device came up.
+func (s Spec) rebind() error {
+	// Order matters: unload stale modules while the device is still off the
+	// host driver, or the reloaded module grabs it mid-transition.
+	if len(s.Modules) > 0 {
+		run("modprobe", append([]string{"-r"}, s.Modules...)...)
+	}
+	// Everything in the IOMMU group left for the VM together, so it all
+	// comes back together: a card's audio function, most often. A companion
+	// Incus already rebound is left where it is.
+	members := s.group()
+	for _, addr := range members {
+		if drv := Driver(addr); drv == "(none)" || (drv != "vfio-pci" && addr != s.PCI) {
+			continue
+		}
+		writeSysfs(sysfs(addr, "driver/unbind"), addr)
+		writeSysfs(sysfs(addr, "driver_override"), "\n")
+	}
+
+	// Reset before the driver loads, not after. With no driver bound this
+	// is the only moment the device can be cleared of what the guest left
+	// in it.
+	if s.Reset {
+		fmt.Println("resetting...")
+		if err := resetDevice(s.PCI); err != nil {
+			return fmt.Errorf("%w\n"+
+				"Without a reset the driver may bind to a device that will not "+
+				"initialise, which looks like a working device that does nothing.\n"+
+				"A reboot clears it.", err)
+		}
+	}
+
+	for i := len(s.Modules) - 1; i >= 0; i-- {
+		if out := run("modprobe", s.Modules[i]); out != "" {
+			fmt.Println(out)
+		}
+	}
+	for _, addr := range members {
+		writeSysfs(filepath.Join(filepath.Dir(sysfsRoot), "drivers_probe"), addr)
+	}
+
+	// Binding is not working. Check the thing the device is for.
+	if s.Alive != "" && !waitAlive(s.PCI, s.Alive, 15*time.Second) {
+		msg := fmt.Sprintf("%s bound to %s but did not come up: nothing matches %s under its sysfs "+
+			"directory, so the host has a driver on a device that is not working.",
+			Driver(s.PCI), s.PCI, s.Alive)
+		if why := kernelComplaint(); why != "" {
+			msg += "\n\nThe kernel said:\n" + why
+		}
+		msg += "\n\nA reboot clears a device that a reset could not."
+		return fmt.Errorf("%s", msg)
+	}
 	return nil
 }
 
@@ -151,6 +187,142 @@ func (s Spec) Free() error {
 	fmt.Printf("%s stopped; %s is free for VMs.\n", s.Unit, s.PCI)
 	s.Status()
 	return nil
+}
+
+// Park binds the device, and everything in its IOMMU group, to vfio-pci
+// before a VM claims it.
+//
+// Incus hands a device back at stop to whatever driver it had when the VM
+// started, unreset, and before rig stop can do anything: a card taken from
+// nvidia goes back to nvidia with the guest's state still in it. Parked, the
+// driver Incus restores is vfio-pci, and the device waits there for Return to
+// reset it before the host driver loads.
+//
+// Unbinding a driver from a device something holds blocks until it lets go,
+// so the holders are checked first, as Incus checks before it takes a card;
+// kill ends them instead of refusing.
+func (s Spec) Park(kill bool) error {
+	if s.Parked() {
+		fmt.Printf("%s is already on vfio-pci.\n", s.PCI)
+		return nil
+	}
+	if held := s.blockers(); len(held) > 0 {
+		nodes := make([]string, 0, len(held))
+		for node := range held {
+			nodes = append(nodes, node)
+		}
+		sort.Strings(nodes)
+		if !kill {
+			var lines []string
+			for _, node := range nodes {
+				for _, pid := range held[node] {
+					lines = append(lines, fmt.Sprintf("  %s: %s", node, Describe(pid)))
+				}
+			}
+			return fmt.Errorf("these hold %s, and unbinding its driver would block until they let go:\n%s\n"+
+				"End them, or start with --kill-holders to have rig end them.", s.PCI, strings.Join(lines, "\n"))
+		}
+		for _, node := range nodes {
+			if err := End(node, held[node], 10*time.Second); err != nil {
+				return err
+			}
+		}
+	}
+
+	bus := filepath.Dir(sysfsRoot)
+	if _, err := os.Stat(filepath.Join(bus, "drivers", "vfio-pci")); err != nil {
+		run("modprobe", "vfio-pci")
+	}
+	members := s.group()
+	for _, addr := range members {
+		writeSysfs(sysfs(addr, "driver_override"), "vfio-pci")
+		if drv := Driver(addr); drv != "(none)" && drv != "vfio-pci" {
+			writeSysfs(sysfs(addr, "driver/unbind"), addr)
+		}
+		writeSysfs(filepath.Join(bus, "drivers_probe"), addr)
+	}
+	for _, addr := range members {
+		if !waitDriver(addr, "vfio-pci", 10*time.Second) {
+			return fmt.Errorf("%s did not bind to vfio-pci; it is on %s.", addr, Driver(addr))
+		}
+	}
+	fmt.Printf("parked %s on vfio-pci.\n", strings.Join(members, ", "))
+	return nil
+}
+
+// Parked reports whether the device and its group are all on vfio-pci, where
+// Park puts them and a VM's stop then leaves them. Reads sysfs only.
+func (s Spec) Parked() bool {
+	for _, addr := range s.group() {
+		if Driver(addr) != "vfio-pci" {
+			return false
+		}
+	}
+	return true
+}
+
+// blockers maps each node whose holders would make unbinding the device's
+// driver block to the processes that have it open or mapped: the device's
+// own DRM nodes and, on nvidia, its own /dev/nvidiaN, the node Incus checks
+// before it takes a card. Narrower than DevNodes on purpose. The rest of the
+// /dev/nvidia* family is shared by every card, a daemon such as
+// nvidia-persistenced can hold it without holding this one, and Incus takes
+// the card regardless, so refusing over it would refuse starts that work.
+// Sees other users' processes only as root.
+func (s Spec) blockers() map[string][]int {
+	var nodes []string
+	links, _ := filepath.Glob(devRoot + "/dri/by-path/pci-" + s.PCI + "-*")
+	for _, l := range links {
+		if target, err := filepath.EvalSymlinks(l); err == nil {
+			nodes = append(nodes, target)
+		}
+	}
+	if minor := nvidiaMinor(s.PCI); minor != "" {
+		nodes = append(nodes, filepath.Join(devRoot, "nvidia"+minor))
+	}
+	held := map[string][]int{}
+	if len(nodes) == 0 {
+		return held
+	}
+	procs, _ := filepath.Glob("/proc/[0-9]*")
+	for _, p := range procs {
+		pid, err := strconv.Atoi(filepath.Base(p))
+		if err != nil || pid == os.Getpid() {
+			continue
+		}
+		for _, node := range nodes {
+			if ok, _ := holdsNode(pid, node); ok {
+				held[node] = append(held[node], pid)
+			}
+		}
+	}
+	return held
+}
+
+// nvidiaMinor is the N of the card's /dev/nvidiaN, from the driver's own
+// description of the card, or "" when nvidia does not have it.
+func nvidiaMinor(pci string) string {
+	for _, line := range strings.Split(readFile(filepath.Join(nvidiaProcRoot, pci, "information")), "\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok && strings.TrimSpace(k) == "Device Minor" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// waitDriver polls until addr is bound to driver, rather than trusting that a
+// probe bound it.
+func waitDriver(addr, driver string, within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for {
+		if Driver(addr) == driver {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // UnitActive reports whether the device's host unit is running, so a caller
@@ -243,14 +415,193 @@ func matchesNode(target string, nodes []string) bool {
 	return false
 }
 
+// --- ending what holds a device -------------------------------------------
+
+// Process is a host process, described from the parts of /proc anyone may
+// read, so a message can say what it is even when what it holds is not ours
+// to look at.
+type Process struct {
+	PID  int
+	User string
+	Name string // comm
+	Args string // the command line, shortened
+	Unit string // the systemd unit or scope its cgroup is in
+}
+
+// Describe reads what can be known about a process without privilege. One
+// that has exited is its PID alone.
+func Describe(pid int) Process {
+	dir := fmt.Sprintf("/proc/%d", pid)
+	p := Process{PID: pid, Name: readFile(dir + "/comm")}
+	p.Args = strings.TrimSpace(strings.ReplaceAll(readFile(dir+"/cmdline"), "\x00", " "))
+	if len(p.Args) > 60 {
+		p.Args = p.Args[:57] + "..."
+	}
+	for _, line := range strings.Split(readFile(dir+"/status"), "\n") {
+		if f := strings.Fields(line); len(f) > 1 && f[0] == "Uid:" {
+			p.User = "uid " + f[1]
+			if u, err := user.LookupId(f[1]); err == nil {
+				p.User = u.Username
+			}
+		}
+	}
+	// cgroup v2: one line, 0::/user.slice/.../org.gnome.Shell@gdm.service
+	_, path, _ := strings.Cut(readFile(dir+"/cgroup"), "::")
+	parts := strings.Split(path, "/")
+	for i := len(parts) - 1; i >= 0; i-- {
+		if strings.HasSuffix(parts[i], ".service") || strings.HasSuffix(parts[i], ".scope") {
+			p.Unit = parts[i]
+			break
+		}
+	}
+	return p
+}
+
+func (p Process) String() string {
+	if p.Name == "" {
+		return fmt.Sprintf("pid %d (gone)", p.PID)
+	}
+	what := p.Args
+	if what == "" {
+		what = p.Name
+	}
+	s := fmt.Sprintf("%s (pid %d", what, p.PID)
+	for _, extra := range []string{p.User, p.Unit} {
+		if extra != "" {
+			s += ", " + extra
+		}
+	}
+	return s + ")"
+}
+
+// Visible reports whether this process can see what pid has open. Short of
+// root, that is also whether pid is ours to signal, so the caller knows
+// before trying whether ending it needs sudo.
+func Visible(pid int) bool {
+	_, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
+	return err == nil || errors.Is(err, fs.ErrNotExist)
+}
+
+// End ends the processes among pids that have node open or mapped: SIGTERM,
+// then SIGKILL for any still holding it after grace. A PID that no longer
+// holds node is left alone, so a list gone stale, or a PID reused since it
+// was made, costs nothing.
+//
+// node must be a character device under /dev. The verb that runs this as
+// root ends processes for holding a device and for nothing else.
+func End(node string, pids []int, grace time.Duration) error {
+	if fi, err := os.Stat(node); err != nil || !strings.HasPrefix(node, "/dev/") ||
+		filepath.Clean(node) != node || fi.Mode()&os.ModeCharDevice == 0 {
+		return fmt.Errorf("%s is not a device node under /dev", node)
+	}
+	var targets []int
+	for _, pid := range pids {
+		if pid <= 1 || pid == os.Getpid() {
+			continue
+		}
+		held, err := holdsNode(pid, node)
+		if err != nil {
+			return err
+		}
+		if held {
+			targets = append(targets, pid)
+		}
+	}
+	if len(targets) == 0 {
+		fmt.Printf("nothing listed holds %s any more.\n", node)
+		return nil
+	}
+	signal := func(pids []int, sig syscall.Signal, verb string) error {
+		for _, pid := range pids {
+			fmt.Printf("%s %s\n", verb, Describe(pid))
+			if err := syscall.Kill(pid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
+				return fmt.Errorf("signalling pid %d: %w", pid, err)
+			}
+		}
+		return nil
+	}
+	if err := signal(targets, syscall.SIGTERM, "ending"); err != nil {
+		return err
+	}
+	left := waitUnheld(node, targets, grace)
+	if len(left) == 0 {
+		return nil
+	}
+	fmt.Printf("still holding %s after %s:\n", node, grace)
+	if err := signal(left, syscall.SIGKILL, "  killing"); err != nil {
+		return err
+	}
+	if left = waitUnheld(node, left, 5*time.Second); len(left) > 0 {
+		var names []string
+		for _, pid := range left {
+			names = append(names, Describe(pid).String())
+		}
+		return fmt.Errorf("still holding %s after SIGKILL: %s", node, strings.Join(names, ", "))
+	}
+	return nil
+}
+
+// holdsNode reports whether a process has node open or mapped. Incus checks
+// the maps alone, so a process that closed the node but kept a mapping still
+// blocks it. A process that has exited, or been reaped, holds nothing.
+func holdsNode(pid int, node string) (bool, error) {
+	dir := fmt.Sprintf("/proc/%d", pid)
+	fds, err := os.ReadDir(dir + "/fd")
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("cannot see what pid %d has open: %w", pid, err)
+	}
+	for _, fd := range fds {
+		if target, err := os.Readlink(dir + "/fd/" + fd.Name()); err == nil && target == node {
+			return true, nil
+		}
+	}
+	maps, err := os.ReadFile(dir + "/maps")
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("cannot see what pid %d has mapped: %w", pid, err)
+	}
+	for _, line := range strings.Split(string(maps), "\n") {
+		if f := strings.Fields(line); len(f) >= 6 && f[5] == node {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// waitUnheld polls until none of pids holds node, returning those still
+// holding it when time runs out. One that can no longer be read counts as
+// released: it was readable when End began, so it has exited and its PID may
+// belong to someone else now, which is the last thing to send SIGKILL to.
+func waitUnheld(node string, pids []int, within time.Duration) []int {
+	deadline := time.Now().Add(within)
+	for {
+		var left []int
+		for _, pid := range pids {
+			if held, err := holdsNode(pid, node); err == nil && held {
+				left = append(left, pid)
+			}
+		}
+		if len(left) == 0 || time.Now().After(deadline) {
+			return left
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // --- sysfs helpers -------------------------------------------------------
 
 // sysfsRoot and devRoot are variables so tests can point the routine at a fake
 // tree. Nothing but a test ever changes them.
 var (
-	sysfsRoot = "/sys/bus/pci/devices"
-	usbRoot   = "/sys/bus/usb/devices"
-	devRoot   = "/dev"
+	sysfsRoot      = "/sys/bus/pci/devices"
+	usbRoot        = "/sys/bus/usb/devices"
+	devRoot        = "/dev"
+	nvidiaProcRoot = "/proc/driver/nvidia/gpus"
 )
 
 func sysfs(pci, leaf string) string { return filepath.Join(sysfsRoot, pci, leaf) }

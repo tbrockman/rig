@@ -7,13 +7,16 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/tbrockman/rig/internal/agent"
 	"github.com/tbrockman/rig/internal/cpuset"
 	"github.com/tbrockman/rig/internal/creds"
 	"github.com/tbrockman/rig/internal/devices"
 	"github.com/tbrockman/rig/internal/hostdev"
 	"github.com/tbrockman/rig/internal/incus"
 	"github.com/tbrockman/rig/internal/manifest"
+	"github.com/tbrockman/rig/internal/policy"
 	"github.com/tbrockman/rig/internal/ports"
+	"github.com/tbrockman/rig/internal/proxy"
 	"github.com/tbrockman/rig/internal/volumes"
 )
 
@@ -54,7 +57,16 @@ func desired(m *manifest.Manifest) (map[string]string, error) {
 		// Always present, empty when unasked: removing the line from the file
 		// must read as drift, not as nothing to say.
 		inputKey: m.Guest.Input,
+		// Empty is the default harness; the agent verbs read it that way.
+		agent.HarnessKey: m.Guest.Agent,
 	}
+	var credentials map[string][]string
+	if m.Guest.Proxy != nil {
+		credentials = m.Guest.Proxy.Credentials
+	}
+	cfg[proxy.InstanceKey] = proxy.Encode(credentials)
+	// Always present, like input: an egress line removed must read as drift.
+	cfg[proxy.EgressKey] = m.ProxyEgress()
 	if absEnv != "" {
 		cfg[creds.InstanceKey] = absEnv
 	}
@@ -134,17 +146,17 @@ func (a *app) newFromManifest(m *manifest.Manifest, profile string) error {
 	}); err != nil {
 		return err
 	}
-	if m.Guest.Network == manifest.NetworkNone {
+	if m.Guest.Network == manifest.NetworkNone || m.Proxied() {
 		inst, _, err := a.c.Instance(name)
 		if err != nil {
 			return err
 		}
-		changes, err := a.reconcileNetwork(inst, true, false)
+		changes, err := a.reconcileNetwork(inst, m.Guest.Network == manifest.NetworkNone, m.Proxied(), false)
 		for _, ch := range changes {
 			note("%s", ch)
 		}
 		if err != nil {
-			return fmt.Errorf("removing the network device: %w", err)
+			return fmt.Errorf("network devices: %w", err)
 		}
 	}
 	if len(m.Guest.Volumes) > 0 {
@@ -213,6 +225,9 @@ func (a *app) reconcileManifest(m *manifest.Manifest) ([]string, error) {
 	if inst.Running() && inst.Config[devices.DevicesKey] != want[devices.DevicesKey] {
 		changes = append(changes, "note: a running VM keeps the devices it started with; rig restart "+name+" to hand it the new set")
 	}
+	if inst.Running() && (inst.Config[proxy.InstanceKey] != want[proxy.InstanceKey] || inst.Config[proxy.EgressKey] != want[proxy.EgressKey]) {
+		changes = append(changes, "note: the proxied credentials or the proxy's egress changed; the guest gets the new set at its next start, or now with:  rig creds "+name+" "+firstNonEmpty(want[creds.InstanceKey], "<env-file>"))
+	}
 	if inst.Running() && inst.Config[inputKey] != want[inputKey] {
 		if want[inputKey] == manifest.InputHost {
 			changes = append(changes, "note: input is lent from the next start; for this run:  rig host input "+name+" --background")
@@ -230,7 +245,7 @@ func (a *app) reconcileManifest(m *manifest.Manifest) ([]string, error) {
 		if inst, _, err = a.c.Instance(name); err != nil {
 			return changes, err
 		}
-		netChanges, err := a.reconcileNetwork(inst, false, false)
+		netChanges, err := a.reconcileNetwork(inst, false, m.Proxied(), false)
 		changes = append(changes, netChanges...)
 		if err != nil {
 			return changes, err
@@ -252,7 +267,7 @@ func (a *app) reconcileManifest(m *manifest.Manifest) ([]string, error) {
 		if inst, _, err = a.c.Instance(name); err != nil {
 			return changes, err
 		}
-		netChanges, err := a.reconcileNetwork(inst, true, false)
+		netChanges, err := a.reconcileNetwork(inst, true, false, false)
 		changes = append(changes, netChanges...)
 		if err != nil {
 			return changes, err
@@ -390,6 +405,90 @@ func freeWanted(wanted []devices.Decl) error {
 	return nil
 }
 
+// parkClaimed is what devices.Start runs between the claim and the start: it
+// parks each claimed device whose recipe resets it on vfio-pci. Incus hands a
+// device back at stop to the driver it had at start, unreset, so a device
+// taken from its host driver would skip the reset its recipe asks for. After
+// the claim, because the claim is what checks the device at each address is
+// the one declared: nothing is unbound on the strength of a stale address.
+func parkClaimed(kill bool) func([]devices.Decl) error {
+	return func(claimed []devices.Decl) error {
+		for _, d := range claimed {
+			if !d.Exclusive() || d.Return == nil || !d.Return.Reset {
+				continue
+			}
+			s := spec(d.PCI, d.Return)
+			// Still parked from before, as rig restart leaves it: nothing to
+			// ask root for.
+			if s.Parked() {
+				continue
+			}
+			var err error
+			if os.Geteuid() == 0 {
+				err = s.Park(kill)
+			} else {
+				err = elevate(parkArgs(s.PCI, kill))
+			}
+			if err != nil {
+				return fmt.Errorf("parking %s (%s) on vfio-pci: %w", d.Name, d.PCI, err)
+			}
+		}
+		return nil
+	}
+}
+
+// startPastHolders runs start, which is devices.Start, for when a process on
+// the host still holds a card: Incus refuses before it moves anything, naming
+// PIDs alone, so this says what they are and, with kill, ends them and tries
+// again.
+//
+// Once per node. If a node is held again after its holders were ended,
+// something restarts them, and ending them again would only race it. Losing
+// that race is worse than a refusal: Incus checks and then unbinds, and the
+// unbind blocks while anything holds the card.
+func startPastHolders(name string, kill bool, start func() error) error {
+	ended := map[string]bool{}
+	for {
+		err := start()
+		held, ok := incus.DeviceInUse(err)
+		if !ok {
+			return err
+		}
+		var list strings.Builder
+		for _, pid := range held.PIDs {
+			fmt.Fprintf(&list, "  %s\n", hostdev.Describe(pid))
+		}
+		if ended[held.Node] {
+			return fmt.Errorf("%s is held again after its holders were ended, so something restarts them:\n%s"+
+				"Ending these as well would only race it. %s was not started.%s",
+				held.Node, list.String(), name, displayManagerHint(held.Device))
+		}
+		if !kill {
+			return fmt.Errorf("%s was not started: Incus will not take %s (%s) while a process on this host has it open:\n%s"+
+				"End them and start anyway:  rig start --kill-holders %s%s",
+				name, held.Device, held.Node, list.String(), name, displayManagerHint(held.Device))
+		}
+		if err := endHolders(held.Node, held.PIDs); err != nil {
+			return fmt.Errorf("ending what holds %s: %w", held.Node, err)
+		}
+		ended[held.Node] = true
+	}
+}
+
+// displayManagerHint is the fix for the likeliest holder on a host with a
+// desktop: the display manager's shell, which keeping a login screen up is
+// what a display manager is for. GDM's holds the card even with the console
+// on another GPU.
+func displayManagerHint(device string) string {
+	if !(hostdev.Spec{Unit: "display-manager"}).UnitActive() {
+		return ""
+	}
+	return fmt.Sprintf("\n\nA display manager is running. If its shell is what holds the card, it starts another when\n"+
+		"that one is killed; stop the display manager instead:\n"+
+		"  for this start:  rig host headless\n"+
+		"  for every start: add unit: display-manager to %s's return: in rig.yaml, then rig apply -f", device)
+}
+
 // --- the network device -----------------------------------------------------
 
 // networkPlan works out how an instance's devices change for a manifest's
@@ -399,7 +498,7 @@ func freeWanted(wanted []devices.Decl) error {
 // override ports put there) is deleted. Without none, the masks over profile
 // NICs are lifted. A `none` device over anything else is someone else's
 // decision and is left alone. Pure, so the rules are testable without Incus.
-func networkPlan(inst *incus.Instance, profileNICs map[string]bool, none bool) (map[string]incus.Device, []string) {
+func networkPlan(inst *incus.Instance, profileNICs map[string]bool, none bool, proxyNIC incus.Device) (map[string]incus.Device, []string) {
 	devices := make(map[string]incus.Device, len(inst.Devices))
 	for name, dev := range inst.Devices {
 		devices[name] = dev
@@ -423,14 +522,42 @@ func networkPlan(inst *incus.Instance, profileNICs map[string]bool, none bool) (
 			}
 		}
 	}
+	// The proxy NIC: an instance device of rig's own, wanted exactly when
+	// the manifest proxies credentials. Its settings are rig's too: a
+	// filter switched off by hand is put back, because the proxy trusts
+	// the address this NIC pins.
+	have, has := devices[policy.ProxyDevice]
+	switch {
+	case proxyNIC != nil && !has:
+		devices[policy.ProxyDevice] = proxyNIC
+		changes = append(changes, policy.ProxyDevice+": add the NIC on "+policy.ProxyNetwork+" at "+proxyNIC["ipv4.address"]+" (the proxy, and nothing else)")
+	case proxyNIC != nil && has && !sameDeviceMap(have, proxyNIC):
+		devices[policy.ProxyDevice] = proxyNIC
+		changes = append(changes, policy.ProxyDevice+": bring the NIC on "+policy.ProxyNetwork+" back to rig's settings")
+	case proxyNIC == nil && has && !none && policy.IsProxyNIC(have):
+		delete(devices, policy.ProxyDevice)
+		changes = append(changes, policy.ProxyDevice+": remove the NIC on "+policy.ProxyNetwork+" (no proxied credentials)")
+	}
 	sort.Strings(changes)
 	return devices, changes
+}
+
+func sameDeviceMap(a, b incus.Device) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // reconcileNetwork brings an instance's network devices to what the manifest
 // asks for, or with dryRun reports what it would change. A NIC is not changed
 // on a running VM.
-func (a *app) reconcileNetwork(inst *incus.Instance, none, dryRun bool) ([]string, error) {
+func (a *app) reconcileNetwork(inst *incus.Instance, none, proxied, dryRun bool) ([]string, error) {
 	profileNICs := map[string]bool{}
 	for _, name := range inst.Profiles {
 		p, _, err := a.c.Profile(name)
@@ -443,14 +570,48 @@ func (a *app) reconcileNetwork(inst *incus.Instance, none, dryRun bool) ([]strin
 			}
 		}
 	}
-	devices, changes := networkPlan(inst, profileNICs, none)
+	// A proxied guest keeps the address it has; a new one takes the lowest
+	// free, so a VM's address is stable for as long as it has the NIC. The
+	// NIC's ACL, which allows that guest's own proxy and nothing else, must
+	// exist before the NIC that names it.
+	var proxyNIC incus.Device
+	var aclChanges []string
+	if proxied {
+		ip := policy.ProxyIPOf(inst)
+		if ip == "" {
+			instances, err := a.c.Instances()
+			if err != nil {
+				return nil, err
+			}
+			if ip, err = policy.AllocateProxyIP(policy.UsedProxyIPs(instances)); err != nil {
+				return nil, err
+			}
+		}
+		var err error
+		if aclChanges, err = policy.EnsureProxyACL(a.c, inst.Name, ip, dryRun); err != nil {
+			return nil, err
+		}
+		proxyNIC = policy.ProxyNIC(inst.Name, ip)
+	}
+	devices, changes := networkPlan(inst, profileNICs, none, proxyNIC)
+	changes = append(aclChanges, changes...)
 	if len(changes) == 0 || dryRun {
 		return changes, nil
 	}
 	if inst.Running() {
 		return changes, fmt.Errorf("%s is running; its network device cannot be changed live.\n  rig stop %s, then rig apply -f again", inst.Name, inst.Name)
 	}
-	return changes, a.c.SetDevices(inst.Name, devices)
+	if err := a.c.SetDevices(inst.Name, devices); err != nil {
+		return changes, err
+	}
+	// A NIC taken away leaves its ACL behind, which is not part of the
+	// instance.
+	if !proxied {
+		if err := policy.DeleteProxyACL(a.c, inst.Name); err != nil {
+			return changes, err
+		}
+	}
+	return changes, nil
 }
 
 // checkCPUs refuses a pinned CPU set this host cannot honour, or one that

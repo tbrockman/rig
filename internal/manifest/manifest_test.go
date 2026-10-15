@@ -39,6 +39,9 @@ guest:
     - "47998-48000:47998-48000/udp"
     - "8080:80"
     - { published: 9000, target: 9001, protocol: udp }
+  proxy:
+    credentials:
+      ANTHROPIC_API_KEY: [api.anthropic.com]
 `
 
 func TestParseReadsTheExample(t *testing.T) {
@@ -64,6 +67,23 @@ func TestParseReadsTheExample(t *testing.T) {
 		if p.String() != want[i] {
 			t.Errorf("port %d = %s, want %s", i, p, want[i])
 		}
+	}
+	if !m.Proxied() || m.Guest.Proxy.Credentials["ANTHROPIC_API_KEY"][0] != "api.anthropic.com" {
+		t.Errorf("proxied credentials not read: %+v", m.Guest.Proxy)
+	}
+}
+
+// A proxied credential needs a file to come from, a network device to reach
+// the proxy over, a variable an env file can define, and real host names.
+func TestProxyCredentialsAreCheckedAgainstTheRest(t *testing.T) {
+	plain := strings.Replace(example, "  proxy:\n    credentials:\n      ANTHROPIC_API_KEY: [api.anthropic.com]\n", "", 1)
+	m, err := Parse([]byte(plain))
+	if err != nil || m.Proxied() {
+		t.Fatalf("without the block: %v %v", err, m.Proxied())
+	}
+	empty := strings.Replace(example, "ANTHROPIC_API_KEY: [api.anthropic.com]", "", 1)
+	if m, err := Parse([]byte(empty)); err != nil || m.Proxied() {
+		t.Fatalf("an empty credentials: must read as not proxied: %v", err)
 	}
 }
 
@@ -103,6 +123,37 @@ var badEdits = map[string]func(string) string{
 	// BIOS change renumbered the bus; a pci device must say what it is.
 	"pci without its identity": func(s string) string { return strings.Replace(s, "      id: 1022:1111\n", "", 1) },
 	"malformed identity":       func(s string) string { return strings.Replace(s, "id: 10de:abcd", "id: RTX4080", 1) },
+	// A proxied credential comes from the env file and goes over the network.
+	"proxy without an env file": func(s string) string { return strings.Replace(s, "  env_file: ~/.config/rig/myproj.env\n", "", 1) },
+	"proxy with no network": func(s string) string {
+		s = strings.Replace(s, "  ports:\n    - \"47989:47989/tcp\"\n    - \"47998-48000:47998-48000/udp\"\n    - \"8080:80\"\n    - { published: 9000, target: 9001, protocol: udp }\n", "", 1)
+		return strings.Replace(s, "  proxy:", "  network: none\n  proxy:", 1)
+	},
+	"proxied variable that is not one": func(s string) string { return strings.Replace(s, "ANTHROPIC_API_KEY:", "anthropic-key:", 1) },
+	"proxied credential with no hosts": func(s string) string { return strings.Replace(s, "[api.anthropic.com]", "[]", 1) },
+	"proxied host with a scheme": func(s string) string {
+		return strings.Replace(s, "api.anthropic.com]", "https://api.anthropic.com]", 1)
+	},
+	"proxied endpoint with a query": func(s string) string {
+		return strings.Replace(s, "[api.anthropic.com]", `["api.anthropic.com/v1?x=1"]`, 1)
+	},
+	"proxied endpoint with a lower-case method": func(s string) string {
+		return strings.Replace(s, "[api.anthropic.com]", `["post api.anthropic.com"]`, 1)
+	},
+	"unknown agent": func(s string) string {
+		return strings.Replace(s, "  name: myproj\n", "  name: myproj\n  agent: codex\n", 1)
+	},
+	"proxied host with a port": func(s string) string {
+		return strings.Replace(s, "[api.anthropic.com]", "[\"api.anthropic.com:443\"]", 1)
+	},
+	// egress widens what the proxy dials; it is a word, and it is nothing
+	// without a credential to have a proxy for.
+	"proxy egress that is not internet": func(s string) string {
+		return strings.Replace(s, "  proxy:\n", "  proxy:\n    egress: everywhere\n", 1)
+	},
+	"proxy egress without a credential": func(s string) string {
+		return strings.Replace(s, "    credentials:\n      ANTHROPIC_API_KEY: [api.anthropic.com]\n", "    egress: internet\n", 1)
+	},
 }
 
 func TestParseRejectsWhatWouldFailLater(t *testing.T) {
@@ -281,5 +332,61 @@ func TestFlakeRefSplitsTheName(t *testing.T) {
 		if ref, attr := m.FlakeRef(); ref != want[0] || attr != want[1] {
 			t.Errorf("%s: got %s #%s, want %s #%s", in, ref, attr, want[0], want[1])
 		}
+	}
+}
+
+// The endpoint grammar: a host alone, methods and a path to narrow it, a
+// wildcard for a site; rendered back canonically.
+func TestEndpointGrammar(t *testing.T) {
+	good := map[string]Endpoint{
+		"api.anthropic.com":                        {Host: "api.anthropic.com"},
+		"POST api.anthropic.com/v1/messages":       {Host: "api.anthropic.com", Methods: []string{"POST"}, Path: "/v1/messages"},
+		"GET,HEAD *.example.com/":                  {Host: "*.example.com", Methods: []string{"GET", "HEAD"}},
+		"  api.example.com/v1/messages/batches/  ": {Host: "api.example.com", Path: "/v1/messages/batches"},
+	}
+	for in, want := range good {
+		got, err := ParseEndpoint(in)
+		if err != nil {
+			t.Errorf("%q: %v", in, err)
+			continue
+		}
+		if got.Host != want.Host || got.Path != want.Path || strings.Join(got.Methods, ",") != strings.Join(want.Methods, ",") {
+			t.Errorf("%q parsed as %+v, want %+v", in, got, want)
+		}
+		if again, _ := ParseEndpoint(got.String()); again.String() != got.String() {
+			t.Errorf("%q does not round-trip: %q -> %q", in, got.String(), again.String())
+		}
+	}
+	for _, bad := range []string{"", "localhost", "https://api.example.com", "api.example.com:443", "post api.example.com",
+		"api.example.com/v1?x=1", "*.example.com*", "api.example.com v1", "POST,", "POST  api.example.com"} {
+		if _, err := ParseEndpoint(bad); err == nil {
+			t.Errorf("%q was accepted", bad)
+		}
+	}
+}
+
+// An agent the manifest names must be one rig runs; leaving it out is the
+// first harness.
+func TestAgentIsAKnownHarness(t *testing.T) {
+	m, err := Parse([]byte("guest:\n  name: a\n  image: rig-base\n  agent: claude-code\n"))
+	if err != nil || m.Guest.Agent != "claude-code" {
+		t.Fatalf("agent: %v %+v", err, m)
+	}
+	if Harnesses[0] != "claude-code" {
+		t.Errorf("the default harness is %q", Harnesses[0])
+	}
+}
+
+// guest.proxy.egress is internet or left out, and only beside a credential:
+// the proxy exists for one.
+func TestProxyEgressIsInternetOrNothing(t *testing.T) {
+	m, err := Parse([]byte(example))
+	if err != nil || m.ProxyEgress() != "" {
+		t.Fatalf("left out: %v %q", err, m.ProxyEgress())
+	}
+	with := strings.Replace(example, "  proxy:\n", "  proxy:\n    egress: internet\n", 1)
+	m, err = Parse([]byte(with))
+	if err != nil || m.ProxyEgress() != EgressInternet {
+		t.Fatalf("egress: internet: %v %q", err, m.ProxyEgress())
 	}
 }

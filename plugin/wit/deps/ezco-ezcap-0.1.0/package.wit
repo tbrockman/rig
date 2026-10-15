@@ -1,0 +1,112 @@
+package ezco:ezcap@0.1.0;
+
+/// The shared vocabulary for requesting and scoping capabilities.
+///
+/// A host (icanhaz, witmproxy) exposes capabilities as WIT interfaces and
+/// resources. A guest (a plugin, an agent) asks for one by `kind` and proposes
+/// a `scope`. The host mints an *instance* whose scope is the guest's proposal
+/// conjoined with whatever the user (or a share bundle, or an intermediate
+/// broker) adds. Narrowing only ever appends: a child instance's clauses are
+/// `parent && extra`. No party edits an expression, so containment is
+/// syntactic and checking a chain is reading it.
+///
+/// Both scope fields are CEL. The environment each interface offers to them
+/// (`call.*`, `event`, `caller.*`, `state.*`, `time`) is generated from that
+/// interface's WIT and documented beside it. A clause that names an argument
+/// a method does not have fails to compile at load time; a clause that names
+/// a variable the host did not bind evaluates to `false`, so scopes fail
+/// closed.
+interface types {
+    /// How a capability may be used.
+    record scope {
+        /// Evaluated once per event, with the event bound: should the holder
+        /// run at all. `"true"` for capabilities that are not event-driven.
+        when: string,
+        /// Evaluated per call on the minted resource, with `call.method`,
+        /// `call.args.*`, the current event, `caller.*`, `state.*` and `time`
+        /// bound: may this call proceed. `call.method` distinguishes methods,
+        /// so there is no per-method list.
+        allow: string,
+    }
+
+    /// A request for (or a description of) one capability.
+    ///
+    /// `kind` names a WIT interface, resource or method by path:
+    /// `icanhaz:nocap/fs`, `witmproxy:plugin/capabilities.local-storage-client`,
+    /// `icanhaz:nocap/process@0.1.0.spawn`.
+    record capability {
+        kind: string,
+        scope: scope,
+    }
+
+    /// Why a call on a capability did not proceed.
+    variant capability-error {
+        /// The capability was never granted (or has been revoked).
+        unavailable,
+        /// Granted, but this call fell outside `allow`. Carries the scope
+        /// rendered as a sentence, for the guest to show or log.
+        denied(string),
+    }
+}
+
+/// Declared configuration: the typed inputs a host renders as a form and a
+/// guest receives as values. Used by plugin manifests (witmproxy), capability
+/// provider configuration (icanhaz) and, later, editor plugin settings, so one
+/// form model serves every consent and settings surface.
+interface forms {
+    /// A file the user supplied.
+    record file-input {
+        /// The original file name
+        name: string,
+        /// The MIME type of the file (if known)
+        content-type: option<string>,
+        /// The file contents as bytes
+        data: list<u8>,
+    }
+
+    variant input-type {
+        str,
+        boolean,
+        number,
+        select(list<string>),
+        datetime,
+        daterange,
+        /// A file input (the user uploads a file)
+        file,
+        /// A raw binary data input
+        binary,
+        /// A credential or key. Rendered masked, never echoed back by an
+        /// API or log, and stored encrypted where the host has a store.
+        secret,
+    }
+
+    variant actual-input {
+        str(string),
+        boolean(bool),
+        number(f64),
+        select(string),
+        datetime(string),
+        daterange(tuple<string, string>),
+        /// A file with name, optional content-type, and data
+        file(file-input),
+        /// Raw binary data
+        binary(list<u8>),
+        /// The value of a `secret` input.
+        secret(string),
+    }
+
+    /// One input the host asks the user for.
+    record input-schema {
+        name: string,
+        input-type: input-type,
+        optional: bool,
+        default: option<actual-input>,
+        description: option<string>,
+    }
+
+    /// One value the user supplied.
+    record user-input {
+        name: string,
+        value: actual-input,
+    }
+}

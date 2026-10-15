@@ -92,6 +92,12 @@ func DesiredACL(name string) *incus.ACL {
 // no internet at all — broken rather than unsafe.
 func Report(inst *incus.Instance, acl string) (unisolated, noEgress []string) {
 	for name, dev := range inst.NICs() {
+		// The proxy NIC is on a bridge where the host offers nothing but
+		// the proxy, under an ACL that allows nothing else: more isolated
+		// than the policy asks, not less.
+		if IsProxyNIC(dev) {
+			continue
+		}
 		if !hasACL(dev["security.acls"], acl) {
 			unisolated = append(unisolated, name)
 		} else if dev["security.acls.default.egress.action"] != "allow" {

@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/tbrockman/rig/internal/agent"
+	_ "github.com/tbrockman/rig/internal/agent/claudecode" // the default harness registers itself
 	"github.com/tbrockman/rig/internal/creds"
 	"github.com/tbrockman/rig/internal/incus"
 )
@@ -21,20 +22,34 @@ func (a *app) exec(name, command string) (string, error) {
 	return a.c.Exec(name, command, incus.ExecOpts{Timeout: 60 * time.Second})
 }
 
+// harnessOf is the instance and the harness it recorded. Every agent verb that
+// talks to the agent, rather than to the unit, starts here: which binary,
+// which event format and which credentials are the harness's to say.
+func (a *app) harnessOf(name string) (*incus.Instance, agent.Harness, error) {
+	inst, _, err := a.c.Instance(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	h, err := agent.ForInstance(inst.Config)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", name, err)
+	}
+	return inst, h, nil
+}
+
 // The agent verbs. Grouped under one noun because they share state in the
 // guest: start creates it, send appends to it, status and log read it.
 func (a *app) agentCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "agent",
 		GroupID: "guest",
-		Short:   "Run Claude Code unattended in the guest, and talk to it",
-		Long: "Runs Claude Code as a systemd unit inside the guest so it outlives\n" +
-			"your shell. Its session UUID is fixed and stored, so a crash resumes the\n" +
+		Short:   "Run an agent unattended in the guest, and talk to it",
+		Long: "Runs the agent as a systemd unit inside the guest so it outlives your\n" +
+			"shell. Its session id is fixed and stored, so a crash resumes the\n" +
 			"conversation instead of restarting the brief. Messages you send are a\n" +
 			"file in the guest, delivered at the agent's next turn or next restart —\n" +
 			"never a pipe, which would die with either process.\n\n" +
-			"These verbs are built around Claude Code: its flags, its session resume,\n" +
-			"its event stream. docs/DESIGN.md lists what another agent would need.",
+			"Harness: claude-code, the default; rig.yaml's agent: field picks another.",
 	}
 	cmd.AddCommand(a.agentInstallCmd(), a.agentStartCmd(), a.agentSendCmd(),
 		a.agentStatusCmd(), a.agentLogCmd(), a.agentStopCmd())
@@ -43,40 +58,45 @@ func (a *app) agentCmd() *cobra.Command {
 
 // agentInstallCmd puts the agent binary where the unit will find it.
 //
-// A verb rather than a hint to copy out of an error: the install needs two
-// flags that are not guessable (see agent.InstallHint), and a fresh VM needs
-// it every time, so it belongs on the path an operator actually walks.
+// A verb rather than a hint to copy out of an error: the install can need
+// flags that are not guessable (see claudecode's InstallHint), and a fresh VM
+// needs it every time, so it belongs on the path an operator actually walks.
 func (a *app) agentInstallCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "install <vm>",
 		Short: "Put the agent binary on the unit's PATH",
-		Long: "Installs Claude Code into the guest's nix profile, which is on the agent\n" +
-			"unit's PATH. The base image does not carry it, so which build a VM runs\n" +
-			"is a project decision, and a fresh VM has none. A project that would\n" +
-			"rather pin it ships it in its guest flake instead (project-template/guest),\n" +
-			"and then never needs this.\n\n" +
-			"Runs, in the guest:\n  " + agent.InstallHint,
+		Long: "Installs the agent binary into the guest, onto the agent unit's PATH. The\n" +
+			"base image does not carry it, so which build a VM runs is a project\n" +
+			"decision, and a fresh VM has none. A project that would rather pin it\n" +
+			"ships it in its guest flake instead (project-template/guest), and then\n" +
+			"never needs this.\n\n" +
+			"Runs the harness's install command in the guest; for claude-code:\n  " +
+			agent.Default().InstallHint(),
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			name := args[0]
 			if err := a.requireInstance(name); err != nil {
 				return err
 			}
-			if out, err := a.exec(name, agent.ClaudeProbe()); err == nil && strings.TrimSpace(out) != "" {
-				note("claude is already on the unit's PATH in %s: %s", name, strings.TrimSpace(out))
+			_, h, err := a.harnessOf(name)
+			if err != nil {
+				return err
+			}
+			if out, err := a.exec(name, h.Probe()); err == nil && strings.TrimSpace(out) != "" {
+				note("%s is already on the unit's PATH in %s: %s", h.Binary(), name, strings.TrimSpace(out))
 				return nil
 			}
-			note("installing claude-code into %s's nix profile (a download; this takes a while)", name)
-			if _, err := a.c.Exec(name, agent.InstallHint, incus.ExecOpts{
+			note("installing %s into %s (a download; this takes a while)", h.Binary(), name)
+			if _, err := a.c.Exec(name, h.InstallHint(), incus.ExecOpts{
 				Streaming: true, Timeout: 30 * time.Minute,
 			}); err != nil {
 				return fmt.Errorf("install failed in %s: %w", name, err)
 			}
-			out, err := a.exec(name, agent.ClaudeProbe())
+			out, err := a.exec(name, h.Probe())
 			if err != nil || strings.TrimSpace(out) == "" {
-				return fmt.Errorf("the install ran, but no `claude` appeared on the unit's PATH\n  PATH searched: %s", agent.UnitPATH)
+				return fmt.Errorf("the install ran, but no `%s` appeared on the unit's PATH\n  PATH searched: %s", h.Binary(), agent.UnitPATH)
 			}
-			note("claude at %s", strings.TrimSpace(out))
+			note("%s at %s", h.Binary(), strings.TrimSpace(out))
 			return nil
 		},
 	}
@@ -91,13 +111,14 @@ func (a *app) agentStartCmd() *cobra.Command {
 		Short: "Start the unattended agent",
 		Long: "Starts the agent as the " + agent.Unit + " systemd unit in the guest, working in\n" +
 			"--workdir on the brief in --prompt-file. Two things must already be true:\n" +
-			"the VM has a credential file recorded (rig new/start --env), and Claude Code\n" +
-			"is on the unit's PATH — the image does not carry it, so a fresh VM has none.\n\n" +
+			"the VM has a credential file recorded (rig new/start --env), and the agent\n" +
+			"binary is on the unit's PATH — the image does not carry it, so a fresh VM\n" +
+			"has none.\n\n" +
 			"Everything about the run lives under " + agent.Dir + " in the guest:\n" +
 			"  prompt          the brief, as given\n" +
 			"  inbox           messages from `rig agent send`, delivered at the next turn\n" +
-			"  events.jsonl    the raw stream-json event log (`rig agent log` filters it)\n" +
-			"  stderr.log      the runner's own notes and claude's stderr\n" +
+			"  events.jsonl    the raw event log (`rig agent log` filters it)\n" +
+			"  stderr.log      the runner's own notes and the agent's stderr\n" +
 			"  STATUS.md       whatever the agent writes there; `rig agent status` prints it\n" +
 			"  DONE            created by the agent to say the brief is finished\n\n" +
 			"A session that already exists is resumed, not replaced; --new-session\n" +
@@ -108,7 +129,7 @@ func (a *app) agentStartCmd() *cobra.Command {
 			if err := a.requireInstance(name); err != nil {
 				return err
 			}
-			inst, _, err := a.c.Instance(name)
+			inst, h, err := a.harnessOf(name)
 			if err != nil {
 				return err
 			}
@@ -126,12 +147,12 @@ func (a *app) agentStartCmd() *cobra.Command {
 			// unit starts, dies on exec, and restart-loops — and `rig agent
 			// status` reports "last exit 127" and an empty last error, which
 			// says nothing about the one thing that is wrong.
-			if out, err := a.exec(name, agent.ClaudeProbe()); err != nil || strings.TrimSpace(out) == "" {
-				return fmt.Errorf("no `claude` on the agent unit's PATH in %s.\n"+
-					"rig agent runs Claude Code, and the base image does not carry it, so a\n"+
+			if out, err := a.exec(name, h.Probe()); err != nil || strings.TrimSpace(out) == "" {
+				return fmt.Errorf("no `%s` on the agent unit's PATH in %s.\n"+
+					"The %s harness runs it, and the base image does not carry it, so a\n"+
 					"fresh VM has none until you put one there:\n"+
 					"  rig agent install %s   # runs: %s\n"+
-					"PATH searched: %s", name, name, agent.InstallHint, agent.UnitPATH)
+					"PATH searched: %s", h.Binary(), name, h.Name(), name, h.InstallHint(), agent.UnitPATH)
 			}
 
 			prompt, err := os.ReadFile(promptFile)
@@ -147,8 +168,8 @@ func (a *app) agentStartCmd() *cobra.Command {
 			// a VM that already earned its warm nix store and its checkout wants
 			// the machine, not the conversation. Resuming there would hand the
 			// agent a finished brief and a transcript of work it must not redo.
-			// The old transcript stays on disk under ~/.claude/projects, so this
-			// abandons a conversation rather than destroying one.
+			// The old transcript stays on disk under agent.Dir, so this abandons
+			// a conversation rather than destroying one.
 			session := inst.Config[agent.SessionKey]
 			switch {
 			case session != "" && newSession:
@@ -175,7 +196,7 @@ func (a *app) agentStartCmd() *cobra.Command {
 			if err := a.c.Mkdir(name, agent.Dir, 0o700); err != nil {
 				return err
 			}
-			if err := a.c.WriteFile(name, agent.RunnerPath, agent.Runner(), 0o755); err != nil {
+			if err := a.c.WriteFile(name, agent.RunnerPath, h.Runner(), 0o755); err != nil {
 				return err
 			}
 			if err := a.c.WriteFile(name, agent.PromptPath, prompt, 0o600); err != nil {
@@ -281,7 +302,7 @@ func (a *app) agentStatusCmd() *cobra.Command {
 			if err := a.requireInstance(name); err != nil {
 				return err
 			}
-			inst, _, err := a.c.Instance(name)
+			inst, h, err := a.harnessOf(name)
 			if err != nil {
 				return err
 			}
@@ -334,7 +355,7 @@ func (a *app) agentStatusCmd() *cobra.Command {
 				// 127 is the shell saying the agent binary is not there. It
 				// is the one exit code with a single cause, so name it.
 				if code == "127" {
-					row("", "127 is \"command not found\": no claude on the unit's PATH.  rig agent install "+name)
+					row("", "127 is \"command not found\": no "+h.Binary()+" on the unit's PATH.  rig agent install "+name)
 				}
 			} else {
 				row("last exit", "")
@@ -345,9 +366,9 @@ func (a *app) agentStatusCmd() *cobra.Command {
 			// Why it stopped, if it stopped badly. Reading it here means the
 			// operator does not have to know events.jsonl exists.
 			if p.Active != "active" {
-				if raw, err := a.exec(name, agent.TailResultsCmd(20000)); err == nil {
-					if e := agent.LastError(raw); e != "" {
-						fmt.Printf("\n  last error   %s\n", agent.ExplainError(e))
+				if raw, err := a.exec(name, h.TailResultsCmd(20000)); err == nil {
+					if e := h.LastError(raw); e != "" {
+						fmt.Printf("\n  last error   %s\n", h.ExplainError(e))
 					}
 				}
 			}
@@ -377,10 +398,14 @@ func (a *app) agentLogCmd() *cobra.Command {
 			if err := a.requireInstance(name); err != nil {
 				return err
 			}
+			_, h, err := a.harnessOf(name)
+			if err != nil {
+				return err
+			}
 			// Filter and tail in the guest, so a huge log never crosses the
 			// wire and the window is spent on speech rather than on the tool
 			// output surrounding it.
-			out, err := a.exec(name, agent.TailSpeechCmd(400000))
+			out, err := a.exec(name, h.TailSpeechCmd(400000))
 			if err != nil {
 				return err
 			}
@@ -389,11 +414,11 @@ func (a *app) agentLogCmd() *cobra.Command {
 					"  rig agent status %s   # is the unit even up", name)
 				return nil
 			}
-			texts := agent.AssistantText(out, lines)
+			texts := h.AssistantText(out, lines)
 			if len(texts) == 0 {
 				// Now a real statement about the agent rather than about the
-				// read: the window held only assistant events, and none of
-				// them was speech.
+				// read: the window held only the agent's own events, and none
+				// of them was speech.
 				note("the agent has written events but said nothing yet; it is working in tools.\n"+
 					"  rig agent status %s   # unit, restarts, and any last error", name)
 				return nil

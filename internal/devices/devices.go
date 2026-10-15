@@ -17,7 +17,9 @@ package devices
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -427,16 +429,20 @@ func Claim(c *incus.Client, cfg Config, name string) error {
 		return err
 	}
 	defer unlock()
-	return claimLocked(c, cfg, name)
+	_, err = claimLocked(c, cfg, name)
+	return err
 }
 
-func claimLocked(c *incus.Client, cfg Config, name string) error {
+// claimLocked claims what name wants and returns it resolved: a gpu declared
+// without an address carries the one discovered, and each has passed
+// CheckIdentity.
+func claimLocked(c *incus.Client, cfg Config, name string) ([]Decl, error) {
 	instances, err := c.Instances()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := CheckProfiles(c, instances); err != nil {
-		return err
+		return nil, err
 	}
 
 	var target *incus.Instance
@@ -446,11 +452,11 @@ func claimLocked(c *incus.Client, cfg Config, name string) error {
 		}
 	}
 	if target == nil {
-		return fmt.Errorf("no such instance: %s", name)
+		return nil, fmt.Errorf("no such instance: %s", name)
 	}
 	wanted, err := Wanted(target, cfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	holders := Holders(instances)
 
@@ -461,21 +467,21 @@ func claimLocked(c *incus.Client, cfg Config, name string) error {
 		if d.Kind == manifest.KindGPU && d.PCI == "" {
 			pci, err := DiscoverPCI(c, cfg)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			d.PCI = pci
 		}
 		if err := CheckIdentity(d); err != nil {
-			return fmt.Errorf("%w\nNothing was claimed; %s was not started.", err, name)
+			return nil, fmt.Errorf("%w\nNothing was claimed; %s was not started.", err, name)
 		}
 		resolved = append(resolved, d)
 	}
 	for _, d := range resolved {
 		if err := claimOne(c, target, holders, d); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return resolved, nil
 }
 
 func claimOne(c *incus.Client, target *incus.Instance, holders []Holder, d Decl) error {
@@ -633,7 +639,11 @@ func Release(c *incus.Client, cfg Config, force bool) ([]Detached, error) {
 
 // Start claims what the instance wants and starts it. The isolation check
 // runs before the claim so a refusal does not leave anything moved.
-func Start(c *incus.Client, cfg Config, name string, allowUnisolated bool, timeoutSec int) error {
+//
+// prepare, when given, runs after the claim and before the start, under the
+// lock, with what was claimed: the moment to move a device on the host, once
+// its identity has been checked and before Incus takes it.
+func Start(c *incus.Client, cfg Config, name string, allowUnisolated bool, timeoutSec int, prepare func([]Decl) error) error {
 	inst, _, err := c.Instance(name)
 	if err != nil {
 		return err
@@ -660,6 +670,7 @@ func Start(c *incus.Client, cfg Config, name string, allowUnisolated bool, timeo
 	if err != nil {
 		return err
 	}
+	var claimed []Decl
 	if len(wanted) > 0 {
 		unlock, err := FileLock(cfg.Lock)
 		if err != nil {
@@ -667,7 +678,7 @@ func Start(c *incus.Client, cfg Config, name string, allowUnisolated bool, timeo
 		}
 		defer unlock()
 
-		if err := claimLocked(c, cfg, name); err != nil {
+		if claimed, err = claimLocked(c, cfg, name); err != nil {
 			return err
 		}
 	}
@@ -677,6 +688,16 @@ func Start(c *incus.Client, cfg Config, name string, allowUnisolated bool, timeo
 	if inst.Running() {
 		fmt.Printf("%s already running.\n", name)
 		return nil
+	}
+	if prepare != nil && len(claimed) > 0 {
+		if err := prepare(claimed); err != nil {
+			return fmt.Errorf("%w\n%s was not started; rig stop %s hands back what it claimed.", err, name, name)
+		}
+	}
+	if inst.Config[StopKey] != "" {
+		if err := c.SetConfigKey(name, StopKey, ""); err != nil {
+			return err
+		}
 	}
 	if err := c.SetState(name, "start", timeoutSec); err != nil {
 		return err
@@ -712,6 +733,27 @@ func StopForce(c *incus.Client, cfg Config, name string, timeoutSec int, force b
 		fmt.Printf("%s already stopped.\n", name)
 		return nil
 	}
+	// Marked before the stop is asked for, so the handback watcher knows the
+	// stop it sees is rig's and leaves the devices to the caller.
+	if err := c.SetConfigKey(name, StopKey, "true"); err != nil {
+		return err
+	}
+	err = stopRunning(c, name, timeoutSec, force)
+	if err != nil {
+		// Still up: a stop from inside later is the watcher's to handle.
+		if inst, _, e := c.Instance(name); e == nil && inst.Running() {
+			_ = c.SetConfigKey(name, StopKey, "")
+		}
+	}
+	return err
+}
+
+// StopKey marks an instance rig stopped. rig stop hands the devices back
+// itself, or keeps them when asked to, and the handback watcher doing it too
+// would race it. rig start clears it.
+const StopKey = "user.rig.stopping"
+
+func stopRunning(c *incus.Client, name string, timeoutSec int, force bool) error {
 	if force {
 		if err := c.ForceStop(name, timeoutSec); err != nil {
 			return err
@@ -729,7 +771,7 @@ func StopForce(c *incus.Client, cfg Config, name string, timeoutSec int, force b
 	// pulling the plug is a VM that stays running with the host's devices
 	// inside it, which is worse than lost guest state. Anything else is a
 	// real error and is reported as one.
-	inst, _, err = c.Instance(name)
+	inst, _, err := c.Instance(name)
 	if err != nil || !inst.Running() {
 		return gracefulErr
 	}
@@ -743,11 +785,20 @@ func StopForce(c *incus.Client, cfg Config, name string, timeoutSec int, force b
 }
 
 // FileLock takes an exclusive advisory lock, waiting (loudly) if held.
+//
+// The file is opened read-only, which is all flock needs, and created only
+// when missing. /run/lock is sticky and world-writable, and there
+// fs.protected_regular refuses an O_CREAT open of another user's file even
+// to root, so the handback watcher, running as root, could not open a lock
+// the user's rig created.
 func FileLock(path string) (func(), error) {
 	if dir := filepath.Dir(path); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o664)
+	f, err := os.Open(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		f, err = os.OpenFile(path, os.O_CREATE|os.O_RDONLY, 0o666)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("cannot open lock %s: %w", path, err)
 	}
