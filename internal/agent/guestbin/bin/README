@@ -1,0 +1,4 @@
+make builds the guest build of rig (cmd/rig/guest) here, as rig-linux-<arch>,
+before it builds rig, which embeds this directory. The binaries are not
+committed: a checkout that has not run make embeds only this file, and
+`rig agent start` says so.

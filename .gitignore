@@ -1,5 +1,7 @@
 # Built binary. Anchored, or this also matches cmd/rig.
 /rig 
+# The guest build, which make builds and rig embeds; see internal/agent/guestbin.
+/internal/agent/guestbin/bin/rig-*
 .claude
 
 # Guest flakes in this checkout lock against base/, which changes with every
