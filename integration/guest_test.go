@@ -66,6 +66,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --session-id|--resume) sid="$2"; rec="$rec $1 $2"; shift ;;
     -p) prompt="$2"; rec="$rec -p <prompt>"; shift ;;
+    --settings|--append-system-prompt) printf '%s' "$2" > "$D/${1#--}.$n"; rec="$rec $1 <value>"; shift ;;
     *) rec="$rec $1" ;;
   esac
   shift
@@ -164,6 +165,15 @@ func TestGuestVerbs(t *testing.T) {
 		}
 		if strings.Contains(second, "restarted after a failure") {
 			t.Error("a turn boundary must not be reported to the agent as a crash")
+		}
+		if strings.Contains(second, "Do the thing.") || !strings.Contains(pull(t, name, "/var/lib/rig-agent/fake/prompt.1"), "Do the thing.") {
+			t.Error("the brief opens the session and is not sent again on a resume")
+		}
+		if hook := pull(t, name, "/var/lib/rig-agent/fake/settings.1"); !strings.Contains(hook, "hook post-tool-use") {
+			t.Errorf("claude must be given rig's PostToolUse hook, got: %s", hook)
+		}
+		if !strings.Contains(status, "as rig agent start wrote them") {
+			t.Errorf("status must find the installed verifier, key and runner unchanged, got:\n%s", status)
 		}
 		delivered := pull(t, name, "/var/lib/rig-agent/fake/prompt.1") + second
 		if !strings.Contains(delivered, "hello from the operator") {

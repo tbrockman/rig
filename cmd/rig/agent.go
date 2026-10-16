@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/ed25519"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -11,8 +13,11 @@ import (
 
 	"github.com/tbrockman/rig/internal/agent"
 	_ "github.com/tbrockman/rig/internal/agent/claudecode" // the default harness registers itself
+	"github.com/tbrockman/rig/internal/agent/guestbin"
+	"github.com/tbrockman/rig/internal/agent/operator"
 	"github.com/tbrockman/rig/internal/creds"
 	"github.com/tbrockman/rig/internal/incus"
+	"github.com/tbrockman/rig/internal/manifest"
 )
 
 // exec runs a short control command in the guest. Bounded: everything the agent
@@ -38,7 +43,8 @@ func (a *app) harnessOf(name string) (*incus.Instance, agent.Harness, error) {
 }
 
 // The agent verbs. Grouped under one noun because they share state in the
-// guest: start creates it, send appends to it, status and log read it.
+// guest: start creates it, send, answer and brief add to it, status, asks,
+// watch and log read it.
 func (a *app) agentCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "agent",
@@ -46,13 +52,16 @@ func (a *app) agentCmd() *cobra.Command {
 		Short:   "Run an agent unattended in the guest, and talk to it",
 		Long: "Runs the agent as a systemd unit inside the guest so it outlives your\n" +
 			"shell. Its session id is fixed and stored, so a crash resumes the\n" +
-			"conversation instead of restarting the brief. Messages you send are a\n" +
-			"file in the guest, delivered at the agent's next turn or next restart —\n" +
-			"never a pipe, which would die with either process.\n\n" +
+			"conversation instead of restarting the brief. What you send it is a file in\n" +
+			"the guest, never a pipe, which would die with either process: signed here,\n" +
+			"verified there by rig's guest build before the agent sees it, and delivered\n" +
+			"after the agent's next tool call, or at its next launch. The agent asks you\n" +
+			"things the same way; `rig agent watch` tells you when.\n\n" +
 			"Harness: claude-code, the default; rig.yaml's agent: field picks another.",
 	}
-	cmd.AddCommand(a.agentInstallCmd(), a.agentStartCmd(), a.agentSendCmd(),
-		a.agentStatusCmd(), a.agentLogCmd(), a.agentStopCmd())
+	cmd.AddCommand(a.agentInstallCmd(), a.agentStartCmd(), a.agentBriefCmd(), a.agentSendCmd(),
+		a.agentAnswerCmd(), a.agentAsksCmd(), a.agentStatusCmd(), a.agentWatchCmd(),
+		a.agentLogCmd(), a.agentStopCmd())
 	return cmd
 }
 
@@ -108,21 +117,31 @@ func (a *app) agentStartCmd() *cobra.Command {
 	var newSession, untilDone bool
 	cmd := &cobra.Command{
 		Use:   "start <vm>",
-		Short: "Start the unattended agent",
+		Short: "Start the unattended agent, or resume it as it was started",
 		Long: "Starts the agent as the " + agent.Unit + " systemd unit in the guest, working in\n" +
 			"--workdir on the brief in --prompt-file. Two things must already be true:\n" +
 			"the VM has a credential file recorded (rig new/start --env), and the agent\n" +
 			"binary is on the unit's PATH — the image does not carry it, so a fresh VM\n" +
 			"has none.\n\n" +
+			"The options are recorded on the instance, so a bare `rig agent start <vm>`\n" +
+			"resumes the run as it was started: same brief file, workdir, model,\n" +
+			"--until-done, timeout and limits. A flag given now wins, and is recorded.\n\n" +
+			"A session that already exists is resumed, not replaced; --new-session\n" +
+			"starts a fresh conversation for a second mission in the same VM. The brief\n" +
+			"opens a new session and is not sent again on a resume, which already has\n" +
+			"it; if the file changed since it was last delivered, the agent is sent the\n" +
+			"diff instead (rig agent brief does that without a restart).\n\n" +
+			"Each start installs the guest build of rig and this VM's public key, and\n" +
+			"signs the brief with the private key, which stays in ~/.config/rig/agent/<vm>/.\n" +
 			"Everything about the run lives under " + agent.Dir + " in the guest:\n" +
-			"  prompt          the brief, as given\n" +
-			"  inbox           messages from `rig agent send`, delivered at the next turn\n" +
+			"  brief.msg       the brief, signed; the runner will not launch on one that fails\n" +
+			"  inbox.d/        what rig agent send, answer and brief queue, one signed file each\n" +
+			"  asks/           the agent's questions (rig agent asks)\n" +
+			"  bin/rig         the guest build of rig, first on the agent's PATH\n" +
 			"  events.jsonl    the raw event log (`rig agent log` filters it)\n" +
 			"  stderr.log      the runner's own notes and the agent's stderr\n" +
 			"  STATUS.md       whatever the agent writes there; `rig agent status` prints it\n" +
-			"  DONE            created by the agent to say the brief is finished\n\n" +
-			"A session that already exists is resumed, not replaced; --new-session\n" +
-			"starts a fresh conversation for a second mission in the same VM.",
+			"  DONE            created by the agent (rig done) to say the brief is finished",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
@@ -140,7 +159,8 @@ func (a *app) agentStartCmd() *cobra.Command {
 			if out, _ := a.exec(name, "systemctl is-active "+agent.Unit); strings.TrimSpace(out) == "active" {
 				return fmt.Errorf("%s is already running on %s.\n"+
 					"  rig agent status %s   # see what it is doing\n"+
-					"  rig agent stop %s     # stop it first", agent.Unit, name, name, name)
+					"  rig agent brief %s    # change the brief without a restart\n"+
+					"  rig agent stop %s     # stop it first", agent.Unit, name, name, name, name)
 			}
 
 			// Look for the binary before creating any state. Without this the
@@ -154,11 +174,40 @@ func (a *app) agentStartCmd() *cobra.Command {
 					"  rig agent install %s   # runs: %s\n"+
 					"PATH searched: %s", h.Binary(), name, h.Name(), name, h.InstallHint(), agent.UnitPATH)
 			}
-
-			prompt, err := os.ReadFile(promptFile)
+			guestRig, err := guestbin.For(inst.Architecture)
 			if err != nil {
 				return err
 			}
+
+			opts, err := startOptions(cmd.Flags().Changed, agent.RecordedOptions(inst.Config), agent.StartOptions{
+				PromptFile: promptFile, Workdir: workdir, Model: model, Timeout: timeout,
+				MemoryMax: memMax, UntilDone: untilDone, Restarts: restarts,
+			})
+			if err != nil {
+				return fmt.Errorf("%w\n  rig agent start %s --prompt-file <brief>", err, name)
+			}
+			store, err := operator.For(name)
+			if err != nil {
+				return err
+			}
+			brief, err := os.ReadFile(opts.PromptFile)
+			if err != nil {
+				last, ok, _ := store.Brief()
+				if cmd.Flags().Changed("prompt-file") || !ok {
+					return err
+				}
+				note("cannot read the recorded brief (%v); keeping the one last delivered", err)
+				brief = []byte(last)
+			}
+
+			key, made, err := store.KeyOrCreate()
+			if err != nil {
+				return err
+			}
+			if made {
+				note("new operator key for %s: %s (it never leaves this host)", name, store.KeyPath())
+			}
+			pub := agent.MarshalPublicKey(key.Public().(ed25519.PublicKey))
 
 			// A session that already exists is resumed, not replaced. Losing a
 			// transcript to a re-run of `agent start` would be exactly the
@@ -170,36 +219,95 @@ func (a *app) agentStartCmd() *cobra.Command {
 			// agent a finished brief and a transcript of work it must not redo.
 			// The old transcript stays on disk under agent.Dir, so this abandons
 			// a conversation rather than destroying one.
-			session := inst.Config[agent.SessionKey]
+			session, previous := inst.Config[agent.SessionKey], ""
+			resuming := session != "" && !newSession
+			if !resuming {
+				previous = session
+				if session, err = agent.NewSessionID(); err != nil {
+					return err
+				}
+				if err := a.c.SetConfigKey(name, agent.SessionKey, session); err != nil {
+					return err
+				}
+			}
 			switch {
-			case session != "" && newSession:
-				previous := session
-				if session, err = agent.NewSessionID(); err != nil {
-					return err
-				}
-				if err := a.c.SetConfigKey(name, agent.SessionKey, session); err != nil {
-					return err
-				}
-				note("new session %s (leaving %s on disk, unresumed)", session, previous)
-			case session == "":
-				if session, err = agent.NewSessionID(); err != nil {
-					return err
-				}
-				if err := a.c.SetConfigKey(name, agent.SessionKey, session); err != nil {
-					return err
-				}
-				note("new session %s", session)
-			default:
+			case resuming:
 				note("resuming session %s", session)
+			case previous != "":
+				note("new session %s (leaving %s on disk, unresumed)", session, previous)
+			default:
+				note("new session %s", session)
 			}
 
-			if err := a.c.Mkdir(name, agent.Dir, 0o700); err != nil {
+			for _, dir := range []struct {
+				path string
+				mode os.FileMode
+			}{{agent.Dir, 0o700}, {agent.GuestBinDir, 0o755}, {agent.InboxDir, 0o700}} {
+				if err := a.c.Mkdir(name, dir.path, dir.mode); err != nil {
+					return err
+				}
+			}
+			// What was queued for the previous session, and its asks, are its
+			// own: moved aside, so the new one neither refuses them as
+			// addressed elsewhere nor lists their asks as open.
+			if previous != "" {
+				aside := agent.Dir + "/previous/" + previous
+				if _, err := a.exec(name, "cd "+agent.Dir+" && mkdir -p "+shellQuote([]string{aside})+
+					" && for f in inbox.d claimed asks answers delivered; do if [ -e $f ]; then mv $f "+
+					shellQuote([]string{aside})+"/; fi; done && mkdir -m 700 inbox.d"); err != nil {
+					return err
+				}
+				note("the previous session's queue and asks are kept in %s", aside)
+			}
+
+			runner := h.Runner()
+			if err := a.put(name, agent.RunnerPath, runner, 0o755); err != nil {
 				return err
 			}
-			if err := a.c.WriteFile(name, agent.RunnerPath, h.Runner(), 0o755); err != nil {
+			if err := a.put(name, agent.GuestBinPath, guestRig, 0o755); err != nil {
 				return err
 			}
-			if err := a.c.WriteFile(name, agent.PromptPath, prompt, 0o600); err != nil {
+			if err := a.put(name, agent.OperatorPubPath, pub, 0o644); err != nil {
+				return err
+			}
+			delivered, hadBrief, err := store.Brief()
+			if err != nil {
+				return err
+			}
+			if err := a.putBrief(name, store, key, session, string(brief)); err != nil {
+				return err
+			}
+			// A resumed session is not sent the brief, so a brief that changed
+			// since the agent last had it reaches it as a diff, at launch.
+			if resuming && hadBrief && delivered != string(brief) {
+				ch := &channel{name: name, session: session, store: store, key: key}
+				if _, err := a.deliver(ch, agent.KindBriefUpdate, "brief",
+					agent.UnifiedDiff("brief (as delivered)", "brief (now)", delivered, string(brief))); err != nil {
+					return err
+				}
+				note("%s changed since it was last delivered; the agent gets the diff at launch", opts.PromptFile)
+			} else if resuming && !hadBrief {
+				note("no record of the brief this host last delivered to %s, so no diff: if it changed, say so (rig agent send)", name)
+			}
+			if err := store.SetBrief(string(brief)); err != nil {
+				return err
+			}
+
+			// What this start installed, and how it was started, so status can
+			// tell a replaced verifier from the one rig wrote, and a bare start
+			// can resume the run as it was.
+			record := opts.Config()
+			for _, f := range agent.Installed {
+				switch f.Name {
+				case agent.RunnerName:
+					record[f.Key] = sha256Hex(runner)
+				case agent.BinName:
+					record[f.Key] = sha256Hex(guestRig)
+				case agent.PubName:
+					record[f.Key] = sha256Hex(pub)
+				}
+			}
+			if err := a.c.SetConfigKeys(name, record); err != nil {
 				return err
 			}
 
@@ -210,93 +318,91 @@ func (a *app) agentStartCmd() *cobra.Command {
 			// its first turn: --until-done reads it as "already finished". The
 			// turn_boundary note is the same kind of leftover, and would open
 			// this run with a resumption note about a turn that is not this
-			// run's.
-			_, _ = a.exec(name, "rm -f "+agent.DonePath+" "+agent.Dir+"/turn_boundary")
-
-			// Turn boundaries spend the restart budget, and a brief with several
-			// missions in it has many. Five — the right number for crashes —
-			// would stop a healthy agent inside an hour, so raise it unless the
-			// operator picked a number themselves.
-			if untilDone && !cmd.Flags().Changed("max-restarts") {
-				restarts = 20
-			}
+			// run's. The plain prompt file is an older rig's unsigned brief,
+			// which nothing reads now.
+			_, _ = a.exec(name, "rm -f "+agent.DonePath+" "+agent.Dir+"/turn_boundary "+agent.Dir+"/prompt")
 
 			argv := agent.SystemdRun(agent.UnitOpts{
-				Workdir: workdir, Session: session, Timeout: timeout,
-				MemoryMax: memMax, Restarts: restarts, UntilDone: untilDone, Model: model,
+				Workdir: opts.Workdir, Session: session, Timeout: opts.Timeout, MemoryMax: opts.MemoryMax,
+				Restarts: opts.EffectiveRestarts(), UntilDone: opts.UntilDone, Model: opts.Model,
 			})
 			out, err := a.exec(name, shellQuote(argv))
 			if err != nil {
 				return fmt.Errorf("starting %s: %w\n%s", agent.Unit, err, out)
 			}
 			note("started %s in %s (memory cap %s, %d restarts before it gives up)",
-				agent.Unit, workdir, memMax, restarts)
-			if model != "" {
-				note("model: %s", model)
+				agent.Unit, opts.Workdir, opts.MemoryMax, opts.EffectiveRestarts())
+			if opts.Model != "" {
+				note("model: %s", opts.Model)
 			}
-			if untilDone {
+			if opts.UntilDone {
 				note("--until-done: a clean exit resumes instead of stopping, until the agent creates %s",
 					agent.DonePath)
 			}
-			note("watch it:  rig agent status %s", name)
+			note("watch it:  rig agent status %s   (or: rig agent watch %s)", name, name)
 			return nil
 		},
 	}
 	f := cmd.Flags()
-	f.StringVar(&promptFile, "prompt-file", "", "host file holding the agent's brief (required)")
+	f.StringVar(&promptFile, "prompt-file", "", "host file holding the agent's brief; required the first time, then recorded")
 	f.StringVar(&workdir, "workdir", "/work", "working directory in the guest")
 	f.StringVar(&memMax, "memory-max", "80%", "systemd MemoryMax for the unit; a runaway child is killed before the guest OOMs")
 	f.StringVar(&timeout, "timeout", "6h", "kill a single agent run after this long; it restarts and resumes")
-	f.IntVar(&restarts, "max-restarts", 5, "restarts allowed per hour before systemd gives up and waits for a human")
+	f.IntVar(&restarts, "max-restarts", 0,
+		fmt.Sprintf("restarts allowed per hour before systemd gives up and waits for a human (default %d, or %d with --until-done)",
+			agent.DefaultRestarts(false), agent.DefaultRestarts(true)))
 	f.BoolVar(&newSession, "new-session", false, "start a fresh conversation instead of resuming; for a second mission in the same VM")
 	f.StringVar(&model, "model", "",
 		"model for the agent — an alias like 'fable' or 'opus' takes the latest of that family; empty uses the guest's default")
 	f.BoolVar(&untilDone, "until-done", false,
 		"treat a clean exit as a turn boundary, not a result: resume until the agent creates "+agent.DonePath)
-	_ = cmd.MarkFlagRequired("prompt-file")
 	return cmd
 }
 
-func (a *app) agentSendCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "send <vm> <message>...",
-		Short: "Queue a message for the agent",
-		Long: "Appends to a file in the guest. The agent picks it up at its next turn\n" +
-			"if it is polling, and unconditionally on its next restart. Nothing is\n" +
-			"held open, so neither process can hang waiting for the other.",
-		Args: cobra.MinimumNArgs(2),
-		RunE: func(_ *cobra.Command, args []string) error {
-			name := args[0]
-			if err := a.requireInstance(name); err != nil {
-				return err
-			}
-			msg := strings.Join(args[1:], " ")
-			existing, _ := a.c.Pull(name, agent.InboxPath)
-			updated := string(existing)
-			if updated != "" && !strings.HasSuffix(updated, "\n") {
-				updated += "\n"
-			}
-			// Each message opens with a delimiter, so a message of several
-			// lines still counts as one.
-			updated += agent.Delimiter + "\n" + msg + "\n"
-			if err := a.c.Mkdir(name, agent.Dir, 0o700); err != nil {
-				return err
-			}
-			if err := a.c.WriteFile(name, agent.InboxPath, []byte(updated), 0o600); err != nil {
-				return err
-			}
-			note("queued for %s (%d message(s) pending)", name, agent.Pending(updated))
-			return nil
-		},
+// startOptions resolves each start option: the flag when it was given now,
+// else what the instance recorded, else the flag's default. The prompt file is
+// made absolute, since a later start may run from another directory.
+func startOptions(changed func(flag string) bool, recorded, given agent.StartOptions) (agent.StartOptions, error) {
+	o := given
+	pick := func(flag string, v *string, rec string) {
+		if !changed(flag) && rec != "" {
+			*v = rec
+		}
 	}
-	return cmd
+	pick("prompt-file", &o.PromptFile, recorded.PromptFile)
+	pick("workdir", &o.Workdir, recorded.Workdir)
+	pick("model", &o.Model, recorded.Model)
+	pick("timeout", &o.Timeout, recorded.Timeout)
+	pick("memory-max", &o.MemoryMax, recorded.MemoryMax)
+	if !changed("until-done") {
+		o.UntilDone = recorded.UntilDone
+	}
+	if !changed("max-restarts") {
+		o.Restarts = recorded.Restarts
+	}
+	if o.PromptFile == "" {
+		return o, fmt.Errorf("no brief: --prompt-file is required the first time, and none is recorded")
+	}
+	abs, err := filepath.Abs(manifest.ExpandHome(o.PromptFile))
+	if err != nil {
+		return o, err
+	}
+	o.PromptFile = abs
+	return o, nil
 }
 
 func (a *app) agentStatusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status <vm>",
-		Short: "Is it alive, how many times has it crashed, what does it say",
-		Args:  cobra.ExactArgs(1),
+		Short: "Is it alive, what does it ask, has anything been tampered with, what does it say",
+		Long: "One bounded read of the agent's state. Open asks come first, since they are\n" +
+			"waiting on you. Then the unit, its restarts and last exit, what is queued\n" +
+			"and what was last delivered, anything the guest refused (an item whose\n" +
+			"signature failed, an unsigned inbox), and whether the guest build of rig,\n" +
+			"the operator key and the runner are still what rig agent start wrote: rig\n" +
+			"records their hashes on the instance, and a mismatch means something in the\n" +
+			"guest replaced what decides who the operator is. Then STATUS.md.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			name := args[0]
 			if err := a.requireInstance(name); err != nil {
@@ -315,6 +421,22 @@ func (a *app) agentStatusCmd() *cobra.Command {
 			}
 			raw, _ := a.exec(name, agent.StatusProbe())
 			p := agent.ParseProbe(raw)
+			ago := func(stamp string) string {
+				t, err := time.Parse(time.RFC3339, stamp)
+				if err != nil || p.Now == 0 {
+					return ""
+				}
+				return agent.Age(p.Now-t.Unix()) + " ago"
+			}
+
+			// What is waiting on the operator goes first.
+			if open := p.OpenAsks(); len(open) > 0 {
+				fmt.Printf("OPEN ASKS — answer with: rig agent answer %s <id> <text>\n", name)
+				for _, q := range open {
+					fmt.Printf("  %-16s %-7s %s\n", q.ID, p.AskAge(q), agent.Clean(q.Text, 200))
+				}
+				fmt.Println()
+			}
 
 			row := func(k, v string) {
 				if v == "" {
@@ -325,13 +447,14 @@ func (a *app) agentStatusCmd() *cobra.Command {
 			row("unit", p.Active)
 			row("session", inst.Config[agent.SessionKey])
 			row("restarts", p.Restarts)
+			row("started with", describeOptions(agent.RecordedOptions(inst.Config)))
 
 			// Whether the agent thinks it is finished, from the marker it sets
 			// itself. Under --until-done this is the difference between "it
 			// stopped because it is done" and "it stopped because it ran out of
 			// restarts", which otherwise look identical from `unit inactive`.
 			if p.Done {
-				row("mission", "COMPLETE (the agent created "+agent.DonePath+")")
+				row("mission", "COMPLETE: "+agent.Clean(p.Summary, 200))
 			}
 
 			// last_exit is written when a run ends, and simply stays there.
@@ -352,16 +475,42 @@ func (a *app) agentStatusCmd() *cobra.Command {
 				default:
 					row("last exit", code)
 				}
-				// 127 is the shell saying the agent binary is not there. It
-				// is the one exit code with a single cause, so name it.
-				if code == "127" {
-					row("", "127 is \"command not found\": no "+h.Binary()+" on the unit's PATH.  rig agent install "+name)
-				}
 			} else {
 				row("last exit", "")
 			}
+			// The exit codes with a single cause, named. 127 is the shell
+			// saying the agent binary is not there; 77 is the runner refusing
+			// to launch on what it cannot verify.
+			switch get(agent.Dir + "/last_exit") {
+			case "127":
+				row("", "127 is \"command not found\": no "+h.Binary()+" on the unit's PATH.  rig agent install "+name)
+			case strconv.Itoa(agent.ExitUnverified):
+				row("", fmt.Sprintf("%d is a launch refused: the brief or the guest rig did not verify, and %s/stderr.log\n"+
+					"                 says which. rig agent stop %s && rig agent start %s reinstalls both.",
+					agent.ExitUnverified, agent.Dir, name, name))
+			}
 
-			row("queued msgs", strconv.Itoa(agent.Pending(get(agent.InboxPath))))
+			queued := strconv.Itoa(p.Pending)
+			if p.Pending > 0 {
+				queued += " (signed; delivered after the agent's next tool call, or at its next launch)"
+			}
+			row("queued", queued)
+			if p.Legacy {
+				row("", "an older rig's unsigned inbox ("+agent.LegacyInboxPath+") has text in it; it is reported, never delivered")
+			}
+			if n := len(p.RecentDeliveries); n > 0 {
+				d := p.RecentDeliveries[n-1]
+				row("last delivery", fmt.Sprintf("%s %s via %s, %s", d.Kind, d.ID, d.Path, ago(d.Time)))
+			}
+			if len(p.Asks) > 0 {
+				row("asks", fmt.Sprintf("%d open, %d answered  (rig agent asks %s)", len(p.OpenAsks()), len(p.Asks)-len(p.OpenAsks()), name))
+			}
+			if n := len(p.RecentTampers); p.Tampers > 0 && n > 0 {
+				t := p.RecentTampers[n-1]
+				row("TAMPER", fmt.Sprintf("%d item(s) refused by the guest, never shown to the agent; last %s: %s (%s)",
+					p.Tampers, ago(t.Time), agent.Clean(t.Reason, 160), agent.Clean(t.File, 80)))
+			}
+			row("installed", integrity(p, inst.Config, name))
 
 			// Why it stopped, if it stopped badly. Reading it here means the
 			// operator does not have to know events.jsonl exists.
@@ -382,6 +531,46 @@ func (a *app) agentStatusCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// integrity says whether what decides who the operator is in the guest is
+// still what rig agent start wrote there.
+func integrity(p agent.Probe, config map[string]string, name string) string {
+	recorded := false
+	for _, f := range agent.Installed {
+		recorded = recorded || config[f.Key] != ""
+	}
+	switch bad := p.Mismatched(config); {
+	case !recorded:
+		return "not recorded (started by an older rig); rig agent start records it"
+	case len(p.SHA256) == 0:
+		return "" // the probe did not answer
+	case len(bad) > 0:
+		return "MISMATCH: " + strings.Join(bad, ", ") + " in " + agent.Dir + " is not what rig agent start wrote.\n" +
+			"                 Something in the guest replaced it. rig agent stop " + name + " && rig agent start " + name + " reinstalls it."
+	}
+	return "guest rig, operator key and runner as rig agent start wrote them"
+}
+
+// describeOptions is the recorded start options in a line, as a bare start
+// would use them.
+func describeOptions(o agent.StartOptions) string {
+	if o.PromptFile == "" {
+		return ""
+	}
+	parts := []string{o.PromptFile}
+	if o.UntilDone {
+		parts = append(parts, "--until-done")
+	}
+	if o.Model != "" {
+		parts = append(parts, "model "+o.Model)
+	}
+	for _, kv := range [][2]string{{"workdir", o.Workdir}, {"timeout", o.Timeout}, {"memory", o.MemoryMax}} {
+		if kv[1] != "" {
+			parts = append(parts, kv[0]+" "+kv[1])
+		}
+	}
+	return strings.Join(append(parts, fmt.Sprintf("%d restarts", o.EffectiveRestarts())), ", ")
 }
 
 func (a *app) agentLogCmd() *cobra.Command {

@@ -13,53 +13,36 @@
 //     unit and take the agent with it. So the unit caps its own memory and
 //     declines to die when the kernel kills one of its children.
 //
-// Messages to the agent are a file in the guest, not a pipe from the host.
-// A file survives a crash, needs nothing holding it open, and cannot couple the
-// two processes' lifetimes.
+// Messages to the agent are files in the guest, not a pipe from the host. A
+// file survives a crash, needs nothing holding it open, and cannot couple the
+// two processes' lifetimes. Each is signed on the host and verified in the
+// guest before the agent sees it (envelope.go), and reaches a running agent at
+// its next tool call through a hook rather than waiting for its next launch
+// (channel.go has the layout).
 package agent
 
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
+	"unicode"
 )
 
 // Dir holds everything about one agent run. On disk, not tmpfs: the transcript
 // has to outlive a VM stop or --resume has nothing to resume from.
 const (
 	Dir        = "/var/lib/rig-agent"
-	RunnerPath = Dir + "/run"
+	RunnerPath = Dir + "/" + RunnerName
 	PromptPath = Dir + "/prompt"
-	InboxPath  = Dir + "/inbox"
-	DonePath   = Dir + "/DONE"
+	DonePath   = Dir + "/" + DoneName
 	EventsPath = Dir + "/events.jsonl"
 	SessionKey = "user.rig.agent.session"
 	Unit       = "rig-agent"
 )
-
-// Delimiter opens each queued message in the inbox file.
-//
-// The inbox is plain text, appended to and read whole, so without a marker
-// there is nothing to count by but newlines — and a queued message is usually
-// several lines, which is how "one message" came to be reported as eleven. It
-// reads as a heading in the brief the agent is handed, which is where the file
-// ends up.
-const Delimiter = "--- operator message ---"
-
-// Pending counts the messages in an inbox file.
-//
-// An inbox written before delimiters existed has none, and is one message.
-func Pending(inbox string) int {
-	if strings.TrimSpace(inbox) == "" {
-		return 0
-	}
-	if n := strings.Count(inbox, Delimiter); n > 0 {
-		return n
-	}
-	return 1
-}
 
 // NewSessionID returns a UUIDv4: the shape an agent CLI that takes a session
 // id asks for. rig generates it rather than letting the guest do it, because
@@ -93,9 +76,18 @@ func NewSessionID() (string, error) {
 // in /usr/bin passed the check and then restart-looped on exit 127 — the exact
 // failure the check was written to catch.
 //
+// GuestBinDir comes first of all: it holds the guest build of rig, which the
+// agent calls as plain `rig`, and which `rig agent start` rewrites every time,
+// so nothing else on the guest can stand in for it by being found earlier.
+//
 // One constant rather than a literal at the use site, because the preflight
 // has to look down exactly the PATH the runner will use.
-const UnitPATH = "/root/.nix-profile/bin:/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/bin"
+const UnitPATH = GuestBinDir + ":/root/.nix-profile/bin:/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/bin"
+
+// ExitUnverified is the runner's exit when it will not launch because nothing
+// from the operator can be verified: the guest build of rig is missing, or the
+// brief does not verify. The unit does not restart it.
+const ExitUnverified = 77
 
 // UnitOpts are the knobs that decide how the unit survives trouble.
 type UnitOpts struct {
@@ -124,6 +116,10 @@ type UnitOpts struct {
 //	  property would be wrong without the UUID.
 //	StartLimit* — a persistently failing run must escalate to a human instead
 //	  of flapping forever.
+//	RestartPreventExitStatus=77 — the runner's "nothing from the operator
+//	  verifies": no verifier, or a brief whose signature fails. Retrying cannot
+//	  fix either, and a run that would act on an unverified brief must not
+//	  happen five times.
 func SystemdRun(o UnitOpts) []string {
 	args := []string{
 		"systemd-run",
@@ -133,6 +129,7 @@ func SystemdRun(o UnitOpts) []string {
 		"--property=OOMPolicy=continue",
 		"--property=Restart=on-failure",
 		"--property=RestartSec=30s",
+		"--property=RestartPreventExitStatus=" + strconv.Itoa(ExitUnverified),
 		"--property=StartLimitIntervalSec=3600",
 		"--property=StartLimitBurst=" + strconv.Itoa(o.Restarts),
 		"--setenv=HOME=/root",
@@ -161,19 +158,6 @@ func SystemdRun(o UnitOpts) []string {
 	return append(args, "--", "/run/current-system/sw/bin/bash", "-lc", RunnerPath)
 }
 
-// Status is the bounded answer to "how is it going" — everything here is a
-// handful of bytes, so asking is cheap enough to do often.
-type Status struct {
-	Unit     string
-	Active   string
-	Session  string
-	Restarts int
-	LastExit string
-	Inbox    int    // messages queued, not yet delivered
-	StatusMD string // whatever the agent wrote for us
-	Events   int    // lines in EventsPath
-}
-
 // NoEvents is what the guest prints when there is no event log at all. It
 // distinguishes "the agent has not started" from "the agent has not spoken",
 // which look identical from an empty read and want different reactions.
@@ -200,39 +184,85 @@ func TailCmd(match string, limitBytes int) string {
 		EventsPath, NoEvents, match, limitBytes)
 }
 
-// Probe is the scalar half of `agent status`: what systemd knows about the
-// unit, plus the clock, in one round trip.
+// Probe is the bounded half of `agent status` and all of `agent watch`: what
+// systemd knows about the unit, the clock, and the channel's state, in one
+// round trip. Everything here is a handful of bytes per item, with a cap on
+// the items, so asking is cheap enough to do every few seconds.
 type Probe struct {
 	Active   string
 	Restarts string
-	Started  int64 // unix seconds the current invocation went active
-	Now      int64 // guest clock, so ages are computed in the guest's frame
-	Exited   int64 // mtime of last_exit
-	Done     bool  // the agent created the DONE marker
+	Started  int64  // unix seconds the current invocation went active
+	Now      int64  // guest clock, so ages are computed in the guest's frame
+	Exited   int64  // mtime of last_exit
+	Done     bool   // the agent created the DONE marker
+	Summary  string // DONE's first line, which `rig done` fills
+	StatusMD string // STATUS.md's size and mtime: it changed when this did
+
+	Pending int               // envelopes in inbox.d, not yet taken
+	Legacy  bool              // an older rig's unsigned inbox has content
+	SHA256  map[string]string // each Installed name -> its hash in the guest, "" when missing
+	Asks    []Ask             // newest first, at most maxProbed
+	Answers map[string]Envelope
+
+	Deliveries       int        // lines in deliveries.jsonl
+	RecentDeliveries []Delivery // its last few, oldest first
+	Tampers          int        // lines in tamper.jsonl
+	RecentTampers    []Tamper   // its last few, oldest first
 }
 
-// StatusProbe asks the guest for everything status needs that is not a file's
-// contents.
+// How many of each list item the probe reads, and how many bytes of each.
+const (
+	maxProbed  = 100
+	recentLogs = 20
+)
+
+// StatusProbe asks the guest for everything status and watch need.
 //
 // It reports the *unit's* restart count rather than a counter rig keeps
 // itself. A file in /var/lib outlives reboots, missions and new sessions, and
 // one did: a three-day-old count of 2 was reported as the current process's
 // second restart. NRestarts belongs to this unit invocation and resets when a
 // human starts it, which is the question being asked.
-func StatusProbe() string {
-	return fmt.Sprintf(`u=%[1]s
+//
+// Every line is key=value. What the guest wrote (asks, answers, log lines) is
+// cut to a bounded length and one line each; it is data from the guest, which
+// the host displays only after cleaning it (Clean).
+func StatusProbe() string { return statusProbe(Dir) }
+
+func statusProbe(dir string) string {
+	sums := ""
+	for _, f := range Installed {
+		sums += fmt.Sprintf("echo \"sha256:%[1]s=$(test -f $d/%[1]s && sha256sum < $d/%[1]s | cut -c1-64)\"\n", f.Name)
+	}
+	return fmt.Sprintf(`u=%[1]s d=%[2]s
 echo "active=$(systemctl is-active $u 2>/dev/null)"
 echo "restarts=$(systemctl show $u -p NRestarts --value 2>/dev/null)"
 echo "started=$(date -d "$(systemctl show $u -p ActiveEnterTimestamp --value 2>/dev/null)" +%%s 2>/dev/null)"
 echo "now=$(date +%%s)"
-echo "exited=$(stat -c %%Y %[2]s/last_exit 2>/dev/null)"
-echo "done=$(test -e %[2]s/DONE && echo yes)"`, Unit, Dir)
+echo "exited=$(stat -c %%Y $d/last_exit 2>/dev/null)"
+echo "done=$(test -e $d/%[3]s && echo yes)"
+echo "summary=$(head -n 1 $d/%[3]s 2>/dev/null | head -c 300 | tr -d '\n')"
+echo "statusmd=$(stat -c %%s.%%Y $d/STATUS.md 2>/dev/null)"
+echo "pending=$(ls -1 $d/%[4]s 2>/dev/null | grep -c '\%[5]s$')"
+echo "legacy=$(test -s $d/%[6]s && echo yes)"
+%[7]sls -t $d/%[8]s 2>/dev/null | grep '\.json$' | head -n %[9]d | while IFS= read -r f; do
+  printf 'ask=%%s ' "${f%%.json}"; head -c 2048 "$d/%[8]s/$f" | tr -d '\n'; echo
+done
+ls $d/%[10]s 2>/dev/null | grep '\%[5]s$' | head -n %[9]d | while IFS= read -r f; do
+  printf 'answer=%%s ' "${f%%%[5]s}"; head -n 1 "$d/%[10]s/$f" | head -c 2048 | tr -d '\n'; echo
+done
+echo "deliveries=$(cat $d/%[11]s 2>/dev/null | wc -l)"
+tail -n %[13]d $d/%[11]s 2>/dev/null | cut -c1-1024 | sed 's/^/delivery=/'
+echo "tampers=$(cat $d/%[12]s 2>/dev/null | wc -l)"
+tail -n %[13]d $d/%[12]s 2>/dev/null | cut -c1-1024 | sed 's/^/tamper=/'`,
+		Unit, dir, DoneName, InboxName, EnvelopeExt, LegacyInboxName, sums,
+		AsksName, maxProbed, AnswersName, DeliveriesName, TamperName, recentLogs)
 }
 
 // ParseProbe reads StatusProbe's output. Anything missing stays zero: a probe
 // that could not answer must not invent a number status will present as fact.
 func ParseProbe(out string) Probe {
-	var p Probe
+	p := Probe{SHA256: map[string]string{}, Answers: map[string]Envelope{}}
 	num := func(s string) int64 {
 		n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
 		if err != nil {
@@ -258,9 +288,105 @@ func ParseProbe(out string) Probe {
 			p.Exited = num(v)
 		case "done":
 			p.Done = strings.TrimSpace(v) == "yes"
+		case "summary":
+			p.Summary = strings.TrimSpace(v)
+		case "statusmd":
+			p.StatusMD = strings.TrimSpace(v)
+		case "pending":
+			p.Pending = int(num(v))
+		case "legacy":
+			p.Legacy = strings.TrimSpace(v) == "yes"
+		case "deliveries":
+			p.Deliveries = int(num(v))
+		case "tampers":
+			p.Tampers = int(num(v))
+		case "ask":
+			// The file name is the id; the record may have been cut short.
+			id, rec, _ := strings.Cut(v, " ")
+			a := Ask{ID: id}
+			_ = json.Unmarshal([]byte(rec), &a)
+			a.ID = id
+			p.Asks = append(p.Asks, a)
+		case "answer":
+			id, rec, _ := strings.Cut(v, " ")
+			var e Envelope
+			_ = json.Unmarshal([]byte(rec), &e)
+			p.Answers[id] = e
+		case "delivery":
+			var d Delivery
+			if json.Unmarshal([]byte(v), &d) == nil {
+				p.RecentDeliveries = append(p.RecentDeliveries, d)
+			}
+		case "tamper":
+			var t Tamper
+			if json.Unmarshal([]byte(v), &t) == nil {
+				p.RecentTampers = append(p.RecentTampers, t)
+			}
+		default:
+			if name, ok := strings.CutPrefix(k, "sha256:"); ok {
+				p.SHA256[name] = strings.TrimSpace(v)
+			}
 		}
 	}
 	return p
+}
+
+// OpenAsks are the asks with no answer yet, newest first.
+func (p Probe) OpenAsks() []Ask {
+	var open []Ask
+	for _, a := range p.Asks {
+		if _, ok := p.Answers[a.ID]; !ok {
+			open = append(open, a)
+		}
+	}
+	return open
+}
+
+// Mismatched names the Installed files whose hash in the guest is not the one
+// recorded on the instance (config). A file with nothing recorded is not
+// judged: it was installed by a rig that did not record it. A probe that said
+// nothing about hashes at all judges nothing either.
+func (p Probe) Mismatched(config map[string]string) []string {
+	if len(p.SHA256) == 0 {
+		return nil
+	}
+	var bad []string
+	for _, f := range Installed {
+		want := config[f.Key]
+		if want != "" && p.SHA256[f.Name] != want {
+			bad = append(bad, f.Name)
+		}
+	}
+	return bad
+}
+
+// AskAge is how long ago a was asked, in the guest's clock, or "".
+func (p Probe) AskAge(a Ask) string {
+	t, err := time.Parse(time.RFC3339, a.Time)
+	if err != nil || p.Now == 0 {
+		return ""
+	}
+	return Age(p.Now - t.Unix())
+}
+
+// Clean makes text from the guest safe to print on one line of a terminal:
+// control characters (an escape sequence, a newline that would forge a second
+// line) become spaces, and it is cut to max runes.
+func Clean(s string, max int) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range s {
+		if n == max {
+			b.WriteString("…")
+			break
+		}
+		if unicode.IsControl(r) || r == ' ' || r == ' ' {
+			r = ' '
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // Age renders a duration the way an operator reads one: coarse and short. The

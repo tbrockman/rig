@@ -18,7 +18,7 @@ import (
 //
 // The unit's environment:
 //
-//	HOME=/root  TERM=dumb  PATH=UnitPATH
+//	HOME=/root  TERM=dumb  PATH=UnitPATH (GuestBinDir first: `rig` is the guest build)
 //	RIG_AGENT_PATH       UnitPATH again. NixOS's /etc/profile exports PATH
 //	                     absolutely, so the login shell has thrown the unit's
 //	                     PATH away by the time the runner starts; the runner
@@ -28,7 +28,8 @@ import (
 //	RIG_AGENT_WORKDIR    where to run; the runner cds there, or exits 78.
 //	RIG_AGENT_SESSION    the session id rig chose and recorded (SessionKey); a
 //	                     UUIDv4. The runner starts or resumes this session and
-//	                     never another.
+//	                     never another, and the guest build of rig accepts only
+//	                     what the operator signed for it.
 //	RIG_AGENT_TIMEOUT    for timeout(1) around the agent: one run is killed
 //	                     after this long, and systemd resumes it.
 //	RIG_AGENT_UNTIL_DONE "1" when a clean exit is a turn boundary, not a
@@ -38,22 +39,36 @@ import (
 //
 // Files under Dir, all written by the shared side unless noted:
 //
-//	prompt            the brief (PromptPath).
-//	inbox             messages from `rig agent send` (InboxPath), each opened
-//	                  by Delimiter. The runner appends the whole file to the
-//	                  brief for this launch, copies it to inbox.delivered, and
-//	                  truncates it.
+//	bin/rig           the guest build of rig (GuestBinPath). Everything the
+//	                  runner knows of the operator comes through it: `rig
+//	                  brief`, `rig hook launch`, `rig hook settings`.
+//	operator.pub      what it verifies with; the private key stays on the host.
+//	brief.msg         the brief, signed (BriefPath). The runner reads it with
+//	                  `rig brief`, sends it as the prompt only when it creates
+//	                  the session, and exits ExitUnverified (77) without
+//	                  launching when it does not verify.
+//	inbox.d/          signed envelopes from `rig agent send`, `answer` and
+//	                  `brief` (channel.go has the rest of the channel's files).
+//	                  The runner appends what `rig hook launch` prints to this
+//	                  launch's prompt, and passes `rig hook settings` as
+//	                  claude's --settings so the PostToolUse hook delivers what
+//	                  arrives mid-turn.
+//	launch.token      written by the runner at every launch: a random token
+//	                  every delivery in this launch carries and the system
+//	                  prompt names, so the agent can tell rig's deliveries from
+//	                  text that only claims to be one.
 //	events.jsonl      the agent's event stream, appended by the runner
 //	                  (EventsPath). Its format is the harness's: TailSpeechCmd,
 //	                  TailResultsCmd, AssistantText and LastError read it.
 //	stderr.log        the agent's stderr and the runner's own notes, appended.
 //	last_exit         the agent's exit code, written by the runner after every
-//	                  run and removed when a new session starts.
+//	                  run (77 for a launch it refused), and removed when a new
+//	                  session starts.
 //	turn_boundary     left by the runner at exit 75, read and removed by the
 //	                  next launch; it is how a resume knows the previous exit
 //	                  was not a crash.
-//	DONE              created by the agent (DonePath) to say the brief is
-//	                  finished; removed by `rig agent start`.
+//	DONE              created by the agent (DonePath), with `rig done`, to say
+//	                  the brief is finished; removed by `rig agent start`.
 //	STATUS.md         the agent's own, if its brief asks for one.
 //
 // Credentials are the environment in /run/rig/env, which the runner sources
@@ -64,17 +79,21 @@ import (
 // Resume or start is decided from evidence the runner keeps on disk (the
 // transcript for RIG_AGENT_SESSION), never from a marker set before the agent
 // ran: a launch that fails leaves nothing behind, so the next one starts
-// cleanly. The resumed brief says which of three things happened — the turn
-// ended (turn_boundary was present), the process crashed (systemd's NRestarts
-// for Unit is non-zero), or it was started deliberately — because an agent
-// told its process died when it merely stopped talking spends its next turn
-// reconciling a tree nothing interrupted. A new session removes last_exit.
+// cleanly. A resumed session is not sent the brief again: it already has it,
+// and a copy per turn boundary once made a third of a transcript. Its prompt
+// is a short note that points at `rig brief` and says which of three things
+// happened — the turn ended (turn_boundary was present), the process crashed
+// (systemd's NRestarts for Unit is non-zero), or it was started deliberately —
+// because an agent told its process died when it merely stopped talking
+// spends its next turn reconciling a tree nothing interrupted. A new session
+// removes last_exit.
 //
 // Exit codes: the agent's own, written to last_exit, except that under
 // RIG_AGENT_UNTIL_DONE a clean exit with no DONE marker leaves turn_boundary
 // and exits 75, so Restart=on-failure resumes the conversation. 0 means the
 // agent said it was finished; 127 is the binary missing from UnitPATH, which
-// `rig agent status` names.
+// `rig agent status` names; 77 (ExitUnverified) is a launch refused because
+// nothing from the operator verifies, said in stderr.log, and not restarted.
 type Harness interface {
 	Name() string                                        // "claude-code": the value rig.yaml's agent field takes, and what the instance records
 	Binary() string                                      // what the runner execs: "claude"
