@@ -213,6 +213,12 @@ func (c *Client) SetDevices(name string, devices map[string]Device) error {
 
 // SetConfigKey sets one key of an instance's config; an empty value removes it.
 func (c *Client) SetConfigKey(name, key, value string) error {
+	return c.SetConfigKeys(name, map[string]string{key: value})
+}
+
+// SetConfigKeys sets several keys in one update; an empty value removes its
+// key.
+func (c *Client) SetConfigKeys(name string, kv map[string]string) error {
 	inst, etag, err := c.Instance(name)
 	if err != nil {
 		return err
@@ -221,10 +227,12 @@ func (c *Client) SetConfigKey(name, key, value string) error {
 	for k, v := range inst.Config {
 		config[k] = v
 	}
-	if value == "" {
-		delete(config, key)
-	} else {
-		config[key] = value
+	for key, value := range kv {
+		if value == "" {
+			delete(config, key)
+		} else {
+			config[key] = value
+		}
 	}
 	body := map[string]any{
 		"architecture": inst.Architecture,
