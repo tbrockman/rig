@@ -77,6 +77,17 @@ look like something else. Decisions and their history are in DESIGN.md.
   rule names the uplink interface, and a PCI renumbering renames that too.
 - Don't run Tailscale inside a guest: it would be a tailnet node that can
   reach every other one, past the ACL. Publish on the host's tailnet address.
+  A guest that must reach one tailnet node gets a vsock relay instead: a
+  user unit on the host (`socat VSOCK-LISTEN:<port>,fork TCP:<tailnet
+  addr>:22`) and a guest unit (`socat TCP-LISTEN:<port>,bind=127.0.0.1,fork
+  VSOCK-CONNECT:2:<port>`), the pattern the CI pools use for host services.
+  The connection leaves with the host's tailnet identity, so the tailnet
+  policy for the host is what the guest gets, to that one address and port;
+  any VM on the host can dial the vsock port.
+- `tailscale status` (text) marks some offline peers only with `-` in the
+  last column; `--json` has an `Online` field. `verify` picks its tailnet
+  peer from the JSON and pings it first, else the check reads "the host
+  cannot reach it either" on every run and verify is never conclusive.
 - Incus evaluates an ACL's `drop` rules, then `reject`, then `allow`, across
   every ACL on the NIC, so an allow for one address inside a rejected range
   (a proxy port on the bridge address) is shadowed by the reject. A hole in

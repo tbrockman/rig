@@ -3,6 +3,7 @@ package verify
 import (
 	"bufio"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -147,31 +148,53 @@ func lanPeer(iface, gateway string) string {
 	return ""
 }
 
-// tailnetPeer finds an online peer in 100.64.0.0/10 that is not this host.
+// tailnetPeer finds an online peer in 100.64.0.0/10 that is not this host,
+// and that this host can reach, so the check has something to prove.
 //
 // The range is not covered by RFC1918 and was a real gap here once, so it stays
 // tested even though the host's own tailnet address already covers it. That
 // address is precisely what must be excluded: `tailscale status` lists the
 // local machine first, and testing it again would duplicate a host check while
 // looking like it reached across the tailnet.
+//
+// The JSON status, not the text: the text column marks some offline peers only
+// with "-", and a peer picked from it that the host cannot reach turns the
+// check into "proves nothing" on every run. Online is necessary, not
+// sufficient — a peer may drop echo requests — so each candidate is pinged,
+// with a short timeout and a bounded count, as lanPeer does.
 func tailnetPeer(own []string) string {
-	out, err := exec.Command("tailscale", "status").Output()
+	out, err := exec.Command("tailscale", "status", "--json").Output()
 	if err != nil {
+		return ""
+	}
+	var status struct {
+		Peer map[string]struct {
+			TailscaleIPs []string
+			Online       bool
+		}
+	}
+	if err := json.Unmarshal(out, &status); err != nil {
 		return ""
 	}
 	mine := map[string]bool{}
 	for _, a := range own {
 		mine[a] = true
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 0 || !strings.HasPrefix(fields[0], "100.") {
+	tried := 0
+	for _, p := range status.Peer {
+		if !p.Online || tried >= 8 {
 			continue
 		}
-		if strings.Contains(line, "offline") || mine[fields[0]] {
-			continue
+		for _, ip := range p.TailscaleIPs {
+			if !strings.HasPrefix(ip, "100.") || mine[ip] {
+				continue
+			}
+			tried++
+			if ok, _ := hostICMP(ip, time.Second); ok {
+				return ip
+			}
+			break
 		}
-		return fields[0]
 	}
 	return ""
 }
