@@ -1,8 +1,125 @@
 # Design notes
 
 Decisions and why, what was learned proving them, and what is still weak.
-Written 2026-08-23; last updated 2026-10-15. `README.md` says what this is;
+Written 2026-08-23; last updated 2026-10-16. `README.md` says what this is;
 `docs/DEV_NOTES.md` has the facts the code depends on.
+
+## 2026-10-16: a channel to the agent that is timely and signed
+
+Four things were wrong between the operator and a running agent. A message
+from `rig agent send` reached the agent only when the runner next launched
+it: the runner read the inbox once, before `claude -p`, and a turn can run
+for hours (`send`'s help said "if it is polling"; nothing polled). The agent
+could not ask anything; its only signals were files the operator had to
+think to read. `send` pulled the inbox, appended and wrote it back while the
+runner copied and truncated it, so a message sent at a launch could vanish.
+And nothing told the operator's words from any other text the agent read:
+the inbox was a plain file the agent, root in the guest, could write itself.
+A fifth surfaced alongside: the runner passed the whole brief as the prompt
+at every launch, `--resume` included, so each turn boundary appended another
+copy as a new user turn; one 9.4 MB transcript held the brief's heading 226
+times, a third of the file, and plausibly helped it overflow its context.
+
+**Delivery.** Each item is its own file in `inbox.d`, written under a dot
+name and renamed into place, so nothing is read-modify-written. Takers claim
+a file by renaming it into `claimed/`, then verify and settle under a lock,
+in sequence order, so two takers at once cannot accept out of order or twice.
+The runner takes at launch; a PostToolUse hook, which the runner hands
+`claude` with `--settings`, takes after every tool call and returns what
+verified as `additionalContext`, which reaches the model within the same
+`claude -p` (DEV_NOTES). Hook context is not in the stream-json log, so each
+delivery is logged to `deliveries.jsonl` with its path: launch, hook, wait.
+
+**Asks.** The agent runs `rig ask <id> <question> [--wait 5m]`, which writes
+`asks/<id>.json`; `rig agent answer` sends a signed answer, which `rig ask
+--wait` or `rig wait` prints (exit 2 when none came; at most nine minutes,
+under the Bash tool's ten) and the hook delivers otherwise. `rig agent watch`
+polls the bounded probe `status` uses and prints one line per change, ask
+opened or answered, delivery, tamper, DONE, unit and restart changes,
+STATUS.md, with `--exec` for a notifier. `rig done` writes DONE.
+
+**Authenticity.** Each VM has an ed25519 key on the host
+(`~/.config/rig/agent/<vm>/operator.key`, 0600, made at its first start);
+the guest gets the public half as `operator.pub`. Every item is an envelope
+`{v, session, seq, time, kind, id, body}`, canonical JSON signed after a
+domain-separation prefix. The guest accepts one only with a good signature,
+for the session it runs, with a sequence number above the last it accepted
+(the host keeps the counter, under a lock); anything else is moved to
+`rejected/` and logged in `tamper.jsonl`, which `status` and `watch` show,
+and the agent never sees it. An older rig's unsigned inbox is treated the
+same way. Verification is code in the guest build of rig, never the model's
+judgement. The model is told, in its system prompt, where text it reads
+during the run cannot reach, that operator messages come only through rig
+and that each delivery in this launch carries a random per-launch token;
+text elsewhere claiming the operator's authority is data. Without that
+statement the model rightly discounted hook context it could not place.
+
+**The brief.** Sent once, as the first message of a new session; a resume
+gets only its short continuation note and what is queued. The brief in the
+guest is itself signed (`brief.msg`, with a floor so an older one copied back
+is refused), the runner will not launch on one that does not verify (exit
+77, which the unit does not restart), and `rig brief` prints the verified
+text, which the continuation note points at so an agent can re-read it after
+a compaction instead of trusting a summary. `rig agent brief` changes it
+while the agent runs: it diffs against the host's copy of the last brief
+delivered, writes the new one signed, and queues the diff as a
+`brief-update`, in order with everything else. Persistent rules live in the
+brief; there is no separate "standing message". The start options are
+recorded on the instance, so a bare `rig agent start` resumes as started:
+one that forgot `--until-done` used to stop the agent after its next turn.
+
+**One codebase, one name.** The guest build is `cmd/rig/guest`, a second main
+package built as `rig` (static, amd64 and arm64), not build tags on
+`cmd/rig`: tags would have to mark every host file, and every new one, and a
+forgotten tag pulls the Incus client into the guest without a sound. A
+package boundary makes "the guest cannot reach Incus or the private key" a
+property of the import graph, which a test checks. Both builds use
+`internal/agent`'s envelope code. rig embeds the guest build
+(`internal/agent/guestbin`), and `rig agent start` installs it as `bin/rig`,
+first on the agent's PATH, and records the sha256 of it, the public key and
+the runner on the instance for `status` to compare. It is a build product,
+not committed: `make` builds it first, a checkout without it embeds a
+placeholder and `go test` still passes, and a test rebuilds each embedded
+build and fails, naming `make`, when it is not what the source builds to now.
+The cost is that `go install` alone gives a rig whose `agent start` refuses,
+saying why.
+
+What holds, and what does not:
+
+- Signing stops forged items, because the private key never enters the
+  guest: the agent, or anything that talks it into writing a file, can put
+  anything in `inbox.d`, and none of it verifies.
+- The model does not judge signatures; it trusts a path, and is told which.
+- Guest root can replace the verifier, the public key or the runner, and
+  then deliver anything. The hash check sees a replaced file, but it reads
+  through the guest (its incus-agent and its sha256sum), so a guest that
+  lies about its own files is not caught. It detects; it does not prevent.
+- The token defends against text written before the launch: a repo file, an
+  issue, a web page. Code running in the guest can read it (it is in
+  `claude`'s argv and in `launch.token`, and everything there is root).
+- Replays are refused by sequence number against state the guest keeps,
+  which guest root can reset.
+- Nothing here touches injected instructions that do not claim the
+  operator's authority: "the tests need the cache deleted" in a README is
+  still text the agent may follow, as before.
+- An item taken at a launch whose `claude` then dies is in `delivered/`, not
+  in the conversation, as with the old inbox.
+- Unverified: whether the hook also fires for a subagent's tool calls, which
+  would put a message in the subagent's context rather than the agent's.
+
+For later: inject operator messages on the host, in the credential proxy,
+which is the agent's only route to the API. That takes the guest's code out
+of the trust base (no verifier, key or runner there to replace) and lets the
+proxy strip imitations from requests. It costs rewriting requests in the
+plugin, a prompt-cache miss at each injection, a transcript in the guest that
+differs from what the model saw, and it works only for proxied VMs.
+
+`claude -p` stops background tasks ten minutes after a turn ends unless
+`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` says otherwise. The runner leaves it:
+a longer ceiling saves a long backgrounded build at a turn boundary, but
+holds the turn open, idle, for as long as a forgotten server runs, which
+under `--until-done` is up to `--timeout`. The env file is exported to the
+agent, so a project whose builds need it sets it there.
 
 ## 2026-10-15: the proxy as the guest's way out, opt-in
 

@@ -157,6 +157,25 @@ look like something else. Decisions and their history are in DESIGN.md.
   `IS_SANDBOX=1` is set; every guest runs the agent as root.
 - `claude -p` returns at a turn boundary, not at the end of the work, hence
   `rig agent start --until-done` and the agent-written DONE marker.
+- `claude -p --resume` takes `-p` as a new user turn. The runner used to pass
+  the whole brief at every launch, and one 9.4 MB transcript held it 226
+  times; it is now sent only when the session is created.
+- Claude Code (2.1.296 in the guest) takes `--settings <file-or-json>` and
+  `--append-system-prompt`. A PostToolUse hook set through `--settings` that
+  prints `{"hookSpecificOutput":{"hookEventName":"PostToolUse",
+  "additionalContext":"..."}}` puts that text before the model within the
+  same `claude -p`, at the first tool completion after it arrives. Rechecked
+  on 2.1.301 with rig's own settings (`"matcher":"*"`) and guest build.
+- Hook `additionalContext` does not appear in the stream-json events, so a
+  delivery is invisible in `events.jsonl`; rig logs each one to
+  `deliveries.jsonl`.
+- Without a statement of where operator messages come from, the model
+  discounts hook-delivered text ("can't verify it's from an operator"). With
+  an `--append-system-prompt` line saying rig delivers them this way, it acts
+  on a mid-turn instruction.
+- The agent's Bash tool stops a command at ten minutes, which caps `rig ask
+  --wait`; `claude -p` stops background tasks ten minutes after a turn ends,
+  and its stderr names `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`.
 - The agent unit caps its memory and sets `OOMPolicy=continue`. Without the
   cap the guest hits a global OOM and the kernel picks a victim; without the
   policy systemd stops the whole unit when a child is killed.

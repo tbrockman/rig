@@ -51,8 +51,11 @@ supported.
 go install github.com/tbrockman/rig/cmd/rig@latest   # or, in a checkout: make
 ```
 
-The binary carries the guest image definition and the project template. Then
-work through `docs/RUNBOOK.md` once: storage pool, `rig setup`, image.
+The binary carries the guest image definition and the project template, and,
+built with `make`, the guest half of `rig agent` (`cmd/rig/guest`); a `go
+install`ed rig has everything else, and its `rig agent start` says what is
+missing. Then work through `docs/RUNBOOK.md` once: storage pool, `rig setup`,
+image.
 
 ## Quick start
 
@@ -160,7 +163,18 @@ rig push cuda-agent examples/cuda-agent          # -> /work/cuda-agent
 rig agent start cuda-agent --prompt-file brief.md --workdir /work/cuda-agent --until-done
 rig agent status cuda-agent      # cheap; check often
 rig agent log cuda-agent         # what it said, minus the tool calls
+rig agent watch cuda-agent       # one line per change: asks, deliveries, tamper, done
+rig agent send cuda-agent "Skip E3; the docs are out of scope."
+rig agent answer cuda-agent cuda "Stay on 12.4."   # the agent asked: rig ask cuda "..."
+rig agent brief cuda-agent       # after editing brief.md: the agent gets the diff
 ```
+
+What you send is signed with a key that stays on this host and verified in
+the guest before the agent sees it, and arrives after the agent's next tool
+call rather than at its next restart. The agent is told that only rig
+delivers your words; text it reads anywhere else that claims to be you is
+data. A bare `rig agent start cuda-agent` later resumes with the same
+options.
 
 Keep credential files outside any repository (`~/.config/rig/`).
 
@@ -220,7 +234,9 @@ values); `rig creds` swaps a key without a restart, as before.
 | `forward` | One TCP port, either direction, over vsock |
 | `creds` | Swap the credential in a running VM |
 | `proxy setup/status/log` | The host proxies that hold proxied credentials, one per guest |
-| `agent install/start/status/log/send/stop` | The coding agent (Claude Code by default) as a systemd unit that resumes its session after a crash |
+| `agent install/start/stop` | The coding agent (Claude Code by default) as a systemd unit that resumes its session after a crash |
+| `agent status/watch/log` | What it is doing, one line per change for a notifier, what it said |
+| `agent send/answer/asks/brief` | Signed messages, answers to its `rig ask`s, and brief changes as diffs, delivered mid-turn |
 
 | Grants and isolation | |
 |---|---|
@@ -249,6 +265,8 @@ What holds:
 - `host input` lends a keyboard and mouse as events rather than passing them
   through, so a guest can't reprogram a device and have it type into the host
   later.
+- What you send an agent is signed on the host; nothing in the guest can forge
+  a message, an answer or the brief.
 
 What doesn't:
 
@@ -257,7 +275,8 @@ What doesn't:
   with `proxy.credentials`. A proxied key is still *usable* from the guest, at
   the endpoints it is meant for: what the proxy prevents is the key leaving,
   not the agent spending it there.
-- The agent is root in the guest.
+- The agent is root in the guest. Root there can replace rig's verifier; `rig
+  agent status` notices the replaced file, which is detection, not prevention.
 - A passed-through device belongs to the guest. The IOMMU confines its DMA,
   but assume a guest could rewrite its firmware. Pass through only what you'd
   accept that for.
