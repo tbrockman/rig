@@ -459,10 +459,22 @@ func (r *runnerDir) run() (int, map[string]string) {
 		return code, nil
 	}
 	args := strings.Split(strings.TrimSuffix(string(raw), "\x00"), "\x00")
-	takesValue := map[string]bool{"-p": true, "--resume": true, "--session-id": true, "--model": true,
+	// The prompt is the one positional, after `--` (a note that begins with
+	// `---` would otherwise be read as an option); it is returned under "-p",
+	// which is the flag that makes it a prompt, so the tests read it there.
+	takesValue := map[string]bool{"--resume": true, "--session-id": true, "--model": true,
 		"--settings": true, "--append-system-prompt": true, "--output-format": true}
 	got := map[string]string{}
 	for i := 0; i < len(args); i++ {
+		if args[i] == "--" {
+			if i+1 < len(args) {
+				got["-p"] = args[i+1]
+			}
+			if i+2 < len(args) {
+				r.t.Fatalf("more than one positional after --: %q", args[i+1:])
+			}
+			break
+		}
 		if takesValue[args[i]] && i+1 < len(args) {
 			got[args[i]] = args[i+1]
 			i++

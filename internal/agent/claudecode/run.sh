@@ -249,12 +249,20 @@ MODEL=()
 # boundary, but also holds a turn open, idle, for as long as a forgotten
 # server runs. The env file is sourced and exported above, so an operator
 # whose builds need it sets it there.
-timeout "$TIMEOUT" claude -p "$PROMPT" "${MODE[@]}" "${MODEL[@]}" \
+#
+# The prompt goes after `--`: every resume note above begins with `---`, and
+# claude (2.1.308) reads a positional that starts with a dash as an option,
+# "error: unknown option '--- NOTE: ...'", exit 1 before anything runs. Each
+# restart then failed the same way until StartLimitBurst gave up, and an
+# agent paused at a turn boundary stayed down for hours. `--` ends option
+# parsing, so the prompt is taken as the prompt whatever it starts with.
+timeout "$TIMEOUT" claude -p "${MODE[@]}" "${MODEL[@]}" \
   --settings "$SETTINGS" \
   --append-system-prompt "$CHANNEL" \
   --dangerously-skip-permissions \
   --verbose \
   --output-format stream-json \
+  -- "$PROMPT" \
   >> "$D/events.jsonl" 2>> "$D/stderr.log"
 
 RC=$?

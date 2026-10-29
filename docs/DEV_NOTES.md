@@ -157,6 +157,11 @@ look like something else. Decisions and their history are in DESIGN.md.
   `IS_SANDBOX=1` is set; every guest runs the agent as root.
 - `claude -p` returns at a turn boundary, not at the end of the work, hence
   `rig agent start --until-done` and the agent-written DONE marker.
+- A prompt that begins with a dash is read by `claude` (2.1.308) as an
+  option: `claude -p "--- NOTE: ..."` exits 1 with "unknown option" before
+  anything runs. Every resume note starts with `---`, so each restart failed
+  the same way until StartLimitBurst gave up and the agent sat idle for hours
+  (2026-10-27, mono-agent). The runner passes the prompt after `--`.
 - `claude -p --resume` takes `-p` as a new user turn. The runner used to pass
   the whole brief at every launch, and one 9.4 MB transcript held it 226
   times; it is now sent only when the session is created.
