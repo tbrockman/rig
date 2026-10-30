@@ -70,6 +70,41 @@ leaves `rig verify` PROVEN. For an operator's own preview, `forwards` is
 the default and `ports` the exception; `rig doctor` notes a port named
 under both.
 
+**Two watchdogs, and budgets.** The six-hour `--timeout` is a backstop for
+a run that never reaches a turn boundary: a lead waiting on subagents
+forever, a server holding the turn open, a hung tool call. It fired three
+times on healthy runs in one mission and cost ten minutes of
+reconciliation each time. `idle_timeout` is the better backstop: the guest
+rig's watchdog (`rig hook watchdog`, started by the runner beside the
+agent) cuts a run with nothing new in its event log for that long, and
+never one that is visibly working; `timeout` stays as the outer ceiling.
+Both are a run's limits, resumed with a note that names which fired, so
+the agent reconciles one unfinished tool call rather than a crash it
+imagines. Idleness is the log's mtime, not a parse for tool calls: it is
+the same for every harness, and a tool call that takes longer than the
+limit without writing anything is what the limit is for.
+
+Budgets are the mission's limits, and the guarantee that an unattended
+agent cannot run past what the operator allowed. Crossing one stops the
+agent the way `rig agent stop` does: the run is ended at once, the unit is
+not restarted (exit 79 is in RestartPreventExitStatus beside 77), a BUDGET
+marker beside DONE says which fired and at what value, and the session is
+kept, so raising the budget and starting resumes where it stopped. What
+the guest can judge it judges itself, so the stop depends on nobody
+watching from the host: restarts are systemd's NRestarts against the
+budget, checked by the runner before a launch; hours and tokens are the
+watchdog's, checked before a launch and during a run, tokens summed from
+the harness's own event log by the harness's parser, which the guest build
+of rig carries for that. A subscription window needs the credential, so
+it is `rig agent watch`'s on the host, and the only budget that is.
+
+The proxy could have been the one place for all of it: it sees every
+response from the provider, so token counts and rate-limit headers could
+be read there, for every harness at once. Not done: only a proxied VM has
+a proxy, the plugin would have to parse streamed response bodies rather
+than rewrite headers, and the event log is in every harness already. If a
+second harness logs no usage, the proxy is where to look next.
+
 **Defaults and records.** `rig agent start` resolves each option as the
 flag given now, else what the last start recorded, else the file, else
 the flag's default. The record stands in for the file once it exists,

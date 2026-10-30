@@ -112,7 +112,7 @@ func (a *app) agentInstallCmd() *cobra.Command {
 }
 
 func (a *app) agentStartCmd() *cobra.Command {
-	var promptFile, workdir, memMax, timeout, model string
+	var promptFile, workdir, memMax, timeout, idleTimeout, model string
 	var restarts int
 	var newSession, untilDone bool
 	cmd := &cobra.Command{
@@ -184,7 +184,7 @@ func (a *app) agentStartCmd() *cobra.Command {
 				return err
 			}
 			opts, err := startOptions(cmd.Flags().Changed, agent.RecordedOptions(inst.Config), manifestDefaults(spec), agent.StartOptions{
-				PromptFile: promptFile, Workdir: workdir, Model: model, Timeout: timeout,
+				PromptFile: promptFile, Workdir: workdir, Model: model, Timeout: timeout, IdleTimeout: idleTimeout,
 				MemoryMax: memMax, UntilDone: untilDone, Restarts: restarts,
 			})
 			if err != nil {
@@ -320,16 +320,23 @@ func (a *app) agentStartCmd() *cobra.Command {
 
 			// A DONE marker from the previous mission would end this one before
 			// its first turn: --until-done reads it as "already finished". The
-			// turn_boundary note is the same kind of leftover, and would open
-			// this run with a resumption note about a turn that is not this
-			// run's. The plain prompt file is an older rig's unsigned brief,
-			// which nothing reads now.
-			_, _ = a.exec(name, "rm -f "+agent.DonePath+" "+agent.Dir+"/turn_boundary "+agent.Dir+"/prompt")
+			// turn_boundary and watchdog notes are the same kind of leftover,
+			// and would open this run with a resumption note about a run that
+			// is not this one's; a BUDGET marker is the stop this start is
+			// meant to lift. The plain prompt file is an older rig's unsigned
+			// brief, which nothing reads now.
+			_, _ = a.exec(name, "rm -f "+agent.DonePath+" "+agent.Dir+"/"+agent.BudgetName+" "+agent.Dir+"/"+agent.WatchdogName+
+				" "+agent.Dir+"/turn_boundary "+agent.Dir+"/prompt")
 
-			argv := agent.SystemdRun(agent.UnitOpts{
-				Workdir: opts.Workdir, Session: session, Timeout: opts.Timeout, MemoryMax: opts.MemoryMax,
-				Restarts: opts.EffectiveRestarts(), UntilDone: opts.UntilDone, Model: opts.Model,
-			})
+			unit := agent.UnitOpts{
+				Workdir: opts.Workdir, Session: session, Harness: h.Name(), Timeout: opts.Timeout, IdleTimeout: opts.IdleTimeout,
+				MemoryMax: opts.MemoryMax, Restarts: opts.EffectiveRestarts(), UntilDone: opts.UntilDone, Model: opts.Model,
+				Started: time.Now().Unix(),
+			}
+			if b := spec.Budgets; b != nil {
+				unit.BudgetHours, unit.BudgetTokens, unit.BudgetRestarts = b.Hours, b.Tokens, b.Restarts
+			}
+			argv := agent.SystemdRun(unit)
 			out, err := a.exec(name, shellQuote(argv))
 			if err != nil {
 				return fmt.Errorf("starting %s: %w\n%s", agent.Unit, err, out)
@@ -338,6 +345,14 @@ func (a *app) agentStartCmd() *cobra.Command {
 				agent.Unit, opts.Workdir, opts.MemoryMax, opts.EffectiveRestarts())
 			if opts.Model != "" {
 				note("model: %s", opts.Model)
+			}
+			if opts.IdleTimeout != "" {
+				note("watchdog: a run with nothing new in its event log for %s is cut and resumed; the ceiling is %s", opts.IdleTimeout, opts.Timeout)
+			} else {
+				note("watchdog: a run is cut and resumed at %s; guest.agent.idle_timeout or --idle-timeout cuts one that has stopped working sooner", opts.Timeout)
+			}
+			if budgets := describeBudgets(spec); budgets != "" {
+				note("budgets: %s; crossing one stops the agent, session kept", budgets)
 			}
 			if opts.UntilDone {
 				note("--until-done: a clean exit resumes instead of stopping, until the agent creates %s",
@@ -352,6 +367,7 @@ func (a *app) agentStartCmd() *cobra.Command {
 	f.StringVar(&workdir, "workdir", "/work", "working directory in the guest")
 	f.StringVar(&memMax, "memory-max", "80%", "systemd MemoryMax for the unit; a runaway child is killed before the guest OOMs")
 	f.StringVar(&timeout, "timeout", "6h", "kill a single agent run after this long; it restarts and resumes")
+	f.StringVar(&idleTimeout, "idle-timeout", "", "kill a run with nothing new in its event log for this long (20m, say); it resumes with a note; empty never does")
 	f.IntVar(&restarts, "max-restarts", 0,
 		fmt.Sprintf("restarts allowed per hour before systemd gives up and waits for a human (default %d, or %d with --until-done)",
 			agent.DefaultRestarts(false), agent.DefaultRestarts(true)))
@@ -367,9 +383,30 @@ func (a *app) agentStartCmd() *cobra.Command {
 // options, in their shape.
 func manifestDefaults(a manifest.Agent) agent.StartOptions {
 	return agent.StartOptions{
-		PromptFile: a.PromptFile, Workdir: a.Workdir, Model: a.Model, Timeout: a.Timeout,
+		PromptFile: a.PromptFile, Workdir: a.Workdir, Model: a.Model, Timeout: a.Timeout, IdleTimeout: a.IdleTimeout,
 		MemoryMax: a.MemoryMax, UntilDone: a.UntilDone,
 	}
+}
+
+// describeBudgets is the guest-enforced budgets in a line, "" for none.
+func describeBudgets(a manifest.Agent) string {
+	if a.Budgets == nil {
+		return ""
+	}
+	var parts []string
+	if a.Budgets.Hours > 0 {
+		parts = append(parts, fmt.Sprintf("%g hours", a.Budgets.Hours))
+	}
+	if a.Budgets.Tokens > 0 {
+		parts = append(parts, agent.Thousands(a.Budgets.Tokens)+" tokens")
+	}
+	if a.Budgets.Restarts > 0 {
+		parts = append(parts, fmt.Sprintf("%d restarts", a.Budgets.Restarts))
+	}
+	if a.Budgets.Usage != nil {
+		parts = append(parts, fmt.Sprintf("%s window at %.0f%% (judged by rig agent watch on this host)", a.Budgets.Usage.Window, a.Budgets.Usage.Max*100))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // startOptions resolves each start option: the flag when it was given now,
@@ -394,6 +431,7 @@ func startOptions(changed func(flag string) bool, recorded, fromManifest, given 
 	pick("workdir", &o.Workdir, base.Workdir)
 	pick("model", &o.Model, base.Model)
 	pick("timeout", &o.Timeout, base.Timeout)
+	pick("idle-timeout", &o.IdleTimeout, base.IdleTimeout)
 	pick("memory-max", &o.MemoryMax, base.MemoryMax)
 	if !changed("until-done") {
 		o.UntilDone = base.UntilDone
@@ -476,6 +514,13 @@ func (a *app) agentStatusCmd() *cobra.Command {
 			// restarts", which otherwise look identical from `unit inactive`.
 			if p.Done {
 				row("mission", "COMPLETE: "+agent.Clean(p.Summary, 200))
+			}
+			if p.Budget != "" {
+				row("mission", "STOPPED BY BUDGET: "+agent.Clean(p.Budget, 200))
+				row("", "session kept; raise the budget in rig.yaml, rig apply -f, then rig agent start "+name)
+			}
+			if p.Watchdog != "" {
+				row("watchdog", agent.Clean(p.Watchdog, 200)+" (resumes with a note at the next launch)")
 			}
 
 			// last_exit is written when a run ends, and simply stays there.
@@ -594,7 +639,7 @@ func describeOptions(o agent.StartOptions) string {
 	if o.Model != "" {
 		parts = append(parts, "model "+o.Model)
 	}
-	for _, kv := range [][2]string{{"workdir", o.Workdir}, {"timeout", o.Timeout}, {"memory", o.MemoryMax}} {
+	for _, kv := range [][2]string{{"workdir", o.Workdir}, {"timeout", o.Timeout}, {"idle timeout", o.IdleTimeout}, {"memory", o.MemoryMax}} {
 		if kv[1] != "" {
 			parts = append(parts, kv[0]+" "+kv[1])
 		}

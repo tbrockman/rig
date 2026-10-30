@@ -90,15 +90,28 @@ const UnitPATH = GuestBinDir + ":/root/.nix-profile/bin:/run/wrappers/bin:/run/c
 // brief does not verify. The unit does not restart it.
 const ExitUnverified = 77
 
+// ExitBudget is the runner's exit when a budget fired: the BUDGET marker
+// says which. The unit does not restart it; the session is kept, and `rig
+// agent start` after the budget is raised resumes it.
+const ExitBudget = 79
+
 // UnitOpts are the knobs that decide how the unit survives trouble.
 type UnitOpts struct {
-	Workdir   string
-	Session   string
-	Timeout   string // passed to timeout(1) inside the guest
-	MemoryMax string // systemd syntax; "80%" is a percentage of guest RAM
-	Restarts  int    // burst allowed before systemd gives up
-	UntilDone bool   // keep resuming after a clean exit until the agent says it is finished
-	Model     string // agent model; empty means whatever the guest's default is
+	Workdir     string
+	Session     string
+	Harness     string // the harness's name, for the guest build to pick its parser
+	Timeout     string // passed to timeout(1) inside the guest
+	IdleTimeout string // a run with nothing new in its event log for this long is killed and resumed; "" for never
+	MemoryMax   string // systemd syntax; "80%" is a percentage of guest RAM
+	Restarts    int    // burst allowed before systemd gives up
+	UntilDone   bool   // keep resuming after a clean exit until the agent says it is finished
+	Model       string // agent model; empty means whatever the guest's default is
+	Started     int64  // unix seconds rig agent start ran, from which the hours budget counts
+
+	// The budgets the guest enforces itself; 0 is none of that kind.
+	BudgetHours    float64
+	BudgetTokens   int64
+	BudgetRestarts int
 }
 
 // SystemdRun builds the systemd-run invocation.
@@ -117,10 +130,11 @@ type UnitOpts struct {
 //	  property would be wrong without the UUID.
 //	StartLimit* — a persistently failing run must escalate to a human instead
 //	  of flapping forever.
-//	RestartPreventExitStatus=77 — the runner's "nothing from the operator
-//	  verifies": no verifier, or a brief whose signature fails. Retrying cannot
-//	  fix either, and a run that would act on an unverified brief must not
-//	  happen five times.
+//	RestartPreventExitStatus=77 79 — the runner's "nothing from the operator
+//	  verifies" (no verifier, or a brief whose signature fails; retrying
+//	  cannot fix either, and a run that would act on an unverified brief must
+//	  not happen five times) and "a budget fired" (the mission's limit, which
+//	  a restart would only cross again).
 func SystemdRun(o UnitOpts) []string {
 	args := []string{
 		"systemd-run",
@@ -130,7 +144,7 @@ func SystemdRun(o UnitOpts) []string {
 		"--property=OOMPolicy=continue",
 		"--property=Restart=on-failure",
 		"--property=RestartSec=30s",
-		"--property=RestartPreventExitStatus=" + strconv.Itoa(ExitUnverified),
+		"--property=RestartPreventExitStatus=" + strconv.Itoa(ExitUnverified) + " " + strconv.Itoa(ExitBudget),
 		"--property=StartLimitIntervalSec=3600",
 		"--property=StartLimitBurst=" + strconv.Itoa(o.Restarts),
 		"--setenv=HOME=/root",
@@ -140,7 +154,23 @@ func SystemdRun(o UnitOpts) []string {
 		"--setenv=RIG_AGENT_WORKDIR=" + o.Workdir,
 		"--setenv=RIG_AGENT_SESSION=" + o.Session,
 		"--setenv=RIG_AGENT_TIMEOUT=" + o.Timeout,
+		"--setenv=RIG_AGENT_STARTED=" + strconv.FormatInt(o.Started, 10),
 		"--description=rig unattended agent",
+	}
+	if o.Harness != "" {
+		args = append(args, "--setenv=RIG_AGENT_HARNESS="+o.Harness)
+	}
+	if o.IdleTimeout != "" {
+		args = append(args, "--setenv=RIG_AGENT_IDLE_TIMEOUT="+o.IdleTimeout)
+	}
+	if o.BudgetHours > 0 {
+		args = append(args, "--setenv=RIG_AGENT_BUDGET_HOURS="+strconv.FormatFloat(o.BudgetHours, 'f', -1, 64))
+	}
+	if o.BudgetTokens > 0 {
+		args = append(args, "--setenv=RIG_AGENT_BUDGET_TOKENS="+strconv.FormatInt(o.BudgetTokens, 10))
+	}
+	if o.BudgetRestarts > 0 {
+		args = append(args, "--setenv=RIG_AGENT_BUDGET_RESTARTS="+strconv.Itoa(o.BudgetRestarts))
 	}
 	if o.MemoryMax != "" {
 		args = append(args, "--property=MemoryMax="+o.MemoryMax)
@@ -197,6 +227,8 @@ type Probe struct {
 	Exited   int64  // mtime of last_exit
 	Done     bool   // the agent created the DONE marker
 	Summary  string // DONE's first line, which `rig done` fills
+	Budget   string // BUDGET's first line: the budget that stopped the agent, "" when none
+	Watchdog string // watchdog's first line: a run's limit that fired and has not been resumed past yet
 	StatusMD string // STATUS.md's size and mtime: it changed when this did
 
 	Pending int               // envelopes in inbox.d, not yet taken
@@ -243,6 +275,8 @@ echo "now=$(date +%%s)"
 echo "exited=$(stat -c %%Y $d/last_exit 2>/dev/null)"
 echo "done=$(test -e $d/%[3]s && echo yes)"
 echo "summary=$(head -n 1 $d/%[3]s 2>/dev/null | head -c 300 | tr -d '\n')"
+echo "budget=$(head -n 1 $d/%[14]s 2>/dev/null | head -c 300 | tr -d '\n')"
+echo "watchdog=$(head -n 1 $d/%[15]s 2>/dev/null | head -c 300 | tr -d '\n')"
 echo "statusmd=$(stat -c %%s.%%Y $d/STATUS.md 2>/dev/null)"
 echo "pending=$(ls -1 $d/%[4]s 2>/dev/null | grep -c '\%[5]s$')"
 echo "legacy=$(test -s $d/%[6]s && echo yes)"
@@ -257,7 +291,8 @@ tail -n %[13]d $d/%[11]s 2>/dev/null | cut -c1-1024 | sed 's/^/delivery=/'
 echo "tampers=$(cat $d/%[12]s 2>/dev/null | wc -l)"
 tail -n %[13]d $d/%[12]s 2>/dev/null | cut -c1-1024 | sed 's/^/tamper=/'`,
 		Unit, dir, DoneName, InboxName, EnvelopeExt, LegacyInboxName, sums,
-		AsksName, maxProbed, AnswersName, DeliveriesName, TamperName, recentLogs)
+		AsksName, maxProbed, AnswersName, DeliveriesName, TamperName, recentLogs,
+		BudgetName, WatchdogName)
 }
 
 // ParseProbe reads StatusProbe's output. Anything missing stays zero: a probe
@@ -291,6 +326,10 @@ func ParseProbe(out string) Probe {
 			p.Done = strings.TrimSpace(v) == "yes"
 		case "summary":
 			p.Summary = strings.TrimSpace(v)
+		case "budget":
+			p.Budget = strings.TrimSpace(v)
+		case "watchdog":
+			p.Watchdog = strings.TrimSpace(v)
 		case "statusmd":
 			p.StatusMD = strings.TrimSpace(v)
 		case "pending":

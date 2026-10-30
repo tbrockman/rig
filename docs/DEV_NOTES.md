@@ -211,6 +211,16 @@ look like something else. Decisions and their history are in DESIGN.md.
 - The agent unit caps its memory and sets `OOMPolicy=continue`. Without the
   cap the guest hits a global OOM and the kernel picks a victim; without the
   policy systemd stops the whole unit when a child is killed.
+- The runner wraps `claude` in `timeout(1)`, and the watchdog ends a run by
+  signalling timeout's pid: coreutils timeout runs the command in a process
+  group of its own and, on a signal, passes it to the whole group, so a
+  `bash` stand-in waiting on a `sleep` dies too (bash defers a SIGTERM
+  until its foreground child exits, so a signal to bash alone would wait
+  out the sleep). SIGKILL follows after thirty seconds regardless. A run
+  the ceiling cut exits 124; one the watchdog cut exits 143.
+- `RestartPreventExitStatus=` takes a space-separated list in a
+  `systemd-run --property`; the runner's 77 (unverified) and 79 (budget)
+  share it.
 - Refreshing an OAuth session on the host rotates the refresh token, which
   invalidates a `CLAUDE_CREDENTIALS_B64` snapshot in a running guest. `rig
   creds` replaces it without a restart.

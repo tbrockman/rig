@@ -161,6 +161,42 @@ if [ -e "$D/turn_boundary" ]; then
   rm -f "$D/turn_boundary"
 fi
 
+# A run's limit that ended the previous run: the watchdog's note (idle) or
+# this script's (the outer timeout). Read once and cleared, like the turn
+# boundary: it explains this resume and no later one.
+WATCHDOG_NOTE=""
+if [ -e "$D/watchdog" ]; then
+  WATCHDOG_NOTE="$(head -n 1 "$D/watchdog")"
+  rm -f "$D/watchdog"
+fi
+
+NR="$(systemctl show "${RIG_AGENT_UNIT:-rig-agent}" -p NRestarts --value 2>/dev/null)"
+case "$NR" in ''|*[!0-9]*) NR=0 ;; esac
+
+# --- budgets ----------------------------------------------------------------
+# The mission's limits, enforced here so that the stop depends on nobody
+# watching from the host. A budget that fired stops the run the way rig agent
+# stop would: BUDGET says which, exit 79 is not restarted, the session is kept,
+# and rig agent start after the budget is raised resumes it. Restarts are
+# systemd's count for this unit invocation, which is what "since rig agent
+# start" means; hours and tokens are the watchdog's to judge, now and during
+# the run.
+budget_stop() {
+  echo "[$(date -Is)] budget: $1; stopping, session kept (raise it and rig agent start)" >> "$D/stderr.log"
+  echo 79 > "$D/last_exit"
+  exit 79
+}
+if [ -n "${RIG_AGENT_BUDGET_RESTARTS:-}" ] && [ "$NR" -gt "$RIG_AGENT_BUDGET_RESTARTS" ]; then
+  printf 'restarts: %s of %s since rig agent start\n%s\n' "$NR" "$RIG_AGENT_BUDGET_RESTARTS" "$(date -Is)" > "$D/BUDGET"
+  budget_stop "$(head -n 1 "$D/BUDGET")"
+fi
+"$RIG" hook watchdog --check >> "$D/stderr.log" 2>&1
+case $? in
+  0) ;;
+  3) budget_stop "$(head -n 1 "$D/BUDGET" 2>/dev/null)" ;;
+  *) echo "[$(date -Is)] rig hook watchdog --check failed; launching without the check" >> "$D/stderr.log" ;;
+esac
+
 # What a resumed agent is told about its brief, since it is not sent again.
 BRIEF_NOTE="Your brief is not repeated here. \`rig brief\` prints it as the operator last
 signed it; re-read it rather than rely on a summary of it. A change to it
@@ -169,14 +205,21 @@ reaches you as an operator message holding a diff."
 if compgen -G "$D/projects/*/$SID.jsonl" > /dev/null; then
   MODE=(--resume "$SID")
 
-  NR="$(systemctl show "${RIG_AGENT_UNIT:-rig-agent}" -p NRestarts --value 2>/dev/null)"
-  case "$NR" in ''|*[!0-9]*) NR=0 ;; esac
-
-  # Three cases, and only one of them is a crash. Telling an agent its process
+  # Four cases, and only one of them is a crash. Telling an agent its process
   # died when in fact its own turn simply ended would send it to reconcile a
   # working tree nothing interrupted — the same wasted turn the NRestarts note
-  # above was written to stop.
-  if [ "$TURN_BOUNDARY" -eq 1 ]; then
+  # above was written to stop. A run the watchdog ended is named as such: it
+  # was cut, not crashed, and the agent should expect its last tool call to be
+  # unfinished and nothing else to be wrong.
+  if [ -n "$WATCHDOG_NOTE" ]; then
+    PROMPT="--- NOTE: your previous run was ended by rig's watchdog ($WATCHDOG_NOTE); you were resumed ---
+rig cut the run short and restarted it with your conversation intact. Nothing
+else crashed. The tool call in flight at that moment did not finish, so check
+the working tree state (git status, git log) and reconcile it with what you
+believe you had done; then carry on. If you were waiting on something, say
+so in STATUS.md rather than wait silently.
+$BRIEF_NOTE"
+  elif [ "$TURN_BOUNDARY" -eq 1 ]; then
     PROMPT="--- NOTE: your previous turn ended; you were resumed to keep working ---
 Nothing crashed and nothing was interrupted. You stopped talking, which ends a
 turn but not the engagement, so you were restarted with your conversation
@@ -266,10 +309,39 @@ timeout "$TIMEOUT" claude -p "${MODE[@]}" "${MODEL[@]}" \
   --verbose \
   --output-format stream-json \
   -- "$PROMPT" \
-  >> "$D/events.jsonl" 2>> "$D/stderr.log"
+  >> "$D/events.jsonl" 2>> "$D/stderr.log" &
+CLAUDE_PID=$!
 
+# The watchdog, beside the run: the idle limit and the hours and tokens
+# budgets, judged in the guest. It ends timeout(1), which passes the signal
+# on to claude, and leaves the marker this script reads below. Stopped once
+# the run is over, whichever way.
+"$RIG" hook watchdog --pid "$CLAUDE_PID" ${RIG_AGENT_WATCHDOG_INTERVAL:+--interval "$RIG_AGENT_WATCHDOG_INTERVAL"} \
+  >> "$D/stderr.log" 2>&1 &
+WATCHDOG_PID=$!
+
+wait "$CLAUDE_PID"
 RC=$?
+kill "$WATCHDOG_PID" 2>/dev/null
+wait "$WATCHDOG_PID" 2>/dev/null
 echo "$RC" > "$D/last_exit"
+
+# A budget fired during the run: the mission's limit, so this is a stop,
+# not a resume. The marker stays for rig agent status and watch to show.
+if [ -e "$D/BUDGET" ]; then
+  budget_stop "$(head -n 1 "$D/BUDGET")"
+fi
+
+# A run's limit fired: the watchdog's (idle), or the outer ceiling (timeout
+# exits 124). Either leaves the note the next launch repeats to the agent,
+# and resumes: a cut run is not a crash, and not a result.
+if [ "$RC" -eq 124 ]; then
+  printf 'timeout: the run reached its ceiling of %s\n%s\n' "$TIMEOUT" "$(date -Is)" > "$D/watchdog"
+fi
+if [ -e "$D/watchdog" ]; then
+  echo "[$(date -Is)] run ended by the watchdog ($(head -n 1 "$D/watchdog")); resuming" >> "$D/stderr.log"
+  exit 75
+fi
 
 # --- did the mission finish, or just the turn? ---------------------------
 # `claude -p` returns when the model stops talking, which for a brief with

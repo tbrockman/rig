@@ -46,7 +46,7 @@ func TestSystemdRunCarriesTheSurvivalProperties(t *testing.T) {
 		{"--working-directory=/work/p", "the agent scopes session lookup to the project dir"},
 		{"/root/.nix-profile/bin", "a nix-profile-installed agent is not on a transient unit's PATH"},
 		{"--setenv=RIG_AGENT_PATH=" + UnitPATH, "the login shell discards PATH; the runner needs the unit's list by another name"},
-		{"--property=RestartPreventExitStatus=77", "a launch refused because nothing verifies must not be retried"},
+		{"--property=RestartPreventExitStatus=77 79", "a launch refused because nothing verifies, or stopped by a budget, must not be retried"},
 	} {
 		if !strings.Contains(got, want.flag) {
 			t.Errorf("missing %s — %s", want.flag, want.why)
@@ -58,23 +58,29 @@ func TestSystemdRunCarriesTheSurvivalProperties(t *testing.T) {
 // variable in it must actually be set, or a second harness written to the
 // contract would be reading nothing.
 func TestSystemdRunSetsTheContractEnvironment(t *testing.T) {
-	got := args(UnitOpts{Workdir: "/work/p", Session: "sid", Timeout: "2h",
-		Restarts: 1, UntilDone: true, Model: "fable"})
+	got := args(UnitOpts{Workdir: "/work/p", Session: "sid", Harness: "claude-code", Timeout: "2h", IdleTimeout: "20m",
+		Restarts: 1, UntilDone: true, Model: "fable", Started: 1793390400,
+		BudgetHours: 24, BudgetTokens: 50000000, BudgetRestarts: 10})
 	for _, want := range []string{
 		"--setenv=HOME=/root", "--setenv=TERM=dumb", "--setenv=PATH=" + UnitPATH,
 		"--setenv=RIG_AGENT_PATH=" + UnitPATH, "--setenv=RIG_AGENT_WORKDIR=/work/p",
 		"--setenv=RIG_AGENT_SESSION=sid", "--setenv=RIG_AGENT_TIMEOUT=2h",
 		"--setenv=RIG_AGENT_UNTIL_DONE=1", "--setenv=RIG_AGENT_MODEL=fable",
+		"--setenv=RIG_AGENT_HARNESS=claude-code", "--setenv=RIG_AGENT_IDLE_TIMEOUT=20m",
+		"--setenv=RIG_AGENT_STARTED=1793390400", "--setenv=RIG_AGENT_BUDGET_HOURS=24",
+		"--setenv=RIG_AGENT_BUDGET_TOKENS=50000000", "--setenv=RIG_AGENT_BUDGET_RESTARTS=10",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %s", want)
 		}
 	}
 	// Unset, not empty: the runner tests presence, and an empty model would
-	// be passed to the agent as a flag with no value.
+	// be passed to the agent as a flag with no value; a budget of 0 is none.
 	plain := args(UnitOpts{Workdir: "/work", Session: "s", Timeout: "1h", Restarts: 1})
-	if strings.Contains(plain, "RIG_AGENT_MODEL") {
-		t.Error("no model asked for must mean no RIG_AGENT_MODEL at all")
+	for _, absent := range []string{"RIG_AGENT_MODEL", "RIG_AGENT_IDLE_TIMEOUT", "RIG_AGENT_BUDGET"} {
+		if strings.Contains(plain, absent) {
+			t.Errorf("nothing asked for must mean no %s at all", absent)
+		}
 	}
 }
 

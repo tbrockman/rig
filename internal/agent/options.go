@@ -8,20 +8,21 @@ import "strconv"
 // --until-done made the agent stop after its next turn, with nothing to say
 // why. A flag given explicitly wins, and is recorded in turn.
 type StartOptions struct {
-	PromptFile string // the brief, on the host; absolute, since a later start may run from elsewhere
-	Workdir    string
-	Model      string // "" is the guest's default
-	Timeout    string
-	MemoryMax  string
-	UntilDone  bool
-	Restarts   int // 0 is the default for the mode: see DefaultRestarts
+	PromptFile  string // the brief, on the host; absolute, since a later start may run from elsewhere
+	Workdir     string
+	Model       string // "" is the guest's default
+	Timeout     string
+	IdleTimeout string // "" is never
+	MemoryMax   string
+	UntilDone   bool
+	Restarts    int // 0 is the default for the mode: see DefaultRestarts
 }
 
 // The instance keys StartOptions is recorded under, by flag name.
 const optionPrefix = "user.rig.agent.opt."
 
 // OptionFlags are the start flags that are recorded, in StartOptions' order.
-var OptionFlags = []string{"prompt-file", "workdir", "model", "timeout", "memory-max", "until-done", "max-restarts"}
+var OptionFlags = []string{"prompt-file", "workdir", "model", "timeout", "idle-timeout", "memory-max", "until-done", "max-restarts"}
 
 // OptionKey is the instance key a start flag is recorded under.
 func OptionKey(flag string) string { return optionPrefix + flag }
@@ -50,12 +51,13 @@ func (o StartOptions) EffectiveRestarts() int {
 func RecordedOptions(cfg map[string]string) StartOptions {
 	get := func(flag string) string { return cfg[OptionKey(flag)] }
 	o := StartOptions{
-		PromptFile: get("prompt-file"),
-		Workdir:    get("workdir"),
-		Model:      get("model"),
-		Timeout:    get("timeout"),
-		MemoryMax:  get("memory-max"),
-		UntilDone:  get("until-done") == "true",
+		PromptFile:  get("prompt-file"),
+		Workdir:     get("workdir"),
+		Model:       get("model"),
+		Timeout:     get("timeout"),
+		IdleTimeout: get("idle-timeout"),
+		MemoryMax:   get("memory-max"),
+		UntilDone:   get("until-done") == "true",
 	}
 	o.Restarts, _ = strconv.Atoi(get("max-restarts"))
 	return o
@@ -74,6 +76,7 @@ func (o StartOptions) Config() map[string]string {
 		OptionKey("workdir"):      o.Workdir,
 		OptionKey("model"):        o.Model,
 		OptionKey("timeout"):      o.Timeout,
+		OptionKey("idle-timeout"): o.IdleTimeout,
 		OptionKey("memory-max"):   o.MemoryMax,
 		OptionKey("until-done"):   strconv.FormatBool(o.UntilDone),
 		OptionKey("max-restarts"): restarts,

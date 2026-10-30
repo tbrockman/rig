@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/tbrockman/rig/internal/agent"
+	_ "github.com/tbrockman/rig/internal/agent/claudecode" // its event-log parser, for the watchdog and rig hook usage
 	"github.com/tbrockman/rig/internal/agent/guest"
 )
 
@@ -240,6 +242,32 @@ func hookCmd() *cobra.Command {
 				return guest.FromEnv().Launch(os.Stdout)
 			},
 		},
+		watchdogCmd(),
+		&cobra.Command{
+			Use:   "usage",
+			Short: "What the session has consumed, from the event log, as JSON",
+			Long: "Sums the event log with the harness's parser (RIG_AGENT_HARNESS, else the\n" +
+				"default) and prints an agent.Consumption as JSON: tokens in, out, cache\n" +
+				"read and write, the harness's own cost figure, and whether a run is still\n" +
+				"going. The host's rig agent usage and watch read this rather than pull\n" +
+				"the log. Exit 2 when there is no event log yet.",
+			Args: cobra.NoArgs,
+			RunE: func(_ *cobra.Command, _ []string) error {
+				h, err := agent.Lookup(os.Getenv("RIG_AGENT_HARNESS"))
+				if err != nil {
+					return err
+				}
+				c, err := guest.FromEnv().Usage(h)
+				if errors.Is(err, guest.ErrNoEvents) {
+					fmt.Println("rig: no event log yet")
+					return notYet
+				}
+				if err != nil {
+					return err
+				}
+				return json.NewEncoder(os.Stdout).Encode(c)
+			},
+		},
 		&cobra.Command{
 			Use:   "settings",
 			Short: "The --settings JSON that makes this binary claude's PostToolUse hook",
@@ -258,6 +286,60 @@ func hookCmd() *cobra.Command {
 			},
 		},
 	)
+	return cmd
+}
+
+// watchdogCmd is the run watchdog the runner starts beside the agent, and
+// the budget check it runs before a launch.
+func watchdogCmd() *cobra.Command {
+	var pid int
+	var check bool
+	var every time.Duration
+	cmd := &cobra.Command{
+		Use:   "watchdog",
+		Short: "Watch one run against the unit's limits; kill it and leave a marker when one fires",
+		Long: "With --pid, checks every --interval until a limit from the unit's environment\n" +
+			"fires (RIG_AGENT_IDLE_TIMEOUT, RIG_AGENT_BUDGET_HOURS, RIG_AGENT_BUDGET_TOKENS,\n" +
+			"counted from RIG_AGENT_STARTED), then leaves the marker (watchdog, or BUDGET\n" +
+			"for a budget), ends the process and exits 3. With --check, looks once, before\n" +
+			"a launch: exit 3 with the marker left when a budget is already crossed, else 0.\n" +
+			"Exits 0 when stopped by the runner.",
+		Args: cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			limits, err := guest.LimitsFromEnv()
+			if err != nil {
+				return err
+			}
+			h, err := agent.Lookup(os.Getenv("RIG_AGENT_HARNESS"))
+			if err != nil {
+				return err
+			}
+			w := guest.NewWatchdog(guest.FromEnv(), h, limits)
+			if check {
+				if f, ok := w.Check(); ok && f.Budget {
+					if err := w.Mark(f); err != nil {
+						return err
+					}
+					fmt.Println(f.Reason)
+					return exitCode(3)
+				}
+				return nil
+			}
+			if pid <= 0 {
+				return errors.New("--pid names the run to watch, or --check looks once")
+			}
+			ctx, stop := signalContext()
+			defer stop()
+			if f, ok := w.Run(ctx.Done(), pid, every); ok {
+				fmt.Println(f.Reason)
+				return exitCode(3)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().IntVar(&pid, "pid", 0, "the process to end when a limit fires (timeout(1), which passes the signal on)")
+	cmd.Flags().BoolVar(&check, "check", false, "look once, for the budgets, and exit")
+	cmd.Flags().DurationVar(&every, "interval", 30*time.Second, "how often to look")
 	return cmd
 }
 

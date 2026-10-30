@@ -45,6 +45,8 @@ const (
 	LegacyInboxName = "inbox"
 	RunnerName      = "run"
 	DoneName        = "DONE"
+	BudgetName      = "BUDGET"   // a budget fired: its reason on the first line; the unit is not restarted, the session is kept
+	WatchdogName    = "watchdog" // a run's limit fired: its reason, read and removed by the next launch, which says so in its note
 	BriefName       = "brief.msg"
 	BriefSeqName    = "brief.seq"
 )

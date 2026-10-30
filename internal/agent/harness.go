@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"sync"
@@ -32,6 +33,20 @@ import (
 //	                     what the operator signed for it.
 //	RIG_AGENT_TIMEOUT    for timeout(1) around the agent: one run is killed
 //	                     after this long, and systemd resumes it.
+//	RIG_AGENT_IDLE_TIMEOUT  the guest rig's watchdog (`rig hook watchdog`)
+//	                     kills a run with nothing new in its event log for this
+//	                     long, and the runner resumes it with a note; unset for
+//	                     never.
+//	RIG_AGENT_STARTED    unix seconds `rig agent start` ran: what the hours
+//	                     budget counts from.
+//	RIG_AGENT_BUDGET_HOURS, _TOKENS, _RESTARTS
+//	                     the mission's limits the guest enforces: the runner
+//	                     checks restarts (systemd's NRestarts) and asks the
+//	                     watchdog about the rest before each launch, the
+//	                     watchdog checks hours and tokens during a run. One
+//	                     that fires leaves BUDGET and the runner exits
+//	                     ExitBudget (79), not restarted; the session is kept.
+//	RIG_AGENT_HARNESS    the harness's name, for the guest rig's parsers.
 //	RIG_AGENT_UNTIL_DONE "1" when a clean exit is a turn boundary, not a
 //	                     result; unset otherwise.
 //	RIG_AGENT_MODEL      a model name to pass through, when the operator gave
@@ -69,6 +84,12 @@ import (
 //	                  was not a crash.
 //	DONE              created by the agent (DonePath), with `rig done`, to say
 //	                  the brief is finished; removed by `rig agent start`.
+//	BUDGET            left by the watchdog or the runner when a budget fired:
+//	                  the reason on its first line. Removed by `rig agent
+//	                  start`, so raising the budget and starting resumes.
+//	watchdog          left when a run's limit fired (idle, by the watchdog;
+//	                  timeout, by the runner at exit 124): the reason, which the
+//	                  next launch's note repeats, then removes.
 //	STATUS.md         the agent's own, if its brief asks for one.
 //
 // Credentials are the environment in /run/rig/env, which the runner sources
@@ -108,6 +129,66 @@ type Harness interface {
 	TailSpeechCmd(limitBytes int) string                 // guest command: a bounded tail of the agent's own speech
 	TailResultsCmd(limitBytes int) string                // guest command: a bounded tail of the run's result events
 	Delivery() []DeliveryPath                            // how an operator's item reaches the agent, soonest first
+	Usage(events io.Reader) (Consumption, bool)          // tokens consumed, summed from the event log; false for a harness that logs none
+}
+
+// Consumption is what a session has used, from the harness's own event log:
+// the four token counts the API bills, and what the harness says they cost.
+// Runs is how many results were summed; Live is the usage of a run still in
+// progress (its events so far, with no result yet), included in the counts.
+type Consumption struct {
+	Input      int64   `json:"input"`
+	Output     int64   `json:"output"`
+	CacheRead  int64   `json:"cache_read"`
+	CacheWrite int64   `json:"cache_write"`
+	CostUSD    float64 `json:"cost_usd,omitempty"`
+	Runs       int     `json:"runs"`
+	Live       bool    `json:"live,omitempty"`
+}
+
+// Total is every token, in and out, cached or not: what a tokens budget
+// counts, since each kind is billed and each kind is a bound on the run.
+func (c Consumption) Total() int64 { return c.Input + c.Output + c.CacheRead + c.CacheWrite }
+
+// Add sums two consumptions.
+func (c Consumption) Add(o Consumption) Consumption {
+	return Consumption{
+		Input: c.Input + o.Input, Output: c.Output + o.Output,
+		CacheRead: c.CacheRead + o.CacheRead, CacheWrite: c.CacheWrite + o.CacheWrite,
+		CostUSD: c.CostUSD + o.CostUSD, Runs: c.Runs + o.Runs, Live: c.Live || o.Live,
+	}
+}
+
+// String is the consumption for an operator: the total, then the parts.
+func (c Consumption) String() string {
+	s := fmt.Sprintf("%s tokens (in %s, out %s, cache read %s, cache write %s)",
+		Thousands(c.Total()), Thousands(c.Input), Thousands(c.Output), Thousands(c.CacheRead), Thousands(c.CacheWrite))
+	if c.CostUSD > 0 {
+		s += fmt.Sprintf(", $%.2f by the harness's count", c.CostUSD)
+	}
+	if c.Live {
+		s += ", a run still going"
+	}
+	return s
+}
+
+// Thousands renders n with separators, since token counts run to eight
+// digits and an operator reads 50,000,000 at a glance and 50000000 twice.
+func Thousands(n int64) string {
+	s := fmt.Sprint(n)
+	neg := strings.HasPrefix(s, "-")
+	s = strings.TrimPrefix(s, "-")
+	var b strings.Builder
+	for i, r := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(r)
+	}
+	if neg {
+		return "-" + b.String()
+	}
+	return b.String()
 }
 
 // DeliveryPath is one way an item from the operator reaches the agent, so

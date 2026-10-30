@@ -6,11 +6,13 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tbrockman/rig/internal/agent"
 )
@@ -276,10 +278,11 @@ func TestRunnerTakesItsRestartCountFromSystemd(t *testing.T) {
 	if !strings.Contains(r, "started deliberately") {
 		t.Error("a deliberate start must not be reported to the agent as a crash")
 	}
-	// Both paths still ask for reconciliation: an interrupted tool call is lost
-	// whether the process was killed or stopped.
-	if strings.Count(r, "reconcile it with what") != 2 {
-		t.Error("both resume notes must ask the agent to reconcile its tree")
+	// Every path but the turn boundary asks for reconciliation: an interrupted
+	// tool call is lost whether the process was killed, stopped, or cut by
+	// the watchdog.
+	if strings.Count(r, "reconcile it with what") != 3 {
+		t.Error("the crash, deliberate-start and watchdog notes must ask the agent to reconcile its tree")
 	}
 }
 
@@ -364,11 +367,12 @@ func TestRunnerDistinguishesATurnBoundaryFromACrash(t *testing.T) {
 const sid = "4f1c2a3b-0000-4000-8000-000000000001"
 
 type runnerDir struct {
-	t    *testing.T
-	d    string // RIG_AGENT_DIR
-	bin  string // where the stand-ins live
-	priv ed25519.PrivateKey
-	seq  uint64
+	t        *testing.T
+	d        string // RIG_AGENT_DIR
+	bin      string // where the stand-ins live
+	priv     ed25519.PrivateKey
+	seq      uint64
+	extraEnv []string // what a test adds to the unit's environment
 }
 
 func newRunnerDir(t *testing.T) *runnerDir {
@@ -428,10 +432,11 @@ func (r *runnerDir) seal(kind, id, body string) []byte {
 
 func (r *runnerDir) env() []string {
 	root := filepath.Dir(r.d)
-	return append(os.Environ(),
+	env := append(os.Environ(),
 		"RIG_AGENT_DIR="+r.d, "RIG_AGENT_PATH="+r.bin, "RIG_AGENT_WORKDIR="+root+"/work",
 		"RIG_AGENT_SESSION="+sid, "RIG_AGENT_TIMEOUT=60s", "RIG_AGENT_ENV="+root+"/env",
 		"RIG_AGENT_CONFIG_DIR="+root+"/config", "CLAUDE_ARGS_OUT="+root+"/argv")
+	return append(env, r.extraEnv...)
 }
 
 // run runs the runner once and returns its exit code and claude's argv, as
@@ -590,6 +595,153 @@ func TestRunnerDeliversVerifiedMessagesAndWiresTheHook(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &ho); err != nil || ho.HookSpecificOutput.HookEventName != "PostToolUse" ||
 		!strings.Contains(ho.HookSpecificOutput.AdditionalContext, "Stop after E2.") {
 		t.Errorf("the hook printed %q (%v)", out, err)
+	}
+}
+
+// What a real run of 2.1.314 wrote (DEV_NOTES): each result carries its run's
+// usage; each assistant event its response's, once per content block under
+// one message id; a subagent's events carry parent_tool_use_id.
+const usageLog = `{"type":"system","subtype":"init","session_id":"abc"}
+{"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":2,"cache_creation_input_tokens":11313,"cache_read_input_tokens":11382,"output_tokens":8},"content":[{"type":"thinking"}]},"session_id":"abc"}
+{"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":2,"cache_creation_input_tokens":11313,"cache_read_input_tokens":11382,"output_tokens":8},"content":[{"type":"tool_use"}]},"session_id":"abc"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"a tool result that mentions \"usage\" and input_tokens: 999999"}]}}
+{"type":"assistant","message":{"id":"msg_2","usage":{"input_tokens":2,"cache_creation_input_tokens":14413,"cache_read_input_tokens":0,"output_tokens":17},"content":[{"type":"tool_use"}]},"parent_tool_use_id":"toolu_sub","session_id":"abc"}
+{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{"input_tokens":6,"cache_creation_input_tokens":12042,"cache_read_input_tokens":56920,"output_tokens":527},"total_cost_usd":0.006,"num_turns":3}
+{"type":"system","subtype":"init","session_id":"abc"}
+{"type":"assistant","message":{"id":"msg_3","usage":{"input_tokens":4,"cache_creation_input_tokens":825,"cache_read_input_tokens":23424,"output_tokens":16},"content":[{"type":"tool_use"}]},"session_id":"abc"}
+`
+
+func TestUsageSumsResultsAndCountsALiveRunOnce(t *testing.T) {
+	c, ok := h.Usage(strings.NewReader(usageLog))
+	if !ok {
+		t.Fatal("Claude Code logs usage")
+	}
+	// The result's four counts, plus the run still going after it (msg_3),
+	// and not the pre-result assistant events, which the result covers.
+	want := agent.Consumption{Input: 6 + 4, Output: 527 + 16, CacheRead: 56920 + 23424, CacheWrite: 12042 + 825,
+		CostUSD: 0.006, Runs: 1, Live: true}
+	if c != want {
+		t.Errorf("got  %+v\nwant %+v", c, want)
+	}
+	if c.Total() != 10+543+80344+12867 {
+		t.Errorf("Total = %d", c.Total())
+	}
+	// Without the result, the run's own events count, once per message id.
+	before, _, _ := strings.Cut(usageLog, `{"type":"result"`)
+	c, _ = h.Usage(strings.NewReader(before))
+	if c != (agent.Consumption{Input: 4, Output: 25, CacheRead: 11382, CacheWrite: 25726, Live: true}) {
+		t.Errorf("a killed run's events: %+v", c)
+	}
+	if c, _ := h.Usage(strings.NewReader("")); c != (agent.Consumption{}) {
+		t.Errorf("empty: %+v", c)
+	}
+}
+
+// The watchdog ends a run with nothing new in its log; the runner resumes it
+// and the next launch's note says so, instead of calling it a crash.
+func TestRunnerResumesARunTheWatchdogCut(t *testing.T) {
+	r := newRunnerDir(t)
+	r.write(agent.BriefName, r.seal(agent.KindBrief, "brief", brief))
+	// A claude that creates its transcript and then hangs, writing nothing.
+	r.script("claude", `while [ "$1" != "--" ]; do case "$1" in --session-id|--resume) mkdir -p "$RIG_AGENT_DIR/projects/p"; touch "$RIG_AGENT_DIR/projects/p/$2.jsonl";; esac; shift; done
+printf '%s\0' "$@" > "$CLAUDE_ARGS_OUT"; sleep 30`)
+	r.extraEnv = []string{"RIG_AGENT_IDLE_TIMEOUT=300ms", "RIG_AGENT_WATCHDOG_INTERVAL=100ms", "RIG_AGENT_UNTIL_DONE=1"}
+
+	code, _ := r.run()
+	if code != 75 {
+		t.Fatalf("a cut run resumes (exit 75), got %d\n%s", code, r.stderrLog())
+	}
+	if !strings.Contains(r.stderrLog(), "run ended by the watchdog (idle: nothing new in the event log") {
+		t.Errorf("stderr.log must say the watchdog cut it:\n%s", r.stderrLog())
+	}
+	raw, err := os.ReadFile(filepath.Join(r.d, agent.WatchdogName))
+	if err != nil || !strings.HasPrefix(string(raw), "idle:") {
+		t.Fatalf("the watchdog marker: %q, %v", raw, err)
+	}
+
+	// The next launch names it, once.
+	r.script("claude", `printf '%s\0' "$@" > "$CLAUDE_ARGS_OUT"`)
+	r.extraEnv = nil
+	_, argv := r.run()
+	if p := argv["-p"]; !strings.Contains(p, "ended by rig's watchdog (idle: nothing new") || strings.Contains(p, "restarted after a failure") {
+		t.Errorf("the resume note must name the watchdog, not a crash:\n%s", p)
+	}
+	if _, err := os.Stat(filepath.Join(r.d, agent.WatchdogName)); err == nil {
+		t.Error("the marker is read once and removed")
+	}
+	_, argv = r.run()
+	if strings.Contains(argv["-p"], "watchdog") {
+		t.Error("a later launch must not repeat it")
+	}
+}
+
+// The outer ceiling (timeout exits 124) is a run's limit too, and the note
+// says which one fired.
+func TestRunnerNamesTheCeilingWhenTimeoutFires(t *testing.T) {
+	r := newRunnerDir(t)
+	r.write(agent.BriefName, r.seal(agent.KindBrief, "brief", brief))
+	r.script("claude", `printf '%s\0' "$@" > "$CLAUDE_ARGS_OUT"; exit 124`)
+	r.extraEnv = []string{"RIG_AGENT_UNTIL_DONE=1"}
+	if code, _ := r.run(); code != 75 {
+		t.Fatalf("exit %d\n%s", code, r.stderrLog())
+	}
+	raw, _ := os.ReadFile(filepath.Join(r.d, agent.WatchdogName))
+	if !strings.HasPrefix(string(raw), "timeout: the run reached its ceiling of 60s") {
+		t.Errorf("marker: %q", raw)
+	}
+}
+
+// A budget is the mission's limit: the runner stops the way rig agent stop
+// would, with the exit the unit does not restart and BUDGET saying which,
+// and does not launch at all when one is already crossed.
+func TestRunnerStopsOnABudget(t *testing.T) {
+	r := newRunnerDir(t)
+	r.write(agent.BriefName, r.seal(agent.KindBrief, "brief", brief))
+
+	// Restarts: systemd's count against the budget, before anything runs.
+	r.script("systemctl", `echo 11`)
+	r.extraEnv = []string{"RIG_AGENT_BUDGET_RESTARTS=10"}
+	code, argv := r.run()
+	if code != agent.ExitBudget || argv != nil {
+		t.Fatalf("exit %d, claude ran: %v\n%s", code, argv != nil, r.stderrLog())
+	}
+	raw, _ := os.ReadFile(filepath.Join(r.d, agent.BudgetName))
+	if !strings.HasPrefix(string(raw), "restarts: 11 of 10") {
+		t.Errorf("BUDGET: %q", raw)
+	}
+	if last, _ := os.ReadFile(filepath.Join(r.d, "last_exit")); strings.TrimSpace(string(last)) != "79" {
+		t.Errorf("last_exit %q", last)
+	}
+
+	// Hours, judged by the watchdog's check before the launch.
+	os.Remove(filepath.Join(r.d, agent.BudgetName))
+	r.script("systemctl", `echo 0`)
+	r.extraEnv = []string{"RIG_AGENT_BUDGET_HOURS=2", "RIG_AGENT_STARTED=" + fmt.Sprint(time.Now().Add(-3*time.Hour).Unix())}
+	code, argv = r.run()
+	if code != agent.ExitBudget || argv != nil {
+		t.Fatalf("exit %d, claude ran: %v\n%s", code, argv != nil, r.stderrLog())
+	}
+	raw, _ = os.ReadFile(filepath.Join(r.d, agent.BudgetName))
+	if !strings.HasPrefix(string(raw), "hours: 3.0 of 2") {
+		t.Errorf("BUDGET: %q", raw)
+	}
+	if !strings.Contains(r.stderrLog(), "session kept") {
+		t.Errorf("stderr.log must say the session is kept:\n%s", r.stderrLog())
+	}
+
+	// Tokens, crossed during a run: the watchdog ends it and the runner
+	// stops rather than resumes.
+	os.Remove(filepath.Join(r.d, agent.BudgetName))
+	r.write("events.jsonl", []byte(strings.Repeat(`{"type":"result","usage":{"input_tokens":1000,"output_tokens":1000}}`+"\n", 30)))
+	r.script("claude", `printf '%s\0' "$@" > "$CLAUDE_ARGS_OUT"; sleep 30`)
+	r.extraEnv = []string{"RIG_AGENT_BUDGET_TOKENS=50000", "RIG_AGENT_WATCHDOG_INTERVAL=100ms", "RIG_AGENT_UNTIL_DONE=1"}
+	code, _ = r.run()
+	if code != agent.ExitBudget {
+		t.Fatalf("exit %d\n%s", code, r.stderrLog())
+	}
+	raw, _ = os.ReadFile(filepath.Join(r.d, agent.BudgetName))
+	if !strings.HasPrefix(string(raw), "tokens: 60,000 of 50,000") {
+		t.Errorf("BUDGET: %q", raw)
 	}
 }
 
