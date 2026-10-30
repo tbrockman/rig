@@ -40,7 +40,7 @@ func TestTheGuestBuildHasOnlyGuestVerbs(t *testing.T) {
 	for _, c := range root().Commands() {
 		names = append(names, c.Name())
 	}
-	if got := strings.Join(names, " "); got != "ask brief done hook wait" {
+	if got := strings.Join(names, " "); got != "ask brief done hook inbox wait" {
 		t.Errorf("verbs: %s", got)
 	}
 }

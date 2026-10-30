@@ -19,6 +19,8 @@ import (
 //	asks/<id>.json     the agent's questions (Ask)
 //	inbox.seq          the last sequence number accepted
 //	deliveries.jsonl   one Delivery per item the agent was shown
+//	last_launch        when the runner last launched the agent, so the next launch can list what was delivered mid-turn since
+//	hook.unproven      left by a hook whose input could not say which process it ran in; removed at launch
 //	tamper.jsonl       one Tamper per item refused
 //	launch.token       this launch's token, which every delivery carries
 //	brief.msg          the brief, sealed like an envelope (KindBrief); the runner refuses to launch without a good one
@@ -38,6 +40,8 @@ const (
 	DeliveriesName  = "deliveries.jsonl"
 	TamperName      = "tamper.jsonl"
 	TokenName       = "launch.token"
+	LastLaunchName  = "last_launch"
+	UnprovenName    = "hook.unproven"
 	LegacyInboxName = "inbox"
 	RunnerName      = "run"
 	DoneName        = "DONE"
@@ -64,6 +68,17 @@ const (
 	ViaLaunch = "launch" // spliced into the prompt by the runner
 	ViaHook   = "hook"   // added after a tool call by the PostToolUse hook
 	ViaWait   = "wait"   // printed by rig ask --wait or rig wait
+	ViaInbox  = "inbox"  // printed by rig inbox, which the brief may tell the lead to run
+)
+
+// Whom a delivery reached. The lead is the agent's own process, the one that
+// reads the brief and answers the operator; its subagents are not it. A hook
+// proves which it ran in from its input (guest.LeadProof); the launch prompt
+// is the lead's by construction; a guest verb is run by whichever process
+// typed it, and nothing in the guest can tell which (DEV_NOTES).
+const (
+	ToLead   = "lead"
+	ToCaller = "caller"
 )
 
 // Ask is a question from the agent, written by `rig ask`.
@@ -80,7 +95,8 @@ type Delivery struct {
 	Seq  uint64 `json:"seq"`
 	Kind string `json:"kind"`
 	ID   string `json:"id"`
-	Path string `json:"path"` // ViaLaunch, ViaHook or ViaWait
+	Path string `json:"path"`         // ViaLaunch, ViaHook, ViaWait or ViaInbox
+	To   string `json:"to,omitempty"` // ToLead or ToCaller; empty in a record from an older rig
 }
 
 // Tamper is one line of tamper.jsonl: an item refused, and why.

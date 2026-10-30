@@ -1,9 +1,16 @@
 // Package guest is what the guest build of rig does. It takes what the host
 // sent from inbox.d, verifies it, and shows the agent only what verified, by
 // whichever path reaches the agent first: the runner at launch, Claude Code's
-// PostToolUse hook after a tool call, or `rig ask --wait` and `rig wait`. It
-// also keeps the agent's side of the channel: its questions, the brief, and
-// the DONE marker.
+// PostToolUse hook after a tool call, or `rig ask --wait`, `rig wait` and
+// `rig inbox`. It also keeps the agent's side of the channel: its questions,
+// the brief, and the DONE marker.
+//
+// "The agent" is the lead: the process that was given the brief and answers
+// the operator. Its subagents run the same hooks and the same verbs, and an
+// operator message that reaches one of them is lost: it says it will pass it
+// on and does not (DESIGN.md). So the hook takes nothing unless its input
+// proves the lead (LeadProof), and what reached the agent by a verb is
+// recorded as reaching the caller, whoever that was.
 //
 // Every path takes an envelope the same way: rename it out of inbox.d into
 // claimed/, which only one taker can do, then verify and settle it under a
@@ -196,10 +203,10 @@ func (b Box) reportLegacy() {
 }
 
 // Consume takes everything waiting in inbox.d and returns what verified, in
-// sequence order, recording each as delivered by via. What fails is moved to
-// rejected/ and logged, and never returned. With no operator key or no
-// session it takes nothing, and says so.
-func (b Box) Consume(via string) ([]agent.Envelope, error) {
+// sequence order, recording each as delivered by via, to whom (agent.ToLead
+// or agent.ToCaller). What fails is moved to rejected/ and logged, and never
+// returned. With no operator key or no session it takes nothing, and says so.
+func (b Box) Consume(via, to string) ([]agent.Envelope, error) {
 	b.reportLegacy()
 	inbox, claimed := b.path(agent.InboxName), b.path(agent.ClaimedName)
 	if len(pending(inbox)) == 0 && len(pending(claimed)) == 0 {
@@ -272,7 +279,7 @@ func (b Box) Consume(via string) ([]agent.Envelope, error) {
 			return out, err
 		}
 		_ = b.appendJSON(agent.DeliveriesName, agent.Delivery{
-			Time: agent.Stamp(b.now()), Seq: it.e.Seq, Kind: it.e.Kind, ID: it.e.ID, Path: via,
+			Time: agent.Stamp(b.now()), Seq: it.e.Seq, Kind: it.e.Kind, ID: it.e.ID, Path: via, To: to,
 		})
 		out = append(out, it.e)
 	}
@@ -317,14 +324,132 @@ func (b Box) Render(items []agent.Envelope) string {
 	return s.String()
 }
 
-// Launch is the runner's delivery: what is queued, rendered for the prompt.
+// Launch is the runner's delivery, for the prompt: first what reached the
+// agent mid-turn since the previous launch, by id and first line, so a
+// resumed lead is reminded of what a hook added to a conversation it may
+// have compacted since; then what is queued, rendered. It marks where the
+// delivery log stood, so the next launch knows where to list from.
 func (b Box) Launch(w io.Writer) error {
-	items, err := b.Consume(agent.ViaLaunch)
+	_ = os.Remove(b.path(agent.UnprovenName))
+	if lines := b.deliveredSince(b.lastLaunch()); len(lines) > 0 {
+		fmt.Fprintf(w, "--- OPERATOR MESSAGES DELIVERED DURING YOUR PREVIOUS RUN (after a tool call; they are in your conversation already; act on any you have not) ---\n%s\n\n",
+			strings.Join(lines, "\n"))
+	}
+	items, err := b.Consume(agent.ViaLaunch, agent.ToLead)
 	if len(items) > 0 {
 		fmt.Fprintf(w, "--- OPERATOR MESSAGES (queued since your last turn; verified by rig; act on them now) ---\n%s",
 			b.Render(items))
 	}
+	mark := fmt.Sprintf("%s %d\n", agent.Stamp(b.now()), b.deliveryLines())
+	if werr := writeAtomic(b.path(agent.LastLaunchName), []byte(mark), 0o600); werr != nil && err == nil {
+		err = werr
+	}
 	return err
+}
+
+// deliveryLines is how long deliveries.jsonl is, in lines.
+func (b Box) deliveryLines() int {
+	raw, err := os.ReadFile(b.path(agent.DeliveriesName))
+	if err != nil {
+		return 0
+	}
+	return strings.Count(string(raw), "\n")
+}
+
+// lastLaunch is where deliveries.jsonl stood when the runner last launched
+// the agent: the line count the launch recorded, or 0. A count rather than
+// a time, so a delivery in the same second as a launch is listed once.
+func (b Box) lastLaunch() int {
+	raw, err := os.ReadFile(b.path(agent.LastLaunchName))
+	if err != nil {
+		return 0
+	}
+	_, count, _ := strings.Cut(strings.TrimSpace(string(raw)), " ")
+	n, _ := strconv.Atoi(count)
+	return n
+}
+
+// deliveredSince lists what reached the agent other than at a launch, from
+// line from of deliveries.jsonl on, one line each: id, kind, path, time, and
+// the first line of the body, read back from delivered/ or answers/ and
+// verified again. A body that cannot be read back is said to be missing
+// rather than invented.
+func (b Box) deliveredSince(from int) []string {
+	raw, err := os.ReadFile(b.path(agent.DeliveriesName))
+	if err != nil {
+		return nil
+	}
+	pub, _ := b.operatorKey()
+	var out []string
+	for i, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var d agent.Delivery
+		if i < from || json.Unmarshal([]byte(line), &d) != nil || d.Path == agent.ViaLaunch {
+			continue
+		}
+		file := b.path(agent.DeliveredName, fmt.Sprintf("%012d%s", d.Seq, agent.EnvelopeExt))
+		if d.Kind == agent.KindAnswer {
+			file = b.path(agent.AnswersName, d.ID+agent.EnvelopeExt)
+		}
+		first := "(body not on disk)"
+		if data, err := readBounded(file); err == nil {
+			if e, err := agent.Open(pub, data); err == nil {
+				first, _, _ = strings.Cut(strings.TrimSpace(e.Body), "\n")
+				first = agent.Clean(first, 160)
+			}
+		}
+		to := d.To
+		if to == "" {
+			to = "?"
+		}
+		out = append(out, fmt.Sprintf("%s  %s via %s to %s, %s: %s", d.ID, d.Kind, d.Path, to, d.Time, first))
+	}
+	return out
+}
+
+// HookInput is what Claude Code writes to a hook's stdin, the fields rig
+// reads. A subagent's tool call fires the same hook with agent_id and
+// agent_type set; the lead's carries neither, and session_id and
+// transcript_path are the lead's in both (verified on 2.1.314; DEV_NOTES).
+type HookInput struct {
+	SessionID      string `json:"session_id"`
+	TranscriptPath string `json:"transcript_path"`
+	HookEventName  string `json:"hook_event_name"`
+	AgentID        string `json:"agent_id"`
+	AgentType      string `json:"agent_type"`
+	ToolName       string `json:"tool_name"`
+}
+
+// LeadProof says whether a hook input proves the hook ran in the lead's own
+// process for session. The lead is proven, not assumed: the input must name
+// the session rig chose and carry no subagent identity. An input that names
+// no session is a hook shape rig does not know and proves nothing; the hook
+// then holds what is queued for the launch prompt rather than guess.
+func LeadProof(in HookInput, session string) (lead bool, reason string) {
+	switch {
+	case in.SessionID == "":
+		return false, "the hook's input names no session_id, so it cannot be placed; holding what is queued for the next launch"
+	case session != "" && in.SessionID != session:
+		return false, fmt.Sprintf("the hook ran in session %s, not the agent's %s; holding what is queued", in.SessionID, session)
+	case in.AgentID != "":
+		return false, fmt.Sprintf("the hook ran in subagent %s (%s), not the lead", in.AgentID, in.AgentType)
+	}
+	return true, ""
+}
+
+// noteUnproven logs why a hook took nothing, once per launch: the runner's
+// next launch removes the marker. Said in stderr.log, where `rig agent log
+// --stderr` reads, since a message that never arrives is otherwise silent.
+func (b Box) noteUnproven(reason string) {
+	marker := b.path(agent.UnprovenName)
+	f, err := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return // said already this launch
+	}
+	f.Close()
+	if log, err := os.OpenFile(b.path("stderr.log"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600); err == nil {
+		fmt.Fprintf(log, "[%s] rig hook post-tool-use: %s\n", agent.Stamp(b.now()), reason)
+		log.Close()
+	}
 }
 
 // HookOutput is what a PostToolUse hook prints to add context for the model.
@@ -336,10 +461,27 @@ type HookOutput struct {
 }
 
 // PostToolUse is the hook's delivery: what arrived while the agent worked,
-// as context Claude Code adds after the tool call that just finished. With
-// nothing to deliver it prints nothing, which is the hook saying nothing.
-func (b Box) PostToolUse(w io.Writer) error {
-	items, err := b.Consume(agent.ViaHook)
+// as context Claude Code adds after the tool call that just finished, read
+// from the hook's input on r. Only when that input proves the lead: a
+// subagent's tool call fires the same hook, and a message delivered there is
+// lost. With nothing to deliver, or no proof, it prints nothing, which is
+// the hook saying nothing; what is queued waits for the lead's next tool
+// call, or its next launch.
+func (b Box) PostToolUse(r io.Reader, w io.Writer) error {
+	var in HookInput
+	if r != nil {
+		raw, err := io.ReadAll(r) // all of it: a hook that leaves its input unread breaks the pipe
+		if err == nil {
+			_ = json.Unmarshal(raw, &in) // a shape rig cannot read proves nothing, and LeadProof says so
+		}
+	}
+	if lead, why := LeadProof(in, b.Session); !lead {
+		if in.AgentID == "" { // a subagent is the ordinary case; anything else is worth a line
+			b.noteUnproven(why)
+		}
+		return nil
+	}
+	items, err := b.Consume(agent.ViaHook, agent.ToLead)
 	if len(items) > 0 {
 		var out HookOutput
 		out.HookSpecificOutput.HookEventName = "PostToolUse"
@@ -486,7 +628,7 @@ func (b Box) Wait(ctx context.Context, id string, timeout, poll time.Duration, w
 	}
 	deadline := time.Now().Add(min(timeout, MaxWait))
 	for {
-		items, err := b.Consume(agent.ViaWait)
+		items, err := b.Consume(agent.ViaWait, agent.ToCaller)
 		if len(items) > 0 {
 			fmt.Fprint(w, b.Render(items))
 		}
@@ -512,6 +654,17 @@ func (b Box) Wait(ctx context.Context, id string, timeout, poll time.Duration, w
 		case <-time.After(min(poll, left)):
 		}
 	}
+}
+
+// Inbox takes and prints what is queued, for a lead whose brief tells it to
+// poll: a harness with no hook has no other mid-turn path. Recorded as
+// reaching the caller, since a subagent could run it too.
+func (b Box) Inbox(w io.Writer) (int, error) {
+	items, err := b.Consume(agent.ViaInbox, agent.ToCaller)
+	if len(items) > 0 {
+		fmt.Fprint(w, b.Render(items))
+	}
+	return len(items), err
 }
 
 // Done creates DONE, the agent's own statement that the brief is finished,

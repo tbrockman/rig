@@ -492,7 +492,11 @@ func (a *app) agentStatusCmd() *cobra.Command {
 
 			queued := strconv.Itoa(p.Pending)
 			if p.Pending > 0 {
-				queued += " (signed; delivered after the agent's next tool call, or at its next launch)"
+				if path, ok := agent.MidTurnPath(h); ok {
+					queued += " (signed; reaches the lead " + path.When + ", or at its next launch)"
+				} else {
+					queued += " (signed; at the agent's next launch, or when it runs rig inbox)"
+				}
 			}
 			row("queued", queued)
 			if p.Legacy {
@@ -500,7 +504,11 @@ func (a *app) agentStatusCmd() *cobra.Command {
 			}
 			if n := len(p.RecentDeliveries); n > 0 {
 				d := p.RecentDeliveries[n-1]
-				row("last delivery", fmt.Sprintf("%s %s via %s, %s", d.Kind, d.ID, d.Path, ago(d.Time)))
+				to := ""
+				if d.To != "" {
+					to = " to the " + d.To
+				}
+				row("last delivery", fmt.Sprintf("%s %s via %s%s, %s", d.Kind, d.ID, d.Path, to, ago(d.Time)))
 			}
 			if len(p.Asks) > 0 {
 				row("asks", fmt.Sprintf("%d open, %d answered  (rig agent asks %s)", len(p.OpenAsks()), len(p.Asks)-len(p.OpenAsks()), name))

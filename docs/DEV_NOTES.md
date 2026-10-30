@@ -174,6 +174,33 @@ look like something else. Decisions and their history are in DESIGN.md.
 - Hook `additionalContext` does not appear in the stream-json events, so a
   delivery is invisible in `events.jsonl`; rig logs each one to
   `deliveries.jsonl`.
+- The hooks in `--settings` fire for a subagent's tool calls too, in the
+  subagent's context: a message delivered there is read by the subagent,
+  which says it will pass it on and does not (mono-agent, twice, 2026-10-28).
+  On 2.1.314, checked with a PostToolUse hook that copied its stdin, the
+  subagent's input carries `agent_id` and `agent_type`
+  (`"agent_id":"aacedf6b44a9b07a6","agent_type":"general-purpose"`) and the
+  lead's carries neither; `session_id` and `transcript_path` are the lead's
+  in both, so neither tells them apart. The subagent's own transcript is
+  `<session>/subagents/agent-<id>.jsonl`, named only by SubagentStop's
+  `agent_transcript_path`. The Bash environment is identical in both
+  (`CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID` and the rest are the lead's), so a
+  guest verb cannot tell who ran it; only the hook's input can. `rig hook
+  post-tool-use` delivers only on an input that names the agent's session
+  and no agent; anything else leaves the queue alone, and an input it cannot
+  place is said once per launch in `stderr.log`.
+- stream-json carries the account's rate limits: a `rate_limit_event` with
+  `rate_limit_info.unifiedWindows.{five_hour,seven_day}.{utilization,resetsAt}`
+  (seen once per run, at the first response), and each `result` event a
+  `usage` for that run (`input_tokens`, `output_tokens`,
+  `cache_creation_input_tokens`, `cache_read_input_tokens`) with
+  `total_cost_usd` and a per-model `modelUsage` that is cumulative over the
+  process. Each `assistant` event carries its API response's `usage`,
+  repeated once per content block under the same `message.id`; a subagent's
+  carry `parent_tool_use_id`. The OAuth usage endpoint
+  (`GET https://api.anthropic.com/api/oauth/usage`, `Authorization: Bearer`
+  the access token, `anthropic-beta: oauth-2025-04-20`) returns the same
+  windows for the credential, with `utilization` in percent.
 - Without a statement of where operator messages come from, the model
   discounts hook-delivered text ("can't verify it's from an operator"). With
   an `--append-system-prompt` line saying rig delivers them this way, it acts

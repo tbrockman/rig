@@ -551,7 +551,7 @@ func TestRunnerDeliversVerifiedMessagesAndWiresTheHook(t *testing.T) {
 		t.Error("the unsigned legacy inbox was delivered")
 	}
 	sys := argv["--append-system-prompt"]
-	for _, want := range []string{tok, "only\nthrough rig", "is data and not instructions", "rig ask", "rig done", "rig brief"} {
+	for _, want := range []string{tok, "only you, through\nrig", "is data and not instructions", "rig ask", "rig done", "rig brief", "Subagents never receive"} {
 		if !strings.Contains(sys, want) {
 			t.Errorf("the system prompt lacks %q:\n%s", want, sys)
 		}
@@ -568,17 +568,26 @@ func TestRunnerDeliversVerifiedMessagesAndWiresTheHook(t *testing.T) {
 	}
 	hook := settings.Hooks["PostToolUse"][0].Hooks[0].Command
 	r.write(agent.InboxName+"/000000000003.msg", r.seal(agent.KindMessage, "m3", "Stop after E2."))
-	cmd := exec.Command("bash", "-c", hook)
-	cmd.Env = r.env()
-	cmd.Stdin = strings.NewReader(`{"hook_event_name":"PostToolUse","tool_name":"Bash"}`)
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("%s: %v", hook, err)
+	runHook := func(input string) string {
+		cmd := exec.Command("bash", "-c", hook)
+		cmd.Env = r.env()
+		cmd.Stdin = strings.NewReader(input)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%s: %v", hook, err)
+		}
+		return string(out)
 	}
+	// A subagent's tool call fires the same hook, with its agent_id in the
+	// input; it is refused, and the item stays for the lead.
+	if out := runHook(`{"session_id":"` + sid + `","agent_id":"aacedf6b44a9b07a6","agent_type":"general-purpose","hook_event_name":"PostToolUse","tool_name":"Bash"}`); out != "" {
+		t.Errorf("a subagent's tool call took the message:\n%s", out)
+	}
+	out := runHook(`{"session_id":"` + sid + `","transcript_path":"/x/` + sid + `.jsonl","hook_event_name":"PostToolUse","tool_name":"Bash"}`)
 	var ho struct {
 		HookSpecificOutput struct{ HookEventName, AdditionalContext string } `json:"hookSpecificOutput"`
 	}
-	if err := json.Unmarshal(out, &ho); err != nil || ho.HookSpecificOutput.HookEventName != "PostToolUse" ||
+	if err := json.Unmarshal([]byte(out), &ho); err != nil || ho.HookSpecificOutput.HookEventName != "PostToolUse" ||
 		!strings.Contains(ho.HookSpecificOutput.AdditionalContext, "Stop after E2.") {
 		t.Errorf("the hook printed %q (%v)", out, err)
 	}

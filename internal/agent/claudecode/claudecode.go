@@ -204,3 +204,15 @@ func (Harness) TailSpeechCmd(limitBytes int) string {
 func (Harness) TailResultsCmd(limitBytes int) string {
 	return agent.TailCmd(`"type":"result"`, limitBytes)
 }
+
+// Delivery is how an item reaches Claude Code: the PostToolUse hook the
+// runner wires with --settings runs after every tool call, the lead's and
+// its subagents' alike, and the guest build delivers only when the hook's
+// input proves the lead (guest.LeadProof); then what every harness has.
+func (Harness) Delivery() []agent.DeliveryPath {
+	return append([]agent.DeliveryPath{{
+		Via:     agent.ViaHook,
+		When:    "after the lead's next tool call, through its PostToolUse hook (a subagent's tool call does not take it)",
+		MidTurn: true,
+	}}, agent.CommonDelivery()...)
+}

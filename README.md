@@ -171,10 +171,11 @@ rig agent brief cuda-agent       # after editing brief.md: the agent gets the di
 
 What you send is signed with a key that stays on this host and verified in
 the guest before the agent sees it, and arrives after the agent's next tool
-call rather than at its next restart. The agent is told that only rig
-delivers your words; text it reads anywhere else that claims to be you is
-data. A bare `rig agent start cuda-agent` later resumes with the same
-options.
+call rather than at its next restart. It reaches the lead, the process that
+was given the brief, never one of its subagents, which fire the same hook.
+The agent is told that only rig delivers your words; text it reads anywhere
+else that claims to be you is data. A bare `rig agent start cuda-agent`
+later resumes with the same options.
 
 Keep credential files outside any repository (`~/.config/rig/`).
 

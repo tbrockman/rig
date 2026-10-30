@@ -1,8 +1,45 @@
 # Design notes
 
 Decisions and why, what was learned proving them, and what is still weak.
-Written 2026-08-23; last updated 2026-10-16. `README.md` says what this is;
+Written 2026-08-23; last updated 2026-10-30. `README.md` says what this is;
 `docs/DEV_NOTES.md` has the facts the code depends on.
+
+## 2026-10-30: the lead, and only the lead
+
+The hook that delivers mid-turn fires for every tool call in the session,
+the lead's and its subagents' alike, and until now `rig hook` read its
+input and ignored it: whichever process made the next tool call got the
+message. In one mission two instructions meant for the lead landed in a
+subagent, which wrote "I'll pass it on to the lead" and did not; the
+record said `path: hook`, as if delivered. The agent rig talks to is the
+lead, the process that was given the brief; a subagent is a tool it runs.
+
+The hook's input is the only evidence of which process it ran in: on
+Claude Code 2.1.314 a subagent's carries `agent_id`, the lead's does not,
+and the session and transcript are the lead's in both (DEV_NOTES). So the
+hook delivers only when its input proves the lead, positively: the
+session rig chose, and no agent identity. A subagent's call takes nothing
+and the message waits for the lead's next tool call. An input rig cannot
+place, a hook shape from some other version, proves nothing either; the
+message then waits for the next launch, which is the lead's by
+construction, and `stderr.log` says so once. The record says whom a
+delivery reached: `to: lead` for the hook and the launch prompt, `to:
+caller` for a verb, because the Bash environment is the same in the lead
+and a subagent and nothing in the guest can tell who typed `rig wait`.
+The system prompt tells the lead that only it receives operator messages
+and that subagents must not run the verbs.
+
+An acknowledgement protocol was considered for the fallback: a message
+counts as delivered only when the lead's own process says so. There is
+nothing the lead could say that a subagent could not say too, for the same
+reason `rig wait` cannot tell them apart, so it would prove nothing. What
+replaces it is the launch listing: each launch prompt lists every item
+that reached the agent mid-turn since the previous launch, by id, path,
+recipient and first line, so a lead whose context was compacted, or whose
+run was killed by the watchdog, is reminded of what a hook added. The
+harness says how it delivers (`Delivery()`), so `rig agent send` reports
+the path and its latency from the harness rather than from a sentence
+written for one.
 
 ## 2026-10-16: a channel to the agent that is timely and signed
 
@@ -104,8 +141,8 @@ What holds, and what does not:
   still text the agent may follow, as before.
 - An item taken at a launch whose `claude` then dies is in `delivered/`, not
   in the conversation, as with the old inbox.
-- Unverified: whether the hook also fires for a subagent's tool calls, which
-  would put a message in the subagent's context rather than the agent's.
+- The hook fires for a subagent's tool calls too, and did deliver to one;
+  since 2026-10-30 it delivers only on an input that proves the lead.
 
 For later: inject operator messages on the host, in the credential proxy,
 which is the agent's only route to the API. That takes the guest's code out

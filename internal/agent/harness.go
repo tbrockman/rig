@@ -107,6 +107,40 @@ type Harness interface {
 	AssistantText(speechTail string, limit int) []string // what the agent said, newest last, from TailSpeechCmd's output
 	TailSpeechCmd(limitBytes int) string                 // guest command: a bounded tail of the agent's own speech
 	TailResultsCmd(limitBytes int) string                // guest command: a bounded tail of the run's result events
+	Delivery() []DeliveryPath                            // how an operator's item reaches the agent, soonest first
+}
+
+// DeliveryPath is one way an item from the operator reaches the agent, so
+// `rig agent send` can say truthfully when a message will arrive. The guest
+// build of rig provides ViaLaunch (the runner's prompt), ViaWait and
+// ViaInbox for every harness; a harness adds what its runner wires, such as
+// a hook that runs between tool calls.
+type DeliveryPath struct {
+	Via     string // ViaHook, ViaLaunch, ViaWait or ViaInbox
+	When    string // for an operator: "after the lead's next tool call"
+	MidTurn bool   // reaches a running agent without waiting for its turn to end, and without the agent asking
+}
+
+// CommonDelivery is what every harness gets from the guest build of rig,
+// after whatever paths the harness itself provides.
+func CommonDelivery() []DeliveryPath {
+	return []DeliveryPath{
+		{Via: ViaWait, When: "while it blocks in rig ask --wait or rig wait"},
+		{Via: ViaInbox, When: "when it runs rig inbox, if its brief tells it to"},
+		{Via: ViaLaunch, When: "at its next launch, in the prompt"},
+	}
+}
+
+// MidTurnPath is the first path of h that reaches a running agent unasked,
+// or false when the harness has none: a message to such an agent waits for
+// its next launch unless the agent polls.
+func MidTurnPath(h Harness) (DeliveryPath, bool) {
+	for _, p := range h.Delivery() {
+		if p.MidTurn {
+			return p, true
+		}
+	}
+	return DeliveryPath{}, false
 }
 
 // Credential is one way a harness authenticates.

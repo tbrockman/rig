@@ -24,7 +24,7 @@ const (
 	EvWatching    = "watching"     // first line: unit, restarts, open-asks, pending
 	EvAskOpened   = "ask-opened"   // id, text
 	EvAskAnswered = "ask-answered" // id
-	EvDelivered   = "delivered"    // seq, kind, id, path (launch, hook or wait)
+	EvDelivered   = "delivered"    // seq, kind, id, path (launch, hook, wait or inbox), to (lead or caller)
 	EvTamper      = "tamper"       // file, reason: an item the guest refused
 	EvIntegrity   = "integrity"    // file: an installed file no longer what rig wrote
 	EvDone        = "done"         // summary
@@ -118,7 +118,7 @@ func Changes(prev *Probe, cur Probe, config map[string]string) []Event {
 	}
 
 	for _, d := range newTail(prev.Deliveries, cur.Deliveries, cur.RecentDeliveries) {
-		out = append(out, ev(EvDelivered, "seq", strconv.FormatUint(d.Seq, 10), "kind", d.Kind, "id", d.ID, "path", d.Path))
+		out = append(out, ev(EvDelivered, "seq", strconv.FormatUint(d.Seq, 10), "kind", d.Kind, "id", d.ID, "path", d.Path, "to", d.To))
 	}
 	for _, t := range newTail(prev.Tampers, cur.Tampers, cur.RecentTampers) {
 		out = append(out, ev(EvTamper, "file", t.File, "reason", t.Reason))

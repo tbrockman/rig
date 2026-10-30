@@ -20,6 +20,7 @@ func (stub) ExplainError(m string) string       { return m }
 func (stub) AssistantText(string, int) []string { return nil }
 func (stub) TailSpeechCmd(int) string           { return "" }
 func (stub) TailResultsCmd(int) string          { return "" }
+func (stub) Delivery() []DeliveryPath           { return CommonDelivery() }
 
 // The registry is package state; each test starts from an empty one and puts
 // back whatever it found, so tests cannot see each other's registrations.

@@ -123,17 +123,22 @@ func (a *app) putBrief(name string, store operator.Store, key ed25519.PrivateKey
 	return a.put(name, agent.BriefPath, data, 0o600)
 }
 
-// queued says where a sent item stands: how many wait, and whether anything
-// is running to take them.
-func (a *app) queued(name string) {
+// queued says where a sent item stands: how many wait, and when the harness
+// will take them, from what it says of its own delivery paths rather than a
+// promise written for one harness.
+func (a *app) queued(name string, h agent.Harness) {
 	out, _ := a.exec(name, "echo $(ls -1 "+agent.InboxDir+" 2>/dev/null | grep -c '\\"+agent.EnvelopeExt+"$') "+
 		"$(systemctl is-active "+agent.Unit+" 2>/dev/null)")
 	n, state, _ := strings.Cut(strings.TrimSpace(out), " ")
-	if state == "active" {
-		note("%s queued; it reaches the agent after its next tool call", n)
+	if state != "active" {
+		note("%s queued; the agent is not running (%s), and gets it when it next starts", n, state)
 		return
 	}
-	note("%s queued; the agent is not running (%s), and gets it when it next starts", n, state)
+	if p, ok := agent.MidTurnPath(h); ok {
+		note("%s queued; it reaches the lead %s", n, p.When)
+		return
+	}
+	note("%s queued; the %s harness has no mid-turn delivery, so it waits for the agent's next launch unless the agent runs rig inbox or rig wait", n, h.Name())
 }
 
 // messageText is what a send or an answer says: its words, or with --file a
@@ -164,16 +169,23 @@ func messageText(words []string, file string) (string, error) {
 
 func (a *app) agentSendCmd() *cobra.Command {
 	var file string
+	var atLaunch bool
 	cmd := &cobra.Command{
 		Use:   "send <vm> [<message>...]",
-		Short: "Send the agent a message, delivered after its next tool call",
+		Short: "Send the agent a message, delivered to the lead after its next tool call",
 		Long: "Signs the message with this VM's operator key and queues it in the guest\n" +
 			"(" + agent.InboxDir + ", one file per message, renamed into place). The\n" +
-			"guest build of rig verifies it and delivers it after the agent's next tool\n" +
-			"call, through Claude Code's PostToolUse hook, or at its next launch,\n" +
-			"whichever comes first; a turn can run for hours, and the message no longer\n" +
-			"waits for it to end. Nothing is held open, so neither side can hang on the\n" +
-			"other. `rig agent status` and `watch` say when it was delivered.\n\n" +
+			"guest build of rig verifies it and delivers it to the lead, the process\n" +
+			"that was given the brief, by the soonest path its harness has: for\n" +
+			"claude-code, after the lead's next tool call through its PostToolUse hook\n" +
+			"(a subagent's tool call fires the same hook and is refused, so a message\n" +
+			"cannot land in a subagent), else at its next launch, in the prompt. A turn\n" +
+			"can run for hours, and the message does not wait for it to end. Nothing is\n" +
+			"held open, so neither side can hang on the other. `rig agent status` and\n" +
+			"`watch` say when it was delivered, and to whom.\n\n" +
+			"A harness with no mid-turn path is refused unless --at-launch says that\n" +
+			"waiting for the next launch is fine; its brief should tell the agent to run\n" +
+			"`rig inbox` at checkpoints instead.\n\n" +
 			"--file sends a file's contents instead of words, and --file - reads stdin.",
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -185,16 +197,25 @@ func (a *app) agentSendCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			_, h, err := a.harnessOf(ch.name)
+			if err != nil {
+				return err
+			}
+			if _, ok := agent.MidTurnPath(h); !ok && !atLaunch {
+				return fmt.Errorf("the %s harness has no mid-turn delivery: nothing runs between the agent's tool calls to take a message, "+
+					"so this would wait for its next launch. Say so with --at-launch, and have the brief tell the agent to run `rig inbox` at checkpoints.", h.Name())
+			}
 			e, err := a.deliver(ch, agent.KindMessage, "", text)
 			if err != nil {
 				return err
 			}
 			note("sent %s to %s", e.ID, ch.name)
-			a.queued(ch.name)
+			a.queued(ch.name, h)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&file, "file", "", "send this file's contents; - reads stdin")
+	cmd.Flags().BoolVar(&atLaunch, "at-launch", false, "queue it for the agent's next launch even when its harness cannot deliver mid-turn")
 	return cmd
 }
 
@@ -234,8 +255,12 @@ func (a *app) agentAnswerCmd() *cobra.Command {
 			if _, err := a.deliver(ch, agent.KindAnswer, id, text); err != nil {
 				return err
 			}
+			_, h, err := a.harnessOf(name)
+			if err != nil {
+				return err
+			}
 			note("answered %q on %s", id, name)
-			a.queued(name)
+			a.queued(name, h)
 			return nil
 		},
 	}
@@ -343,7 +368,11 @@ func (a *app) agentBriefCmd() *cobra.Command {
 			}
 			added, removed := diffStat(diff)
 			note("brief updated on %s (+%d -%d lines)", name, added, removed)
-			a.queued(name)
+			_, h, err := a.harnessOf(name)
+			if err != nil {
+				return err
+			}
+			a.queued(name, h)
 			return nil
 		},
 	}
@@ -378,7 +407,7 @@ func (a *app) agentWatchCmd() *cobra.Command {
 			"  watching        first: unit, restarts, open-asks, pending\n" +
 			"  ask-opened      id, text   (also for each open ask when watch starts)\n" +
 			"  ask-answered    id\n" +
-			"  delivered       seq, kind, id, path (launch, hook or wait)\n" +
+			"  delivered       seq, kind, id, path (launch, hook, wait or inbox), to (lead, or caller for a verb)\n" +
 			"  tamper          file, reason: something the guest refused to deliver\n" +
 			"  integrity       file: an installed file is no longer what rig agent start wrote\n" +
 			"  done            summary: the agent ran rig done\n" +

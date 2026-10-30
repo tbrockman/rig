@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,7 +40,8 @@ func newFixture(t *testing.T) *fixture {
 	if err := os.WriteFile(filepath.Join(dir, agent.TokenName), []byte("tok123\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return &fixture{t: t, box: Box{Dir: dir, Session: "sess"}, priv: priv}
+	fixed := time.Date(2026, 10, 16, 10, 0, 0, 0, time.UTC)
+	return &fixture{t: t, box: Box{Dir: dir, Session: "sess", Now: func() time.Time { return fixed }}, priv: priv}
 }
 
 func (f *fixture) seal(e agent.Envelope) []byte {
@@ -119,14 +121,14 @@ func TestConsumeDeliversInSequenceOrderAndOnlyOnce(t *testing.T) {
 	f.put("zzz.msg", a)
 	f.put("aaa.msg", b)
 
-	got, err := f.box.Consume(agent.ViaHook)
+	got, err := f.box.Consume(agent.ViaHook, agent.ToLead)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 2 || got[0].Body != "first" || got[1].Body != "second" {
 		t.Fatalf("got %+v", got)
 	}
-	if again, _ := f.box.Consume(agent.ViaHook); len(again) != 0 {
+	if again, _ := f.box.Consume(agent.ViaHook, agent.ToLead); len(again) != 0 {
 		t.Errorf("delivered twice: %+v", again)
 	}
 	if n := len(f.lines(agent.DeliveriesName)); n != 2 {
@@ -150,7 +152,7 @@ func TestRejectedItemsAreMovedAsideAndLoggedNeverDelivered(t *testing.T) {
 	f.put("elsewhere.msg", f.seal(agent.Envelope{Session: "another-run", Kind: agent.KindMessage, Body: "old"}))
 	f.put("brief.msg", f.seal(agent.Envelope{Kind: agent.KindBrief, ID: "brief", Body: "a brief is not mail"}))
 
-	got, err := f.box.Consume(agent.ViaLaunch)
+	got, err := f.box.Consume(agent.ViaLaunch, agent.ToLead)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +183,7 @@ func TestRejectedItemsAreMovedAsideAndLoggedNeverDelivered(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.put("again.msg", again)
-	if got, _ := f.box.Consume(agent.ViaHook); len(got) != 0 {
+	if got, _ := f.box.Consume(agent.ViaHook, agent.ToLead); len(got) != 0 {
 		t.Errorf("a replay was delivered: %+v", got)
 	}
 	if last := f.tampers(); !strings.Contains(last[len(last)-1].Reason, "already") {
@@ -206,7 +208,7 @@ func TestConcurrentTakersDeliverEachItemExactlyOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 20; i++ {
-				got, err := f.box.Consume(agent.ViaHook)
+				got, err := f.box.Consume(agent.ViaHook, agent.ToLead)
 				if err != nil {
 					t.Error(err)
 					return
@@ -238,7 +240,7 @@ func TestAHalfWrittenFileIsLeftForItsWriter(t *testing.T) {
 	dir := filepath.Join(f.box.Dir, agent.InboxName)
 	os.MkdirAll(dir, 0o700)
 	os.WriteFile(filepath.Join(dir, ".tmp-9"), []byte("half"), 0o600)
-	if got, err := f.box.Consume(agent.ViaHook); err != nil || len(got) != 0 {
+	if got, err := f.box.Consume(agent.ViaHook, agent.ToLead); err != nil || len(got) != 0 {
 		t.Fatalf("got %v, %v", got, err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".tmp-9")); err != nil {
@@ -253,7 +255,7 @@ func TestAClaimLeftByADeadTakerIsSettledByTheNext(t *testing.T) {
 	dir := filepath.Join(f.box.Dir, agent.ClaimedName)
 	os.MkdirAll(dir, 0o700)
 	os.WriteFile(filepath.Join(dir, "000000000001.msg"), f.seal(agent.Envelope{Kind: agent.KindMessage, Body: "orphan"}), 0o600)
-	got, err := f.box.Consume(agent.ViaLaunch)
+	got, err := f.box.Consume(agent.ViaLaunch, agent.ToLead)
 	if err != nil || len(got) != 1 || got[0].Body != "orphan" {
 		t.Fatalf("got %+v, %v", got, err)
 	}
@@ -264,11 +266,11 @@ func TestWithoutAKeyOrASessionNothingIsTaken(t *testing.T) {
 	f.send(agent.KindMessage, "", "wait for me")
 	noSession := f.box
 	noSession.Session = ""
-	if _, err := noSession.Consume(agent.ViaHook); err != ErrNoSession {
+	if _, err := noSession.Consume(agent.ViaHook, agent.ToLead); err != ErrNoSession {
 		t.Errorf("want ErrNoSession, got %v", err)
 	}
 	os.Remove(filepath.Join(f.box.Dir, agent.PubName))
-	if _, err := f.box.Consume(agent.ViaHook); err == nil || !strings.Contains(err.Error(), "operator key") {
+	if _, err := f.box.Consume(agent.ViaHook, agent.ToLead); err == nil || !strings.Contains(err.Error(), "operator key") {
 		t.Errorf("want a missing-key error, got %v", err)
 	}
 	if left := pending(filepath.Join(f.box.Dir, agent.InboxName)); len(left) != 1 {
@@ -302,13 +304,13 @@ func TestTheUnsignedLegacyInboxIsReportedNotDelivered(t *testing.T) {
 func TestPostToolUsePrintsHookContextOrNothing(t *testing.T) {
 	f := newFixture(t)
 	var quiet bytes.Buffer
-	if err := f.box.PostToolUse(&quiet); err != nil || quiet.Len() != 0 {
+	if err := f.box.PostToolUse(leadInput(), &quiet); err != nil || quiet.Len() != 0 {
 		t.Fatalf("nothing queued must print nothing, got %q, %v", quiet.String(), err)
 	}
 
 	f.send(agent.KindMessage, "", "Stop after E2 and report.")
 	var out bytes.Buffer
-	if err := f.box.PostToolUse(&out); err != nil {
+	if err := f.box.PostToolUse(leadInput(), &out); err != nil {
 		t.Fatal(err)
 	}
 	var raw map[string]map[string]string
@@ -326,8 +328,159 @@ func TestPostToolUsePrintsHookContextOrNothing(t *testing.T) {
 		}
 	}
 	d := f.lines(agent.DeliveriesName)
-	if len(d) != 1 || !strings.Contains(d[0], `"path":"hook"`) {
-		t.Errorf("the delivery must be logged with its path, got %v", d)
+	if len(d) != 1 || !strings.Contains(d[0], `"path":"hook"`) || !strings.Contains(d[0], `"to":"lead"`) {
+		t.Errorf("the delivery must be logged with its path and whom it reached, got %v", d)
+	}
+}
+
+// What Claude Code 2.1.314 writes to the hook's stdin, trimmed to the fields
+// that matter: the lead's input names the session and no agent; a subagent's
+// names the same session and transcript, and an agent_id (DEV_NOTES).
+func leadInput() *strings.Reader {
+	return strings.NewReader(`{"session_id":"sess","transcript_path":"/root/.claude/projects/-work/sess.jsonl","cwd":"/work",` +
+		`"permission_mode":"bypassPermissions","hook_event_name":"PostToolUse","tool_name":"Bash",` +
+		`"tool_input":{"command":"echo lead-1"},"tool_response":{"stdout":"lead-1"},"tool_use_id":"toolu_01","duration_ms":4}`)
+}
+
+func subagentInput() *strings.Reader {
+	return strings.NewReader(`{"session_id":"sess","transcript_path":"/root/.claude/projects/-work/sess.jsonl","cwd":"/work",` +
+		`"permission_mode":"bypassPermissions","agent_id":"aacedf6b44a9b07a6","agent_type":"general-purpose",` +
+		`"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"echo sub-1"},` +
+		`"tool_response":{"stdout":"sub-1"},"tool_use_id":"toolu_02","duration_ms":4}`)
+}
+
+// A message delivered after a subagent's tool call is lost: the subagent
+// says it will pass it on and does not. So the hook takes nothing unless its
+// input proves the lead, and what it holds reaches the lead at its next tool
+// call or its next launch.
+func TestTheHookDeliversOnlyWhenItsInputProvesTheLead(t *testing.T) {
+	f := newFixture(t)
+	f.send(agent.KindMessage, "", "Stop after E2 and report.")
+	pendingNow := func() int { return len(pending(filepath.Join(f.box.Dir, agent.InboxName))) }
+
+	for name, in := range map[string]*strings.Reader{
+		"a subagent's tool call": subagentInput(),
+		"another session":        strings.NewReader(`{"session_id":"other","hook_event_name":"PostToolUse","tool_name":"Bash"}`),
+		"no session named":       strings.NewReader(`{"hook_event_name":"PostToolUse","tool_name":"Bash"}`),
+		"not JSON at all":        strings.NewReader("stdin from some other hook shape"),
+		"no input":               nil,
+	} {
+		var out bytes.Buffer
+		var r io.Reader
+		if in != nil {
+			r = in
+		}
+		if err := f.box.PostToolUse(r, &out); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if out.Len() != 0 {
+			t.Errorf("%s: the hook delivered:\n%s", name, out.String())
+		}
+		if pendingNow() != 1 {
+			t.Errorf("%s: the message must stay queued for the lead", name)
+		}
+	}
+	if d := f.lines(agent.DeliveriesName); len(d) != 0 {
+		t.Errorf("nothing was delivered, yet: %v", d)
+	}
+	// A hook rig could not place is said once, where rig agent log --stderr
+	// reads; a subagent's call, the ordinary case, is not noise.
+	stderr, _ := os.ReadFile(filepath.Join(f.box.Dir, "stderr.log"))
+	if n := strings.Count(string(stderr), "rig hook post-tool-use"); n != 1 {
+		t.Errorf("want one line about an input that proves nothing, got %d:\n%s", n, stderr)
+	}
+	if strings.Contains(string(stderr), "subagent") {
+		t.Errorf("a subagent's tool call is ordinary and must not be logged:\n%s", stderr)
+	}
+
+	var out bytes.Buffer
+	if err := f.box.PostToolUse(leadInput(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Stop after E2") || pendingNow() != 0 {
+		t.Fatalf("the lead's own tool call must take it, got:\n%s", out.String())
+	}
+	if d := f.lines(agent.DeliveriesName); len(d) != 1 || !strings.Contains(d[0], `"to":"lead"`) {
+		t.Errorf("the record must say it reached the lead: %v", d)
+	}
+}
+
+// A message the hook held survives the run it was held in, and reaches the
+// lead at its next launch, in the prompt; a launch also lists what reached
+// the agent mid-turn since the previous launch, by id and first line, so a
+// lead whose context was compacted or whose run was killed is reminded.
+func TestLaunchDeliversWhatWasHeldAndListsWhatReachedTheAgentMidTurn(t *testing.T) {
+	f := newFixture(t)
+	var first bytes.Buffer
+	if err := f.box.Launch(&first); err != nil {
+		t.Fatal(err)
+	}
+	if first.Len() != 0 {
+		t.Fatalf("nothing happened yet, got:\n%s", first.String())
+	}
+
+	hooked := f.send(agent.KindMessage, "", "Skip E3; the docs are out of scope.\nSecond line.")
+	var out bytes.Buffer
+	if err := f.box.PostToolUse(leadInput(), &out); err != nil || !strings.Contains(out.String(), "Skip E3") {
+		t.Fatalf("hook: %v\n%s", err, out.String())
+	}
+	f.box.Ask("q", "which?")
+	f.send(agent.KindAnswer, "q", "the second one")
+	var wait bytes.Buffer
+	if ok, _ := f.box.Wait(context.Background(), "q", time.Second, 10*time.Millisecond, &wait); !ok {
+		t.Fatal("the answer must reach wait")
+	}
+	held := f.send(agent.KindMessage, "", "Report before you stop.")
+	if err := f.box.PostToolUse(subagentInput(), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+
+	var launch bytes.Buffer
+	if err := f.box.Launch(&launch); err != nil {
+		t.Fatal(err)
+	}
+	text := launch.String()
+	for _, want := range []string{
+		"DELIVERED DURING YOUR PREVIOUS RUN",
+		hooked.ID + "  message via hook to lead, " + "2026-10-16T10:00:00Z: Skip E3; the docs are out of scope.",
+		"q  answer via wait to caller",
+		"queued since your last turn", "Report before you stop.", "token tok123",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the launch prompt lacks %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "Second line.") {
+		t.Error("the listing is first lines only; the body is in the conversation already")
+	}
+	d := f.lines(agent.DeliveriesName)
+	if len(d) != 3 || !strings.Contains(d[2], `"path":"launch"`) || !strings.Contains(d[2], `"to":"lead"`) ||
+		!strings.Contains(d[2], fmt.Sprintf(`"seq":%d`, held.Seq)) {
+		t.Errorf("the held message must be recorded as delivered at launch, to the lead: %v", d)
+	}
+
+	// The next launch lists only what came after this one.
+	var again bytes.Buffer
+	if err := f.box.Launch(&again); err != nil {
+		t.Fatal(err)
+	}
+	if again.Len() != 0 {
+		t.Errorf("a launch with nothing new must print nothing, got:\n%s", again.String())
+	}
+}
+
+func TestInboxTakesForWhoeverRanIt(t *testing.T) {
+	f := newFixture(t)
+	var out bytes.Buffer
+	if n, err := f.box.Inbox(&out); err != nil || n != 0 || out.Len() != 0 {
+		t.Fatalf("empty: %d %v %q", n, err, out.String())
+	}
+	f.send(agent.KindMessage, "", "poll me")
+	if n, err := f.box.Inbox(&out); err != nil || n != 1 || !strings.Contains(out.String(), "poll me") {
+		t.Fatalf("got %d %v\n%s", n, err, out.String())
+	}
+	if d := f.lines(agent.DeliveriesName); len(d) != 1 || !strings.Contains(d[0], `"path":"inbox"`) || !strings.Contains(d[0], `"to":"caller"`) {
+		t.Errorf("recorded as reaching the caller, since nothing in the guest can say who ran it: %v", d)
 	}
 }
 
@@ -415,7 +568,7 @@ func TestAnAnswerDeliveredByTheHookIsFoundByWait(t *testing.T) {
 	f.box.Ask("q", "?")
 	f.send(agent.KindAnswer, "q", "yes")
 	var hook bytes.Buffer
-	f.box.PostToolUse(&hook)
+	f.box.PostToolUse(leadInput(), &hook)
 	if !strings.Contains(hook.String(), "yes") {
 		t.Fatalf("the hook must deliver answers too: %s", hook.String())
 	}
@@ -493,7 +646,7 @@ func TestBriefVerifiesOrRefuses(t *testing.T) {
 func TestBriefUpdatesRenderAsDiffsThatPointAtTheWholeText(t *testing.T) {
 	f := newFixture(t)
 	f.send(agent.KindBriefUpdate, "brief", agent.UnifiedDiff("brief (as delivered)", "brief (now)", "a\nb\n", "a\nc\n"))
-	got, _ := f.box.Consume(agent.ViaHook)
+	got, _ := f.box.Consume(agent.ViaHook, agent.ToLead)
 	text := f.box.Render(got)
 	for _, want := range []string{"changed your brief", "rig brief", "-b\n+c\n", "token tok123"} {
 		if !strings.Contains(text, want) {
