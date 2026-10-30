@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1146,6 +1147,34 @@ func (a *app) doctorCmd() *cobra.Command {
 							fmt.Printf("        %s\n", r)
 						}
 					}
+				}
+			}
+
+			// Forwards are vsock, not a grant through the ACL, and a port named
+			// under both is published to the network and loopback at once:
+			// most often one that was meant to be only the latter.
+			if fwd, err := recordedForwards(inst); err != nil {
+				check("forwards", false, err.Error())
+			} else if len(fwd) > 0 {
+				recorded, _ := recordedPorts(inst)
+				var both []string
+				for _, p := range fwd {
+					for _, pub := range recorded {
+						if lo, hi := pub.TargetRange(); p >= lo && p <= hi {
+							both = append(both, strconv.Itoa(p))
+						}
+					}
+				}
+				if len(both) > 0 {
+					info("forwards", "port(s) "+strings.Join(both, ", ")+" are both forwarded to loopback and published on the network (guest.ports); for a preview of your own, forwards alone is enough")
+				}
+				switch {
+				case !inst.Running():
+					info("forwards", fmt.Sprintf("%v held on 127.0.0.1 from the next start (%s)", fwd, forwardUnit(name)))
+				case forwardActive(name):
+					check("forwards", true, fmt.Sprintf("%v on 127.0.0.1 over vsock (%s)", fwd, forwardUnit(name)))
+				default:
+					check("forwards", false, fmt.Sprintf("%s is not running; the ports are not held:  rig forward %s --background", forwardUnit(name), name))
 				}
 			}
 

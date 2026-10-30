@@ -29,10 +29,16 @@ import (
 // manifestKey records the file an instance was made from, so `rig doctor` can
 // find it without being told. portsKey records the published ports, as the
 // manifest's list in JSON, so the network reconciliation has the intent to
-// hand.
+// hand; forwardsKey the ports rig start carries over vsock, the same way.
+// agentKey records guest.agent's long form, as JSON with the prompt file
+// made absolute, which `rig agent start` reads as its defaults and `rig
+// agent watch` for its budgets and thresholds; empty when the file gives
+// only a harness name, which agent.HarnessKey records on its own.
 const (
 	manifestKey = "user.rig.manifest"
 	portsKey    = "user.rig.ports"
+	forwardsKey = "user.rig.forwards"
+	agentKey    = "user.rig.agent.manifest"
 )
 
 // desired is the instance config a manifest asks for: every key rig records,
@@ -54,11 +60,13 @@ func desired(m *manifest.Manifest) (map[string]string, error) {
 		devices.DevicesKey: devices.Encode(decls),
 		manifestKey:        m.Path,
 		portsKey:           string(ports),
+		forwardsKey:        encodeForwards(m.Guest.Forwards),
 		// Always present, empty when unasked: removing the line from the file
 		// must read as drift, not as nothing to say.
 		inputKey: m.Guest.Input,
 		// Empty is the default harness; the agent verbs read it that way.
-		agent.HarnessKey: m.Guest.Agent,
+		agent.HarnessKey: m.AgentHarness(),
+		agentKey:         encodeAgent(m.ResolvedAgent()),
 	}
 	var credentials map[string][]string
 	if m.Guest.Proxy != nil {
@@ -77,6 +85,55 @@ func desired(m *manifest.Manifest) (map[string]string, error) {
 		cfg["limits.memory"] = m.Guest.Memory
 	}
 	return cfg, nil
+}
+
+// encodeForwards is the forwards list for the record, "" for none.
+func encodeForwards(ports []int) string {
+	if len(ports) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(ports)
+	return string(b)
+}
+
+// recordedForwards reads the ports rig start carries over vsock back out of
+// the record.
+func recordedForwards(inst *incus.Instance) ([]int, error) {
+	raw := inst.Config[forwardsKey]
+	if raw == "" {
+		return nil, nil
+	}
+	var ports []int
+	if err := json.Unmarshal([]byte(raw), &ports); err != nil {
+		return nil, fmt.Errorf("%s on %s is not a port list: %w", forwardsKey, inst.Name, err)
+	}
+	return ports, nil
+}
+
+// encodeAgent is guest.agent's long form for the record: "" when the file
+// says nothing beyond a harness name, which has a key of its own.
+func encodeAgent(a manifest.Agent) string {
+	a.Harness = ""
+	if a.IsZero() {
+		return ""
+	}
+	b, _ := json.Marshal(a)
+	return string(b)
+}
+
+// recordedAgent reads guest.agent's long form back out of the record; the
+// zero value when the manifest gave none.
+func recordedAgent(inst *incus.Instance) (manifest.Agent, error) {
+	raw := inst.Config[agentKey]
+	if raw == "" {
+		return manifest.Agent{}, nil
+	}
+	var a manifest.Agent
+	if err := json.Unmarshal([]byte(raw), &a); err != nil {
+		return a, fmt.Errorf("%s on %s is not an agent record: %w", agentKey, inst.Name, err)
+	}
+	a.Harness = inst.Config[agent.HarnessKey]
+	return a, nil
 }
 
 func portStrings(m *manifest.Manifest) []string {
@@ -234,6 +291,30 @@ func (a *app) reconcileManifest(m *manifest.Manifest) ([]string, error) {
 		} else if inputActive(name) {
 			changes = append(changes, "note: input stays lent until "+name+" stops; sooner:  rig host input "+name+" --stop")
 		}
+	}
+	// The file's agent settings are the defaults a start reads, under what a
+	// start recorded from its flags. When the file changes, the record from
+	// the last start is cleared, so the next bare start reads the file rather
+	// than a flag resolved against the old one.
+	if inst.Config[agentKey] != want[agentKey] {
+		clear := map[string]string{}
+		for _, flag := range agent.OptionFlags {
+			if inst.Config[agent.OptionKey(flag)] != "" {
+				clear[agent.OptionKey(flag)] = ""
+			}
+		}
+		if len(clear) > 0 {
+			if err := a.c.SetConfigKeys(name, clear); err != nil {
+				return changes, err
+			}
+			changes = append(changes, "note: guest.agent changed, so the options recorded by the last rig agent start are cleared; the next start reads the file")
+		}
+		if inst.Running() && inst.Config[agent.SessionKey] != "" {
+			changes = append(changes, "note: a running agent keeps its settings; rig agent stop "+name+" && rig agent start "+name+" applies the file's")
+		}
+	}
+	if inst.Running() && inst.Config[forwardsKey] != want[forwardsKey] {
+		changes = append(changes, "note: the forwards are held from the next start; for this run:  rig forward "+name+" --background")
 	}
 	// The network device and the ports, in an order that matters. A mask is
 	// lifted before ports are published, because they need the NIC back; it

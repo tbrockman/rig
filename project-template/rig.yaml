@@ -53,7 +53,29 @@ guest:
   #   egress: internet            # and everything else its NIC may reach, for the agent's tools (cargo, git, nix)
   # volumes:                      # named volumes; they outlive the VM
   #   - "PROJECT-data:/srv/data"
-  # ports:                        # host:guest/proto, published on the LAN
+  # ports:                        # host:guest/proto, published on the network through the ACL
   #   - "8080:80/tcp"
+  # forwards: [5173]              # guest ports on this host's 127.0.0.1 over vsock; isolation untouched
+  # agent:                        # or just `agent: claude-code`; `rig agent start` reads these as defaults
+  #   prompt_file: brief.md       # the brief, relative to this file
+  #   workdir: /work/PROJECT
+  #   model: claude-fable-5-1
+  #   timeout: 6h                 # kill one run after this long and resume: a hang backstop
+  #   idle_timeout: 20m           # kill a run with no tool call for this long and resume: the better backstop
+  #   memory_max: 80%             # MemoryMax= on the agent's unit, inside the VM's memory
+  #   until_done: true            # resume at each turn boundary until the agent runs `rig done`
+  #   budgets:                    # hard limits: crossing one stops the agent, session kept
+  #     hours: 24
+  #     tokens: 50000000
+  #     usage: { window: five_hour, max: 0.9 }   # a subscription window, for an OAuth login
+  #     restarts: 10
+  #   watch:                      # soft thresholds: each is a `rig agent watch` event; on: adds a message
+  #     idle_minutes: 120         # no commit on the workdir's branch
+  #     unit_minutes: 30          # a transient unit the agent started, still running
+  #     status_minutes: 90        # STATUS.md untouched
+  #     usage: { window: five_hour, max: 0.7 }
+  #     on:
+  #       idle: { send: "No commit in two hours. Say in STATUS.md what you are waiting on." }
+  #       status: { send: "STATUS.md is stale. Rewrite it." }
   # network: none                 # no network device at all
   # input: host                   # lend the host's keyboard and mouse (desktop module)

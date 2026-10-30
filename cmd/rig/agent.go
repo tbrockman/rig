@@ -179,12 +179,16 @@ func (a *app) agentStartCmd() *cobra.Command {
 				return err
 			}
 
-			opts, err := startOptions(cmd.Flags().Changed, agent.RecordedOptions(inst.Config), agent.StartOptions{
+			spec, err := recordedAgent(inst)
+			if err != nil {
+				return err
+			}
+			opts, err := startOptions(cmd.Flags().Changed, agent.RecordedOptions(inst.Config), manifestDefaults(spec), agent.StartOptions{
 				PromptFile: promptFile, Workdir: workdir, Model: model, Timeout: timeout,
 				MemoryMax: memMax, UntilDone: untilDone, Restarts: restarts,
 			})
 			if err != nil {
-				return fmt.Errorf("%w\n  rig agent start %s --prompt-file <brief>", err, name)
+				return fmt.Errorf("%w\n  rig agent start %s --prompt-file <brief>   # or guest.agent.prompt_file in rig.yaml", err, name)
 			}
 			store, err := operator.For(name)
 			if err != nil {
@@ -359,26 +363,43 @@ func (a *app) agentStartCmd() *cobra.Command {
 	return cmd
 }
 
+// manifestDefaults is what guest.agent's long form says of the start
+// options, in their shape.
+func manifestDefaults(a manifest.Agent) agent.StartOptions {
+	return agent.StartOptions{
+		PromptFile: a.PromptFile, Workdir: a.Workdir, Model: a.Model, Timeout: a.Timeout,
+		MemoryMax: a.MemoryMax, UntilDone: a.UntilDone,
+	}
+}
+
 // startOptions resolves each start option: the flag when it was given now,
-// else what the instance recorded, else the flag's default. The prompt file is
-// made absolute, since a later start may run from another directory.
-func startOptions(changed func(flag string) bool, recorded, given agent.StartOptions) (agent.StartOptions, error) {
+// else what the last start recorded, else what the manifest's guest.agent
+// says, else the flag's default. A start's record stands in for the
+// manifest as a whole once it exists (it was resolved against the manifest
+// then), and `rig apply -f` clears it when the manifest's agent settings
+// change. The prompt file is made absolute, since a later start may run from
+// another directory.
+func startOptions(changed func(flag string) bool, recorded, fromManifest, given agent.StartOptions) (agent.StartOptions, error) {
 	o := given
+	base := fromManifest
+	if recorded.PromptFile != "" {
+		base = recorded
+	}
 	pick := func(flag string, v *string, rec string) {
 		if !changed(flag) && rec != "" {
 			*v = rec
 		}
 	}
-	pick("prompt-file", &o.PromptFile, recorded.PromptFile)
-	pick("workdir", &o.Workdir, recorded.Workdir)
-	pick("model", &o.Model, recorded.Model)
-	pick("timeout", &o.Timeout, recorded.Timeout)
-	pick("memory-max", &o.MemoryMax, recorded.MemoryMax)
+	pick("prompt-file", &o.PromptFile, base.PromptFile)
+	pick("workdir", &o.Workdir, base.Workdir)
+	pick("model", &o.Model, base.Model)
+	pick("timeout", &o.Timeout, base.Timeout)
+	pick("memory-max", &o.MemoryMax, base.MemoryMax)
 	if !changed("until-done") {
-		o.UntilDone = recorded.UntilDone
+		o.UntilDone = base.UntilDone
 	}
 	if !changed("max-restarts") {
-		o.Restarts = recorded.Restarts
+		o.Restarts = base.Restarts
 	}
 	if o.PromptFile == "" {
 		return o, fmt.Errorf("no brief: --prompt-file is required the first time, and none is recorded")

@@ -80,6 +80,7 @@ var schemaCannotSay = map[string]bool{
 	"port out of range":                 true,
 	"wildcard host ip":                  true,
 	"proxy egress without a credential": true,
+	"on without its threshold":          true,
 }
 
 func TestSchemaAgreesWithValidate(t *testing.T) {

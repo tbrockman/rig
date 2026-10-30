@@ -329,7 +329,12 @@ func (a *app) agentBriefCmd() *cobra.Command {
 			}
 			given := agent.StartOptions{PromptFile: promptFile}
 			rec := agent.RecordedOptions(inst.Config)
-			o, err := startOptions(cmd.Flags().Changed, agent.StartOptions{PromptFile: rec.PromptFile}, given)
+			spec, err := recordedAgent(inst)
+			if err != nil {
+				return err
+			}
+			o, err := startOptions(cmd.Flags().Changed, agent.StartOptions{PromptFile: rec.PromptFile},
+				agent.StartOptions{PromptFile: spec.PromptFile}, given)
 			if err != nil {
 				return err
 			}

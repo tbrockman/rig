@@ -202,12 +202,14 @@ type vmDetail struct {
 	Isolation    string              `json:"isolation"`
 	Devices      []devices.Holder    `json:"devices"`
 	Ports        []string            `json:"ports"`
+	Forwards     []int               `json:"forwards"`
 	Volumes      map[string]string   `json:"volumes"` // name -> path in the guest
 	Input        string              `json:"input,omitempty"`
 	EnvFile      string              `json:"env_file,omitempty"`
 	Proxied      map[string][]string `json:"proxied,omitempty"`
 	Egress       string              `json:"egress,omitempty"`
 	AgentSession string              `json:"agent_session,omitempty"`
+	Agent        *manifest.Agent     `json:"agent,omitempty"` // guest.agent's long form, as recorded
 }
 
 func (a *app) vmDetail(name string) (vmDetail, error) {
@@ -232,6 +234,7 @@ func (a *app) vmDetail(name string) (vmDetail, error) {
 		Isolation:    isolationDetail(a.cfg.ACL, len(inst.NICs()), unisolated, noEgress),
 		Devices:      devices.Holders([]incus.Instance{*inst}),
 		Ports:        []string{},
+		Forwards:     []int{},
 		Volumes:      volumes.Mounts(inst),
 		Input:        inst.Config[inputKey],
 		EnvFile:      inst.Config[creds.InstanceKey],
@@ -251,10 +254,77 @@ func (a *app) vmDetail(name string) (vmDetail, error) {
 	for _, p := range recorded {
 		d.Ports = append(d.Ports, p.String())
 	}
+	if fwd, err := recordedForwards(inst); err != nil {
+		return d, err
+	} else if fwd != nil {
+		d.Forwards = fwd
+	}
 	if d.Proxied, err = proxy.Decode(inst.Config[proxy.InstanceKey]); err != nil {
 		return d, err
 	}
+	if spec, err := recordedAgent(inst); err != nil {
+		return d, err
+	} else if !spec.IsZero() {
+		d.Agent = &spec
+	}
 	return d, nil
+}
+
+// describeAgentSpec is guest.agent's long form in a line: the settings a
+// start reads, then the budgets and thresholds, each only when set.
+func describeAgentSpec(a manifest.Agent) string {
+	var parts []string
+	add := func(k, v string) {
+		if v != "" {
+			parts = append(parts, k+" "+v)
+		}
+	}
+	add("harness", a.Harness)
+	add("brief", a.PromptFile)
+	add("workdir", a.Workdir)
+	add("model", a.Model)
+	add("timeout", a.Timeout)
+	add("idle timeout", a.IdleTimeout)
+	add("memory", a.MemoryMax)
+	if a.UntilDone {
+		parts = append(parts, "until done")
+	}
+	if b := a.Budgets; b != nil {
+		var limits []string
+		if b.Hours > 0 {
+			limits = append(limits, fmt.Sprintf("%gh", b.Hours))
+		}
+		if b.Tokens > 0 {
+			limits = append(limits, fmt.Sprintf("%d tokens", b.Tokens))
+		}
+		if b.Usage != nil {
+			limits = append(limits, fmt.Sprintf("%s at %.0f%%", b.Usage.Window, b.Usage.Max*100))
+		}
+		if b.Restarts > 0 {
+			limits = append(limits, fmt.Sprintf("%d restarts", b.Restarts))
+		}
+		parts = append(parts, "budgets: "+strings.Join(limits, ", "))
+	}
+	if w := a.Watch; w != nil {
+		var marks []string
+		if w.IdleMinutes > 0 {
+			marks = append(marks, fmt.Sprintf("idle %dm", w.IdleMinutes))
+		}
+		if w.UnitMinutes > 0 {
+			marks = append(marks, fmt.Sprintf("unit %dm", w.UnitMinutes))
+		}
+		if w.StatusMinutes > 0 {
+			marks = append(marks, fmt.Sprintf("status %dm", w.StatusMinutes))
+		}
+		if w.Usage != nil {
+			marks = append(marks, fmt.Sprintf("%s at %.0f%%", w.Usage.Window, w.Usage.Max*100))
+		}
+		if len(w.On) > 0 {
+			marks = append(marks, fmt.Sprintf("%d with a message", len(w.On)))
+		}
+		parts = append(parts, "watch: "+strings.Join(marks, ", "))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (a *app) describeVMs(names []string, asJSON bool) error {
@@ -325,6 +395,17 @@ func printDetail(d vmDetail) {
 	}
 	line("devices", none(devs))
 	line("ports", none(d.Ports))
+	if len(d.Forwards) > 0 {
+		var fwd []string
+		for _, p := range d.Forwards {
+			fwd = append(fwd, fmt.Sprintf("127.0.0.1:%d", p))
+		}
+		held := "held by rig-forward-" + d.Name + " while it runs"
+		if !forwardActive(d.Name) {
+			held = "not held now; rig start holds them, or: rig forward " + d.Name + " --background"
+		}
+		line("forwards", strings.Join(fwd, ", ")+" over vsock ("+held+")")
+	}
 	var vols []string
 	for _, name := range sortedKeys(d.Volumes) {
 		vols = append(vols, name+" at "+d.Volumes[name])
@@ -350,7 +431,10 @@ func printDetail(d vmDetail) {
 		}
 		line("proxied", proxied)
 	}
+	if d.Agent != nil {
+		line("agent", describeAgentSpec(*d.Agent))
+	}
 	if d.AgentSession != "" {
-		line("agent", "session "+d.AgentSession+";  rig agent status "+d.Name+" asks the guest")
+		line("", "session "+d.AgentSession+";  rig agent status "+d.Name+" asks the guest")
 	}
 }
