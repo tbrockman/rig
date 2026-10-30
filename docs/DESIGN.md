@@ -41,6 +41,44 @@ harness says how it delivers (`Delivery()`), so `rig agent send` reports
 the path and its latency from the harness rather than from a sentence
 written for one.
 
+## 2026-10-30: the manifest says how the agent runs, and what is held for it
+
+The overseer of a mission needed facts that were flags to `rig agent
+start` or lines in a brief: the prompt file, the workdir, the model, the
+timeout, and the ports to hold forwards for. The forward died with the VM
+when the image was rebuilt, and someone had to remember to restart it.
+Now `guest.agent` carries the run's settings (its short form, the harness
+name alone, still works), budgets, which are hard limits, and watch
+thresholds, which are soft ones; and `guest.forwards` carries the ports.
+
+**Forwards in the manifest.** A forward is a host process by nature: the
+vsock listener is on the host side, and nothing in Incus or the guest can
+hold a port on this host's loopback. So it is a grant like the others,
+declared in the file and recorded on the instance, and `rig start` leaves
+a holder, `rig-forward-<vm>`, a transient unit in the operator's user
+manager, the way it leaves the handback watcher and the input forwarder
+as root units. User scope because vsock needs no root and a preview is the
+operator's own; `rig proxy setup`'s lingering keeps it past a logout, as
+it does the proxies. It follows the VM, ends with it, and is left again at
+the next start, so a VM recreated from a new image comes back with its
+forwards. It was not put in the proxy: that is witmproxy's process, exists
+only for a proxied VM, and carries HTTP, not a raw port. The schema, the
+README and `rig status` say how `forwards` differs from `ports`: a
+published port goes through the network and the ACL and can be bound to
+an address other machines reach; a forward is vsock, loopback only, and
+leaves `rig verify` PROVEN. For an operator's own preview, `forwards` is
+the default and `ports` the exception; `rig doctor` notes a port named
+under both.
+
+**Defaults and records.** `rig agent start` resolves each option as the
+flag given now, else what the last start recorded, else the file, else
+the flag's default. The record stands in for the file once it exists,
+since it was resolved against it, and `rig apply -f` clears the record
+when the file's agent settings change, so a bare start then reads the
+file. The alternative, the file always winning, would make `--model` a
+one-start override that a bare restart silently undoes, which is the
+forgotten-flag failure the record exists to prevent.
+
 ## 2026-10-16: a channel to the agent that is timely and signed
 
 Four things were wrong between the operator and a running agent. A message

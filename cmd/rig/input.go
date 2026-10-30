@@ -219,9 +219,15 @@ func (a *app) isLentVM(vm string, cid uint32) bool {
 
 // followVM ends ctx once vm stops, so a background forwarder ends with the
 // VM it was lent to rather than waiting, grab-ready, for a guest that is
-// gone. A few failed reads in a row are needed, not one: Incus restarting
-// under a running VM is not the VM stopping.
+// gone.
 func (a *app) followVM(ctx context.Context, vm string, cid uint32) context.Context {
+	return a.untilStopped(ctx, vm, cid, "%s stopped; input stays with this host")
+}
+
+// untilStopped ends ctx once vm is no longer running as the boot cid names,
+// saying so with stopped. A few failed reads in a row are needed, not one:
+// Incus restarting under a running VM is not the VM stopping.
+func (a *app) untilStopped(ctx context.Context, vm string, cid uint32, stopped string) context.Context {
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
 		defer cancel()
@@ -239,7 +245,7 @@ func (a *app) followVM(ctx context.Context, vm string, cid uint32) context.Conte
 				continue
 			}
 			if misses++; misses >= 3 {
-				note("%s stopped; input stays with this host", vm)
+				note(stopped, vm)
 				return
 			}
 		}

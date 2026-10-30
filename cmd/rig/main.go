@@ -447,6 +447,7 @@ func (a *app) start(name string, timeout time.Duration, wait, allowUnisolated, k
 	a.startHandback(name, wanted)
 	if !wait {
 		a.startInput(name, wait)
+		a.startForwards(name, wait)
 		return nil
 	}
 	if err := a.c.WaitAgent(name, timeout); err != nil {
@@ -474,11 +475,13 @@ func (a *app) start(name string, timeout time.Duration, wait, allowUnisolated, k
 	}
 	envFile := inst.Config[creds.InstanceKey]
 	if envFile == "" {
+		a.startForwards(name, wait)
 		return nil
 	}
 	if _, statErr := os.Stat(envFile); statErr != nil {
 		note("WARNING: %s expects credentials at %s, which is missing.", name, envFile)
 		note("         The guest started without them.")
+		a.startForwards(name, wait)
 		return nil
 	}
 	n, err := a.injectCredentials(name, envFile)
@@ -486,6 +489,7 @@ func (a *app) start(name string, timeout time.Duration, wait, allowUnisolated, k
 		return err
 	}
 	note("injected %d credential(s) into %s (tmpfs; gone on stop)", n, creds.GuestPath)
+	a.startForwards(name, wait)
 	return nil
 }
 
@@ -623,6 +627,7 @@ func (a *app) stopForce(name string, timeout time.Duration, keep, force bool) er
 		return err
 	}
 	stopInput(name)
+	stopForwards(name)
 	// Its credentials leave the proxy with it; the next start puts them back.
 	if inst, _, err := a.c.Instance(name); err == nil {
 		a.proxyRevoke(inst)

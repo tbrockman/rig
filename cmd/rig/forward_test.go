@@ -111,3 +111,34 @@ func TestForwardWaitsForTheGuestHalfToListen(t *testing.T) {
 		t.Error("a half that never listens must fail the wait and show socat's own output")
 	}
 }
+
+// Several ports in one process, each once, each a port; with none given the
+// manifest's forwards are read, and --host-port renames one port only.
+func TestForwardTakesSeveralPortsOnce(t *testing.T) {
+	ports, err := parsePorts([]string{"5173", "9222"})
+	if err != nil || len(ports) != 2 || ports[0] != 5173 || ports[1] != 9222 {
+		t.Fatalf("got %v, %v", ports, err)
+	}
+	for _, bad := range [][]string{{"0"}, {"70000"}, {"web"}, {"5173", "5173"}} {
+		if _, err := parsePorts(bad); err == nil {
+			t.Errorf("%v was accepted", bad)
+		}
+	}
+	if ports, err := parsePorts(nil); err != nil || len(ports) != 0 {
+		t.Errorf("no operands is the manifest's list, decided later: %v, %v", ports, err)
+	}
+}
+
+// The holder rig start leaves is a transient user unit named after the VM,
+// so rig status and rig doctor can find it and rig stop can end it.
+func TestForwardUnitIsNamedAfterTheVM(t *testing.T) {
+	if got := forwardUnit("myproj"); got != "rig-forward-myproj.service" {
+		t.Errorf("unit %q", got)
+	}
+	if !strings.Contains(firstNonEmpty("", "x"), "x") {
+		t.Fatal("firstNonEmpty")
+	}
+	if firstPort(0, 5173) != 5173 || firstPort(8080, 5173) != 8080 {
+		t.Error("--host-port renames; 0 keeps the port")
+	}
+}
