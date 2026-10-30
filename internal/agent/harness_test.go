@@ -1,25 +1,40 @@
 package agent
 
 import (
+	"io"
 	"strings"
 	"testing"
 )
 
+func TestThousands(t *testing.T) {
+	for n, want := range map[int64]string{0: "0", 999: "999", 1000: "1,000", 50000000: "50,000,000", -1234: "-1,234"} {
+		if got := Thousands(n); got != want {
+			t.Errorf("Thousands(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
 // stub is a harness with nothing behind it but a name.
 type stub struct{ name string }
 
-func (s stub) Name() string                     { return s.name }
-func (stub) Binary() string                     { return "stub" }
-func (stub) InstallHint() string                { return "true" }
-func (stub) Probe() string                      { return "true" }
-func (stub) Runner() []byte                     { return []byte("#!/bin/sh\n") }
-func (stub) Credentials() []Credential          { return nil }
-func (stub) TrustEnv(_, _ string) []string      { return nil }
-func (stub) LastError(string) string            { return "" }
-func (stub) ExplainError(m string) string       { return m }
-func (stub) AssistantText(string, int) []string { return nil }
-func (stub) TailSpeechCmd(int) string           { return "" }
-func (stub) TailResultsCmd(int) string          { return "" }
+func (s stub) Name() string                                          { return s.name }
+func (stub) Binary() string                                          { return "stub" }
+func (stub) InstallHint() string                                     { return "true" }
+func (stub) Probe() string                                           { return "true" }
+func (stub) Runner() []byte                                          { return []byte("#!/bin/sh\n") }
+func (stub) Credentials() []Credential                               { return nil }
+func (stub) TrustEnv(_, _ string) []string                           { return nil }
+func (stub) LastError(string) string                                 { return "" }
+func (stub) ExplainError(m string) string                            { return m }
+func (stub) AssistantText(string, int) []string                      { return nil }
+func (stub) TailSpeechCmd(int) string                                { return "" }
+func (stub) TailResultsCmd(int) string                               { return "" }
+func (stub) Delivery() []DeliveryPath                                { return CommonDelivery() }
+func (stub) Usage(io.Reader) (Consumption, bool)                     { return Consumption{}, false }
+func (stub) QuotaRequests(map[string]string) ([]QuotaRequest, error) { return nil, nil }
+func (stub) Overseer(OverseerOpts) ([]string, map[string][]byte, bool) {
+	return nil, nil, false
+}
 
 // The registry is package state; each test starts from an empty one and puts
 // back whatever it found, so tests cannot see each other's registrations.

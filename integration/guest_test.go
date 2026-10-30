@@ -66,6 +66,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --session-id|--resume) sid="$2"; rec="$rec $1 $2"; shift ;;
     -p) prompt="$2"; rec="$rec -p <prompt>"; shift ;;
+    --settings|--append-system-prompt) printf '%s' "$2" > "$D/${1#--}.$n"; rec="$rec $1 <value>"; shift ;;
     *) rec="$rec $1" ;;
   esac
   shift
@@ -165,6 +166,15 @@ func TestGuestVerbs(t *testing.T) {
 		if strings.Contains(second, "restarted after a failure") {
 			t.Error("a turn boundary must not be reported to the agent as a crash")
 		}
+		if strings.Contains(second, "Do the thing.") || !strings.Contains(pull(t, name, "/var/lib/rig-agent/fake/prompt.1"), "Do the thing.") {
+			t.Error("the brief opens the session and is not sent again on a resume")
+		}
+		if hook := pull(t, name, "/var/lib/rig-agent/fake/settings.1"); !strings.Contains(hook, "hook post-tool-use") {
+			t.Errorf("claude must be given rig's PostToolUse hook, got: %s", hook)
+		}
+		if !strings.Contains(status, "as rig agent start wrote them") {
+			t.Errorf("status must find the installed verifier, key and runner unchanged, got:\n%s", status)
+		}
 		delivered := pull(t, name, "/var/lib/rig-agent/fake/prompt.1") + second
 		if !strings.Contains(delivered, "hello from the operator") {
 			t.Error("the queued message was never delivered in any prompt")
@@ -182,12 +192,12 @@ func TestGuestVerbs(t *testing.T) {
 	t.Run("push refuses to clobber a guest-side edit", func(t *testing.T) {
 		src := t.TempDir()
 		os.WriteFile(filepath.Join(src, "a.txt"), []byte("from the host\n"), 0o644)
-		mustRig(t, "push", name, src, "--dest", "/work/pg")
+		mustRig(t, "push", name, src, "/work/pg")
 
 		if err := c.WriteFile(name, "/work/pg/a.txt", []byte("edited in the guest\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		out, err := rig(t, "push", name, src, "--dest", "/work/pg")
+		out, err := rig(t, "push", name, src, "/work/pg")
 		if err == nil {
 			t.Fatal("a second push overwrote a file the guest had changed")
 		}
@@ -198,13 +208,67 @@ func TestGuestVerbs(t *testing.T) {
 			t.Errorf("the refused push still changed the file: %q", got)
 		}
 
-		mustRig(t, "push", name, src, "--dest", "/work/pg", "--force")
+		mustRig(t, "push", "--force", name, src, "/work/pg")
 		if got := pull(t, name, "/work/pg/a.txt"); got != "from the host\n" {
 			t.Errorf("--force did not overwrite: %q", got)
 		}
 		// Re-pushing what rig itself wrote is the normal workflow and needs
 		// no --force.
-		mustRig(t, "push", name, src, "--dest", "/work/pg")
+		mustRig(t, "push", name, src, "/work/pg")
+	})
+
+	t.Run("pull copies a tree out and refuses to clobber a host-side edit", func(t *testing.T) {
+		// /work/pg holds a.txt from the push above.
+		if err := c.Mkdir(name, "/work/pg/sub", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.WriteFile(name, "/work/pg/sub/b.sh", []byte("one\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		dst := filepath.Join(t.TempDir(), "pg")
+		b := filepath.Join(dst, "sub", "b.sh")
+		read := func() string { s, _ := os.ReadFile(b); return string(s) }
+
+		mustRig(t, "pull", name, "/work/pg", dst)
+		if got := read(); got != "one\n" {
+			t.Fatalf("pulled %q", got)
+		}
+		if st, err := os.Stat(b); err != nil || st.Mode().Perm() != 0o755 {
+			t.Errorf("the guest's mode must come out with the file: %v", st.Mode())
+		}
+		if _, err := os.Stat(filepath.Join(dst, "pg")); err == nil {
+			t.Error("a directory named after the source appeared under the destination")
+		}
+
+		// The agent works on; pulling again is a refresh and needs no --force.
+		c.WriteFile(name, "/work/pg/sub/b.sh", []byte("two\n"), 0o755)
+		mustRig(t, "pull", name, "/work/pg", dst)
+		if got := read(); got != "two\n" {
+			t.Fatalf("a refresh left %q", got)
+		}
+
+		// A host edit is the operator's.
+		os.WriteFile(b, []byte("my notes\n"), 0o644)
+		c.WriteFile(name, "/work/pg/sub/b.sh", []byte("three\n"), 0o755)
+		out, err := rig(t, "pull", name, "/work/pg", dst)
+		if err == nil {
+			t.Fatal("a pull overwrote a file edited on the host")
+		}
+		if !strings.Contains(out, b) || !strings.Contains(out, "--force") {
+			t.Errorf("the refusal must name the file and the override, got:\n%s", out)
+		}
+		if got := read(); got != "my notes\n" {
+			t.Errorf("the refused pull still changed the file: %q", got)
+		}
+		mustRig(t, "pull", "--force", name, "/work/pg", dst)
+		if got := read(); got != "three\n" {
+			t.Errorf("--force did not overwrite: %q", got)
+		}
+
+		// A directory is never its listing on stdout.
+		if out, err := rig(t, "pull", name, "/work/pg", "-"); err == nil {
+			t.Errorf("pulling a directory to stdout must be refused, got:\n%s", out)
+		}
 	})
 
 	t.Run("forward carries a port and tears its guest half down", func(t *testing.T) {

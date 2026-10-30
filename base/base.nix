@@ -13,7 +13,11 @@
   virtualisation.incus.agent.enable = true;
 
   # No sshd. The NIC rejects ingress, so nothing could reach one; a listener
-  # that can never be reached is surface without a purpose.
+  # that can never be reached is surface without a purpose. Said explicitly,
+  # because nixpkgs' lxc-instance-common.nix (imported by the Incus VM
+  # module above) enables it with mkDefault and socket-activates it: left
+  # alone, every guest listened on [::]:22 and the vsock from boot.
+  services.openssh.enable = false;
 
   environment.systemPackages = with pkgs; [
     pciutils

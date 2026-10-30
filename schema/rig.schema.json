@@ -2,6 +2,113 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/tbrockman/rig/main/schema/rig.schema.json",
   "$defs": {
+    "Action": {
+      "properties": {
+        "send": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A message to send the agent through the channel, once per crossing, as `rig agent send` would."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "send"
+      ],
+      "description": "Action is what one watch threshold does when crossed."
+    },
+    "Agent": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "claude-code"
+          ]
+        },
+        {
+          "properties": {
+            "harness": {
+              "type": "string",
+              "enum": [
+                "claude-code"
+              ],
+              "description": "claude-code, the default when left out. The harness decides the binary, how it is installed and launched, and which credentials it authenticates with."
+            },
+            "prompt_file": {
+              "type": "string",
+              "description": "The brief: a file on this host, relative to this file, sent once when the session is created; later changes reach the agent as diffs."
+            },
+            "workdir": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Where the agent works in the guest: /work when left out."
+            },
+            "model": {
+              "type": "string",
+              "description": "The model, as the harness names it; the guest's default when left out."
+            },
+            "timeout": {
+              "type": "string",
+              "pattern": "^[0-9]+(\\.[0-9]+)?[smh]$",
+              "description": "Kill one run after this long (6h when left out) and resume it: the outer backstop for a run that never reaches a turn boundary, not a mission limit. A healthy run it cuts loses a few minutes to reconciliation; idle_timeout is the one that fires only on a run that has stopped working."
+            },
+            "idle_timeout": {
+              "type": "string",
+              "pattern": "^[0-9]+(\\.[0-9]+)?[smh]$",
+              "description": "Kill one run after this long with no tool call in its event log, and resume it with a note saying so. A run that is visibly working is never interrupted. Off when left out; 20m is a reasonable value."
+            },
+            "memory_max": {
+              "type": "string",
+              "pattern": "^[0-9]+(%|[KMGT])?$",
+              "description": "MemoryMax= on the agent's unit, in systemd's syntax: 80% when left out, of the guest's memory, so a runaway child is killed before the guest hits a global OOM and takes the agent with it."
+            },
+            "until_done": {
+              "type": "boolean",
+              "description": "Treat a clean exit as a turn boundary, not a result: resume until the agent runs `rig done`. Off when left out, as the honest default for an unattended process."
+            },
+            "budgets": {
+              "$ref": "#/$defs/Budgets",
+              "description": "Hard limits. Crossing one stops the agent the way `rig agent stop` does, at once, with a BUDGET marker saying which fired and at what value; the session is kept, so raising the budget and running `rig agent start` resumes it where it stopped."
+            },
+            "watch": {
+              "$ref": "#/$defs/Watch",
+              "description": "Soft thresholds. Each crossing and clearing is a `rig agent watch` event and a line in `rig agent status --full`; on: may add a message. Nothing here stops the agent."
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "description": "Agent is guest.agent in its long form."
+        }
+      ],
+      "description": "Agent is guest.agent in its long form."
+    },
+    "Budgets": {
+      "properties": {
+        "hours": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Wall-clock hours since `rig agent start`, restarts included."
+        },
+        "tokens": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "Tokens consumed over the session, in and out, cache reads and writes included, summed from the harness's own event log."
+        },
+        "usage": {
+          "$ref": "#/$defs/Usage",
+          "description": "A subscription window's utilization, where the credential has one (an OAuth login; an API key has none); read from the provider on the host."
+        },
+        "restarts": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "Restarts since `rig agent start`, turn boundaries included; beyond this the unit is not restarted again. Distinct from the burst limit that stops a flapping unit within the hour."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "minProperties": 1,
+      "description": "Budgets is guest.agent.budgets: what an unattended agent may not run past."
+    },
     "CPUs": {
       "oneOf": [
         {
@@ -213,7 +320,17 @@
             "$ref": "#/$defs/Port"
           },
           "type": "array",
-          "description": "Guest ports published on a host address, in Compose's syntax. Each one opens that port alone through the isolation."
+          "description": "Guest ports published on a host address, in Compose's syntax. Each one opens that port alone through the isolation ACL, through the network, and can be bound to an address other machines reach. For your own preview of something the guest serves, forwards is the default and this the exception."
+        },
+        "forwards": {
+          "items": {
+            "type": "integer",
+            "maximum": 65535,
+            "minimum": 1
+          },
+          "type": "array",
+          "uniqueItems": true,
+          "description": "Guest ports carried to this host's loopback over vsock, which is not IP: the isolation ACL that `rig verify` proves is untouched, the port exists on 127.0.0.1 of this host only, and a host process holds it (rig start leaves one, rig-forward-\u003cvm\u003e, that ends with the VM and is left again at the next start). The manifest form of `rig forward`; it works with network: none too, since no NIC is involved."
         },
         "volumes": {
           "items": {
@@ -237,11 +354,8 @@
           "description": "host: lend this host's keyboard and mouse to the guest as events from start to stop, toggled with both Ctrl keys. The guest needs rig.nixosModules.desktop."
         },
         "agent": {
-          "type": "string",
-          "enum": [
-            "claude-code"
-          ],
-          "description": "Which coding agent `rig agent` runs in this guest: claude-code, the default when left out. The harness decides the binary, how it is installed and launched, and which credentials it authenticates with."
+          "$ref": "#/$defs/Agent",
+          "description": "The coding agent `rig agent` runs in this guest, and how: the harness name alone (claude-code, the default), or a block with the run's settings, which `rig agent start` reads as its defaults; a flag given to it wins, and is recorded until the file's settings next change."
         },
         "proxy": {
           "$ref": "#/$defs/Proxy",
@@ -415,6 +529,31 @@
       "type": "object",
       "description": "Return is how the host takes a device back after rig stop."
     },
+    "Usage": {
+      "properties": {
+        "window": {
+          "type": "string",
+          "enum": [
+            "five_hour",
+            "seven_day"
+          ],
+          "description": "five_hour or seven_day."
+        },
+        "max": {
+          "type": "number",
+          "maximum": 1,
+          "exclusiveMinimum": 0,
+          "description": "The fraction of the window, above 0 and at most 1: 0.9 is 90%."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "window",
+        "max"
+      ],
+      "description": "Usage is a subscription window and a fraction of it."
+    },
     "Volume": {
       "oneOf": [
         {
@@ -453,6 +592,51 @@
         }
       ],
       "description": "Volume is one entry of guest.volumes: an Incus custom storage volume by name, and where the guest mounts it."
+    },
+    "Watch": {
+      "properties": {
+        "idle_minutes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "Minutes with no new commit on the branch checked out in the workdir."
+        },
+        "unit_minutes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "Minutes a transient unit the agent started (systemd-run: a dev server, a build) has been running."
+        },
+        "units": {
+          "type": "string",
+          "description": "A glob naming which transient units count, such as \"mono-*\". Every transient service but rig's own when left out."
+        },
+        "status_minutes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "Minutes STATUS.md has gone untouched."
+        },
+        "usage": {
+          "$ref": "#/$defs/Usage",
+          "description": "A subscription window's utilization, as under budgets, as a warning."
+        },
+        "on": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Action"
+          },
+          "propertyNames": {
+            "enum": [
+              "idle",
+              "unit",
+              "status",
+              "usage"
+            ]
+          },
+          "type": "object",
+          "description": "What a crossing does besides the event: by threshold (idle, unit, status, usage), a message to send the agent, so it is asked to account for itself. The event alone when left out."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "Watch is guest.agent.watch: facts about the run rig observes without the harness's help, each with the point past which the operator wants to hear."
     }
   },
   "properties": {

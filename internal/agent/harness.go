@@ -2,9 +2,11 @@ package agent
 
 import (
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Harness is what differs between agents. Everything else in this package is
@@ -18,7 +20,7 @@ import (
 //
 // The unit's environment:
 //
-//	HOME=/root  TERM=dumb  PATH=UnitPATH
+//	HOME=/root  TERM=dumb  PATH=UnitPATH (GuestBinDir first: `rig` is the guest build)
 //	RIG_AGENT_PATH       UnitPATH again. NixOS's /etc/profile exports PATH
 //	                     absolutely, so the login shell has thrown the unit's
 //	                     PATH away by the time the runner starts; the runner
@@ -28,9 +30,24 @@ import (
 //	RIG_AGENT_WORKDIR    where to run; the runner cds there, or exits 78.
 //	RIG_AGENT_SESSION    the session id rig chose and recorded (SessionKey); a
 //	                     UUIDv4. The runner starts or resumes this session and
-//	                     never another.
+//	                     never another, and the guest build of rig accepts only
+//	                     what the operator signed for it.
 //	RIG_AGENT_TIMEOUT    for timeout(1) around the agent: one run is killed
 //	                     after this long, and systemd resumes it.
+//	RIG_AGENT_IDLE_TIMEOUT  the guest rig's watchdog (`rig hook watchdog`)
+//	                     kills a run with nothing new in its event log for this
+//	                     long, and the runner resumes it with a note; unset for
+//	                     never.
+//	RIG_AGENT_STARTED    unix seconds `rig agent start` ran: what the hours
+//	                     budget counts from.
+//	RIG_AGENT_BUDGET_HOURS, _TOKENS, _RESTARTS
+//	                     the mission's limits the guest enforces: the runner
+//	                     checks restarts (systemd's NRestarts) and asks the
+//	                     watchdog about the rest before each launch, the
+//	                     watchdog checks hours and tokens during a run. One
+//	                     that fires leaves BUDGET and the runner exits
+//	                     ExitBudget (79), not restarted; the session is kept.
+//	RIG_AGENT_HARNESS    the harness's name, for the guest rig's parsers.
 //	RIG_AGENT_UNTIL_DONE "1" when a clean exit is a turn boundary, not a
 //	                     result; unset otherwise.
 //	RIG_AGENT_MODEL      a model name to pass through, when the operator gave
@@ -38,22 +55,42 @@ import (
 //
 // Files under Dir, all written by the shared side unless noted:
 //
-//	prompt            the brief (PromptPath).
-//	inbox             messages from `rig agent send` (InboxPath), each opened
-//	                  by Delimiter. The runner appends the whole file to the
-//	                  brief for this launch, copies it to inbox.delivered, and
-//	                  truncates it.
+//	bin/rig           the guest build of rig (GuestBinPath). Everything the
+//	                  runner knows of the operator comes through it: `rig
+//	                  brief`, `rig hook launch`, `rig hook settings`.
+//	operator.pub      what it verifies with; the private key stays on the host.
+//	brief.msg         the brief, signed (BriefPath). The runner reads it with
+//	                  `rig brief`, sends it as the prompt only when it creates
+//	                  the session, and exits ExitUnverified (77) without
+//	                  launching when it does not verify.
+//	inbox.d/          signed envelopes from `rig agent send`, `answer` and
+//	                  `brief` (channel.go has the rest of the channel's files).
+//	                  The runner appends what `rig hook launch` prints to this
+//	                  launch's prompt, and passes `rig hook settings` as
+//	                  claude's --settings so the PostToolUse hook delivers what
+//	                  arrives mid-turn.
+//	launch.token      written by the runner at every launch: a random token
+//	                  every delivery in this launch carries and the system
+//	                  prompt names, so the agent can tell rig's deliveries from
+//	                  text that only claims to be one.
 //	events.jsonl      the agent's event stream, appended by the runner
 //	                  (EventsPath). Its format is the harness's: TailSpeechCmd,
 //	                  TailResultsCmd, AssistantText and LastError read it.
 //	stderr.log        the agent's stderr and the runner's own notes, appended.
 //	last_exit         the agent's exit code, written by the runner after every
-//	                  run and removed when a new session starts.
+//	                  run (77 for a launch it refused), and removed when a new
+//	                  session starts.
 //	turn_boundary     left by the runner at exit 75, read and removed by the
 //	                  next launch; it is how a resume knows the previous exit
 //	                  was not a crash.
-//	DONE              created by the agent (DonePath) to say the brief is
-//	                  finished; removed by `rig agent start`.
+//	DONE              created by the agent (DonePath), with `rig done`, to say
+//	                  the brief is finished; removed by `rig agent start`.
+//	BUDGET            left by the watchdog or the runner when a budget fired:
+//	                  the reason on its first line. Removed by `rig agent
+//	                  start`, so raising the budget and starting resumes.
+//	watchdog          left when a run's limit fired (idle, by the watchdog;
+//	                  timeout, by the runner at exit 124): the reason, which the
+//	                  next launch's note repeats, then removes.
 //	STATUS.md         the agent's own, if its brief asks for one.
 //
 // Credentials are the environment in /run/rig/env, which the runner sources
@@ -64,30 +101,148 @@ import (
 // Resume or start is decided from evidence the runner keeps on disk (the
 // transcript for RIG_AGENT_SESSION), never from a marker set before the agent
 // ran: a launch that fails leaves nothing behind, so the next one starts
-// cleanly. The resumed brief says which of three things happened — the turn
-// ended (turn_boundary was present), the process crashed (systemd's NRestarts
-// for Unit is non-zero), or it was started deliberately — because an agent
-// told its process died when it merely stopped talking spends its next turn
-// reconciling a tree nothing interrupted. A new session removes last_exit.
+// cleanly. A resumed session is not sent the brief again: it already has it,
+// and a copy per turn boundary once made a third of a transcript. Its prompt
+// is a short note that points at `rig brief` and says which of three things
+// happened — the turn ended (turn_boundary was present), the process crashed
+// (systemd's NRestarts for Unit is non-zero), or it was started deliberately —
+// because an agent told its process died when it merely stopped talking
+// spends its next turn reconciling a tree nothing interrupted. A new session
+// removes last_exit.
 //
 // Exit codes: the agent's own, written to last_exit, except that under
 // RIG_AGENT_UNTIL_DONE a clean exit with no DONE marker leaves turn_boundary
 // and exits 75, so Restart=on-failure resumes the conversation. 0 means the
 // agent said it was finished; 127 is the binary missing from UnitPATH, which
-// `rig agent status` names.
+// `rig agent status` names; 77 (ExitUnverified) is a launch refused because
+// nothing from the operator verifies, said in stderr.log, and not restarted.
 type Harness interface {
-	Name() string                                        // "claude-code": the value rig.yaml's agent field takes, and what the instance records
-	Binary() string                                      // what the runner execs: "claude"
-	InstallHint() string                                 // the in-guest command that installs the binary onto UnitPATH
-	Probe() string                                       // a guest command that prints the binary's path on UnitPATH, or nothing
-	Runner() []byte                                      // the script the unit runs; it honours the runner contract documented in this package
-	Credentials() []Credential                           // the env vars it authenticates with, most preferred first
-	TrustEnv(caFile, bundleFile string) []string         // KEY=VALUE lines that make it trust an extra CA (bundleFile = system roots plus that CA, caFile = the CA alone)
-	LastError(resultsTail string) string                 // why a run stopped, from TailResultsCmd's output; "" when nothing
-	ExplainError(msg string) string                      // adds the fix to errors whose cause is not obvious from the text
-	AssistantText(speechTail string, limit int) []string // what the agent said, newest last, from TailSpeechCmd's output
-	TailSpeechCmd(limitBytes int) string                 // guest command: a bounded tail of the agent's own speech
-	TailResultsCmd(limitBytes int) string                // guest command: a bounded tail of the run's result events
+	Name() string                                                 // "claude-code": the value rig.yaml's agent field takes, and what the instance records
+	Binary() string                                               // what the runner execs: "claude"
+	InstallHint() string                                          // the in-guest command that installs the binary onto UnitPATH
+	Probe() string                                                // a guest command that prints the binary's path on UnitPATH, or nothing
+	Runner() []byte                                               // the script the unit runs; it honours the runner contract documented in this package
+	Credentials() []Credential                                    // the env vars it authenticates with, most preferred first
+	TrustEnv(caFile, bundleFile string) []string                  // KEY=VALUE lines that make it trust an extra CA (bundleFile = system roots plus that CA, caFile = the CA alone)
+	LastError(resultsTail string) string                          // why a run stopped, from TailResultsCmd's output; "" when nothing
+	ExplainError(msg string) string                               // adds the fix to errors whose cause is not obvious from the text
+	AssistantText(speechTail string, limit int) []string          // what the agent said, newest last, from TailSpeechCmd's output
+	TailSpeechCmd(limitBytes int) string                          // guest command: a bounded tail of the agent's own speech
+	TailResultsCmd(limitBytes int) string                         // guest command: a bounded tail of the run's result events
+	Delivery() []DeliveryPath                                     // how an operator's item reaches the agent, soonest first
+	Usage(events io.Reader) (Consumption, bool)                   // tokens consumed, summed from the event log; false for a harness that logs none
+	QuotaRequests(vars map[string]string) ([]QuotaRequest, error) // how to ask the provider for the credential's windows, best source first; none when the credential has no window (an API key)
+	// Overseer is the host-side half: how to launch this harness on the
+	// host as an overseer, with the system prompt, the mission, the model
+	// and the files (relative to OverseerOpts.FilesDir) that make it run
+	// without permission friction. ok is false for a harness rig cannot
+	// launch this way, which `rig overseer prompt` serves instead.
+	Overseer(o OverseerOpts) (argv []string, files map[string][]byte, ok bool)
+}
+
+// QuotaRequest is how the host asks a provider for a credential's windows:
+// the harness names the request and parses the answer, and the host makes
+// it (cmd/rig), since this package is in the guest build too and carries
+// no HTTP client. The credential is in Headers and goes nowhere else.
+// Source says, for the operator, whose credential this is: the env file's,
+// or a login on this host assumed to be the same account.
+type QuotaRequest struct {
+	Source  string
+	URL     string
+	Headers map[string]string
+	Parse   func(body []byte, now time.Time) (*Quota, error)
+}
+
+// Consumption is what a session has used, from the harness's own event log:
+// the four token counts the API bills, and what the harness says they cost.
+// Runs is how many results were summed; Live is the usage of a run still in
+// progress (its events so far, with no result yet), included in the counts.
+type Consumption struct {
+	Input      int64   `json:"input"`
+	Output     int64   `json:"output"`
+	CacheRead  int64   `json:"cache_read"`
+	CacheWrite int64   `json:"cache_write"`
+	CostUSD    float64 `json:"cost_usd,omitempty"`
+	Runs       int     `json:"runs"`
+	Live       bool    `json:"live,omitempty"`
+}
+
+// Total is every token, in and out, cached or not: what a tokens budget
+// counts, since each kind is billed and each kind is a bound on the run.
+func (c Consumption) Total() int64 { return c.Input + c.Output + c.CacheRead + c.CacheWrite }
+
+// Add sums two consumptions.
+func (c Consumption) Add(o Consumption) Consumption {
+	return Consumption{
+		Input: c.Input + o.Input, Output: c.Output + o.Output,
+		CacheRead: c.CacheRead + o.CacheRead, CacheWrite: c.CacheWrite + o.CacheWrite,
+		CostUSD: c.CostUSD + o.CostUSD, Runs: c.Runs + o.Runs, Live: c.Live || o.Live,
+	}
+}
+
+// String is the consumption for an operator: the total, then the parts.
+func (c Consumption) String() string {
+	s := fmt.Sprintf("%s tokens (in %s, out %s, cache read %s, cache write %s)",
+		Thousands(c.Total()), Thousands(c.Input), Thousands(c.Output), Thousands(c.CacheRead), Thousands(c.CacheWrite))
+	if c.CostUSD > 0 {
+		s += fmt.Sprintf(", $%.2f by the harness's count", c.CostUSD)
+	}
+	if c.Live {
+		s += ", a run still going"
+	}
+	return s
+}
+
+// Thousands renders n with separators, since token counts run to eight
+// digits and an operator reads 50,000,000 at a glance and 50000000 twice.
+func Thousands(n int64) string {
+	s := fmt.Sprint(n)
+	neg := strings.HasPrefix(s, "-")
+	s = strings.TrimPrefix(s, "-")
+	var b strings.Builder
+	for i, r := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(r)
+	}
+	if neg {
+		return "-" + b.String()
+	}
+	return b.String()
+}
+
+// DeliveryPath is one way an item from the operator reaches the agent, so
+// `rig agent send` can say truthfully when a message will arrive. The guest
+// build of rig provides ViaLaunch (the runner's prompt), ViaWait and
+// ViaInbox for every harness; a harness adds what its runner wires, such as
+// a hook that runs between tool calls.
+type DeliveryPath struct {
+	Via     string // ViaHook, ViaLaunch, ViaWait or ViaInbox
+	When    string // for an operator: "after the lead's next tool call"
+	MidTurn bool   // reaches a running agent without waiting for its turn to end, and without the agent asking
+}
+
+// CommonDelivery is what every harness gets from the guest build of rig,
+// after whatever paths the harness itself provides.
+func CommonDelivery() []DeliveryPath {
+	return []DeliveryPath{
+		{Via: ViaWait, When: "while it blocks in rig ask --wait or rig wait"},
+		{Via: ViaInbox, When: "when it runs rig inbox, if its brief tells it to"},
+		{Via: ViaLaunch, When: "at its next launch, in the prompt"},
+	}
+}
+
+// MidTurnPath is the first path of h that reaches a running agent unasked,
+// or false when the harness has none: a message to such an agent waits for
+// its next launch unless the agent polls.
+func MidTurnPath(h Harness) (DeliveryPath, bool) {
+	for _, p := range h.Delivery() {
+		if p.MidTurn {
+			return p, true
+		}
+	}
+	return DeliveryPath{}, false
 }
 
 // Credential is one way a harness authenticates.

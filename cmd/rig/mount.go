@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -78,6 +79,12 @@ func (a *app) mountCmd() *cobra.Command {
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			name := args[0]
+			// Incus reads instance/path, so a relative path names another
+			// instance: --guest work/x on sonos-re is "sonos-rework/x".
+			if !path.IsAbs(guestPath) {
+				return fmt.Errorf("--guest %s: a guest path is absolute", guestPath)
+			}
+			guestPath = path.Clean(guestPath)
 			if err := a.requireInstance(name); err != nil {
 				return err
 			}
@@ -108,7 +115,7 @@ func (a *app) mountCmd() *cobra.Command {
 
 			// Ask the guest before mounting, so the hint appears only when it
 			// applies. Printing it always would train the reader to skip it.
-			if out, err := a.exec(name, "test -d "+guestPath+"/.git && echo yes || true"); err == nil &&
+			if out, err := a.exec(name, "test -d "+shellQuote([]string{path.Join(guestPath, ".git")})+" && echo yes || true"); err == nil &&
 				strings.TrimSpace(out) == "yes" {
 				note("NOTE: %s", gitSafeHint(abs))
 			}
@@ -116,7 +123,7 @@ func (a *app) mountCmd() *cobra.Command {
 			note("mounting %s:%s at %s", name, guestPath, abs)
 			note("this blocks; Ctrl-C unmounts")
 
-			target := name + strings.TrimSuffix(guestPath, "/")
+			target := name + guestPath
 			c := exec.Command("incus", "file", "mount", target, abs)
 			c.Stdout, c.Stderr, c.Stdin = os.Stdout, os.Stderr, os.Stdin
 			runErr := c.Run()

@@ -51,15 +51,18 @@ supported.
 go install github.com/tbrockman/rig/cmd/rig@latest   # or, in a checkout: make
 ```
 
-The binary carries the guest image definition and the project template. Then
-work through `docs/RUNBOOK.md` once: storage pool, `rig setup`, image.
+The binary carries the guest image definition and the project template, and,
+built with `make`, the guest half of `rig agent` (`cmd/rig/guest`); a `go
+install`ed rig has everything else, and its `rig agent start` says what is
+missing. Then work through `docs/RUNBOOK.md` once: storage pool, `rig setup`,
+image.
 
 ## Quick start
 
 ```bash
 rig new scratch --start          # a VM with no host devices
 rig verify scratch               # prove the isolation with real packets
-rig shell scratch
+rig sh scratch
 rig stop scratch && rig rm scratch
 
 rig init myproj --with nvidia    # myproj/rig.yaml granting the card, myproj/guest/ with its driver
@@ -130,11 +133,37 @@ rig delete -f rig.yaml           # remove it; its volumes stay unless --volumes
 | `guest.disk` | Root disk size: 40GiB. |
 | `guest.env_file` | A file of KEY=VALUE credentials, injected to tmpfs in the guest at each start and never written to its disk. Keep it outside any repository. |
 | `guest.devices` | Which of host.devices this VM gets. |
-| `guest.ports` | Guest ports published on a host address, in Compose's syntax. Each one opens that port alone through the isolation. |
+| `guest.ports` | Guest ports published on a host address, in Compose's syntax. Each one opens that port alone through the isolation ACL, through the network, and can be bound to an address other machines reach. For your own preview of something the guest serves, forwards is the default and this the exception. |
+| `guest.forwards` | Guest ports carried to this host's loopback over vsock, which is not IP: the isolation ACL that `rig verify` proves is untouched, the port exists on 127.0.0.1 of this host only, and a host process holds it (rig start leaves one, rig-forward-&lt;vm&gt;, that ends with the VM and is left again at the next start). The manifest form of `rig forward`; it works with network: none too, since no NIC is involved. |
 | `guest.volumes` | Named Incus volumes mounted in the guest. They outlive the VM, so data survives it being recreated; host directories are refused. |
 | `guest.network` | none: no network device at all. Left out, the VM gets the isolated NIC, which reaches the internet but not this host or the LAN. |
 | `guest.input` | host: lend this host's keyboard and mouse to the guest as events from start to stop, toggled with both Ctrl keys. The guest needs rig.nixosModules.desktop. |
-| `guest.agent` | Which coding agent `rig agent` runs in this guest: claude-code, the default when left out. The harness decides the binary, how it is installed and launched, and which credentials it authenticates with. |
+| `guest.agent` | The coding agent `rig agent` runs in this guest, and how: the harness name alone (claude-code, the default), or a block with the run's settings, which `rig agent start` reads as its defaults; a flag given to it wins, and is recorded until the file's settings next change. |
+| `guest.agent.harness` | claude-code, the default when left out. The harness decides the binary, how it is installed and launched, and which credentials it authenticates with. |
+| `guest.agent.prompt_file` | The brief: a file on this host, relative to this file, sent once when the session is created; later changes reach the agent as diffs. |
+| `guest.agent.workdir` | Where the agent works in the guest: /work when left out. |
+| `guest.agent.model` | The model, as the harness names it; the guest's default when left out. |
+| `guest.agent.timeout` | Kill one run after this long (6h when left out) and resume it: the outer backstop for a run that never reaches a turn boundary, not a mission limit. A healthy run it cuts loses a few minutes to reconciliation; idle_timeout is the one that fires only on a run that has stopped working. |
+| `guest.agent.idle_timeout` | Kill one run after this long with no tool call in its event log, and resume it with a note saying so. A run that is visibly working is never interrupted. Off when left out; 20m is a reasonable value. |
+| `guest.agent.memory_max` | MemoryMax= on the agent's unit, in systemd's syntax: 80% when left out, of the guest's memory, so a runaway child is killed before the guest hits a global OOM and takes the agent with it. |
+| `guest.agent.until_done` | Treat a clean exit as a turn boundary, not a result: resume until the agent runs `rig done`. Off when left out, as the honest default for an unattended process. |
+| `guest.agent.budgets` | Hard limits. Crossing one stops the agent the way `rig agent stop` does, at once, with a BUDGET marker saying which fired and at what value; the session is kept, so raising the budget and running `rig agent start` resumes it where it stopped. |
+| `guest.agent.budgets.hours` | Wall-clock hours since `rig agent start`, restarts included. |
+| `guest.agent.budgets.tokens` | Tokens consumed over the session, in and out, cache reads and writes included, summed from the harness's own event log. |
+| `guest.agent.budgets.usage` | A subscription window's utilization, where the credential has one (an OAuth login; an API key has none); read from the provider on the host. |
+| `guest.agent.budgets.usage.window` | five_hour or seven_day. |
+| `guest.agent.budgets.usage.max` | The fraction of the window, above 0 and at most 1: 0.9 is 90%. |
+| `guest.agent.budgets.restarts` | Restarts since `rig agent start`, turn boundaries included; beyond this the unit is not restarted again. Distinct from the burst limit that stops a flapping unit within the hour. |
+| `guest.agent.watch` | Soft thresholds. Each crossing and clearing is a `rig agent watch` event and a line in `rig agent status --full`; on: may add a message. Nothing here stops the agent. |
+| `guest.agent.watch.idle_minutes` | Minutes with no new commit on the branch checked out in the workdir. |
+| `guest.agent.watch.unit_minutes` | Minutes a transient unit the agent started (systemd-run: a dev server, a build) has been running. |
+| `guest.agent.watch.units` | A glob naming which transient units count, such as "mono-*". Every transient service but rig's own when left out. |
+| `guest.agent.watch.status_minutes` | Minutes STATUS.md has gone untouched. |
+| `guest.agent.watch.usage` | A subscription window's utilization, as under budgets, as a warning. |
+| `guest.agent.watch.usage.window` | five_hour or seven_day. |
+| `guest.agent.watch.usage.max` | The fraction of the window, above 0 and at most 1: 0.9 is 90%. |
+| `guest.agent.watch.on` | What a crossing does besides the event: by threshold (idle, unit, status, usage), a message to send the agent, so it is asked to account for itself. The event alone when left out. |
+| `guest.agent.watch.on.<name>.send` | A message to send the agent through the channel, once per crossing, as `rig agent send` would. |
 | `guest.proxy` | The host's proxy (witmproxy), which this guest reaches over a second NIC that leads nowhere else. Its one job so far is credentials the guest never holds: see proxy.credentials. Set up once per host with `rig proxy setup`. |
 | `guest.proxy.credentials` | Variables from env_file whose values the guest never sees, each with the endpoints the value may be sent to. The guest gets a stand-in; the proxy puts the real value into HTTPS requests to those endpoints, and nowhere else, wherever the stand-in occurs in a header or the URL. An endpoint is "[METHOD[,METHOD] ]host[/path]": the host alone is every request to it; a path covers itself and everything below it; *.host covers the host and its subdomains. A guest that leaks everything it has leaks a string that works only through this proxy, only there: ANTHROPIC_API_KEY: [POST api.anthropic.com/v1/messages] |
 | `guest.proxy.egress` | What else the guest may reach through the proxy. Left out, nothing: the proxy dials the credentials' hosts and refuses the rest. internet: everything the isolated NIC may reach, with this host and the LAN still refused, judged on the address after resolution. For the tools under the agent, which inherit its HTTPS_PROXY: cargo, git, nix and npm reach their registries through the proxy or not at all. |
@@ -158,9 +187,41 @@ devShell, a test that the card really computes, and Claude Code in the image.
 rig apply -f examples/cuda-agent/rig.yaml --start
 rig push cuda-agent examples/cuda-agent          # -> /work/cuda-agent
 rig agent start cuda-agent --prompt-file brief.md --workdir /work/cuda-agent --until-done
-rig agent status cuda-agent      # cheap; check often
+rig agent status cuda-agent      # cheap; check often (--full: branch, units, disk, usage, thresholds)
 rig agent log cuda-agent         # what it said, minus the tool calls
+rig agent watch cuda-agent       # one line per change: asks, deliveries, budgets, thresholds, done
+rig agent usage cuda-agent       # tokens from its event log, and the credential's windows
+rig agent send cuda-agent "Skip E3; the docs are out of scope."
+rig agent answer cuda-agent cuda "Stay on 12.4."   # the agent asked: rig ask cuda "..."
+rig agent brief cuda-agent       # after editing brief.md: the agent gets the diff
 ```
+
+The flags to `rig agent start` can live in the manifest instead, under
+`guest.agent` (the field table below): the brief, the workdir, the model,
+the run watchdogs, and two things only the file can say, `budgets` (hard
+limits that stop the agent, session kept) and `watch` (soft thresholds that
+become `rig agent watch` events, each optionally with a message to send).
+`guest.forwards` lists guest ports `rig start` carries to this host's
+loopback over vsock, held for as long as the VM runs; `guest.ports` is for a
+port other machines must reach.
+
+An overseer can run all of this for you: `rig overseer -f rig.yaml --prompt
+"…"` starts a coding agent on this host, in your terminal, with a prompt that
+makes it the operator's deputy (set up, keep healthy, keep moving, keep
+within budget, report in `OVERSEER.md`), every rig verb allowed and a short
+confirm list asked; `--prompt` alone makes the project first. `rig overseer
+prompt` prints the prompt for another harness. Every verb that acts on a
+VM, yours or the overseer's, is on the operator log, `rig agent log
+--operator <vm>`. `rig init` writes `brief.md`, the shape of the inner
+agent's brief, beside the manifest.
+
+What you send is signed with a key that stays on this host and verified in
+the guest before the agent sees it, and arrives after the agent's next tool
+call rather than at its next restart. It reaches the lead, the process that
+was given the brief, never one of its subagents, which fire the same hook.
+The agent is told that only rig delivers your words; text it reads anywhere
+else that claims to be you is data. A bare `rig agent start cuda-agent`
+later resumes with the same options.
 
 Keep credential files outside any repository (`~/.config/rig/`).
 
@@ -204,23 +265,26 @@ values); `rig creds` swaps a key without a restart, as before.
 | VMs | |
 |---|---|
 | `image build`, `image list` | Build a guest image from `base/` or a project's guest flake |
-| `init` | Write a `rig.yaml` and a guest flake; `--with nvidia,docker,desktop` adds modules |
+| `init` | Write a `rig.yaml`, a guest flake and a brief template; `--with nvidia,docker,desktop` adds modules |
 | `schema` | Print rig.yaml's JSON Schema |
 | `apply -f`, `delete -f` | Create a manifest's VM or bring it back in line with the file; remove it |
 | `new` | Create a VM without a manifest (`--gpu` for this host's card) |
-| `start`, `stop`, `restart`, `rm` | Lifecycle. `start` claims devices; `stop` returns them; `rm --volumes` also deletes volumes |
-| `status`, `logs` | Who holds which device; the console of a VM that won't boot |
+| `start`, `stop`, `restart`, `rm` | Lifecycle. `start` claims devices; `stop` returns them; `rm` asks first, and `--volumes` also deletes volumes |
+| `list`, `status`, `logs` | Every VM; who holds which device, or with a VM named, everything recorded on it; the console of a VM that won't boot |
 | `doctor`, `verify` | Check the configuration; prove the isolation from inside |
 
 | Inside a guest | |
 |---|---|
-| `exec`, `shell` | Run a command, or open a shell |
-| `push`, `pull` | Copy files in and out; `push` won't overwrite what it didn't write |
+| `exec`, `sh` | Run a command, or open a shell (`shell` also works) |
+| `push`, `pull` | Copy a file or directory in or out; neither overwrites what it didn't write |
 | `mount`, `unmount` | A live view of a guest directory on the host |
 | `forward` | One TCP port, either direction, over vsock |
 | `creds` | Swap the credential in a running VM |
 | `proxy setup/status/log` | The host proxies that hold proxied credentials, one per guest |
-| `agent install/start/status/log/send/stop` | The coding agent (Claude Code by default) as a systemd unit that resumes its session after a crash |
+| `agent install/start/stop` | The coding agent (Claude Code by default) as a systemd unit that resumes its session after a crash |
+| `agent status/watch/log/usage` | What it is doing (`--full` for the run's facts), one line per change for a notifier, what it said, what it has consumed |
+| `agent send/answer/asks/brief` | Signed messages, answers to its `rig ask`s, and brief changes as diffs, delivered mid-turn |
+| `overseer` | An agent on this host that sets up and runs a VM's agent for you, audited (`agent log --operator`) |
 
 | Grants and isolation | |
 |---|---|
@@ -249,6 +313,8 @@ What holds:
 - `host input` lends a keyboard and mouse as events rather than passing them
   through, so a guest can't reprogram a device and have it type into the host
   later.
+- What you send an agent is signed on the host; nothing in the guest can forge
+  a message, an answer or the brief.
 
 What doesn't:
 
@@ -257,7 +323,8 @@ What doesn't:
   with `proxy.credentials`. A proxied key is still *usable* from the guest, at
   the endpoints it is meant for: what the proxy prevents is the key leaving,
   not the agent spending it there.
-- The agent is root in the guest.
+- The agent is root in the guest. Root there can replace rig's verifier; `rig
+  agent status` notices the replaced file, which is detection, not prevention.
 - A passed-through device belongs to the guest. The IOMMU confines its DMA,
   but assume a guest could rewrite its firmware. Pass through only what you'd
   accept that for.

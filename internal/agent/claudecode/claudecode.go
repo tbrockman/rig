@@ -5,8 +5,11 @@
 package claudecode
 
 import (
+	"bufio"
+	"bytes"
 	_ "embed"
 	"encoding/json"
+	"io"
 	"strings"
 
 	"github.com/tbrockman/rig/internal/agent"
@@ -203,4 +206,84 @@ func (Harness) TailSpeechCmd(limitBytes int) string {
 // TailResultsCmd tails the "result" events, where a failure reason lives.
 func (Harness) TailResultsCmd(limitBytes int) string {
 	return agent.TailCmd(`"type":"result"`, limitBytes)
+}
+
+// usage is the token counts as the API reports them, in a result event and
+// in an assistant event's message alike.
+type usage struct {
+	Input      int64 `json:"input_tokens"`
+	Output     int64 `json:"output_tokens"`
+	CacheWrite int64 `json:"cache_creation_input_tokens"`
+	CacheRead  int64 `json:"cache_read_input_tokens"`
+}
+
+func (u usage) consumption() agent.Consumption {
+	return agent.Consumption{Input: u.Input, Output: u.Output, CacheRead: u.CacheRead, CacheWrite: u.CacheWrite}
+}
+
+// Usage sums what the stream-json log says the session consumed. Each
+// `result` event carries its run's usage and cost, so those are summed as
+// they are. A run still going has no result yet; its `assistant` events
+// carry each API response's usage, repeated once per content block under
+// one message id, so those after the last result are summed once per id
+// and reported as live. A run that was killed left no result and its
+// assistant events are counted the same way, which is why the live sum is
+// not reset at a new system init. Reads line by line: a tool result is
+// routinely hundreds of kilobytes and the log can be hundreds of megabytes.
+func (Harness) Usage(events io.Reader) (agent.Consumption, bool) {
+	var total, live agent.Consumption
+	seen := map[string]bool{}
+	r := bufio.NewReaderSize(events, 1<<20)
+	for {
+		line, err := r.ReadBytes('\n')
+		if len(line) > 0 {
+			switch {
+			case bytes.HasPrefix(line, []byte(`{"type":"result"`)):
+				var ev struct {
+					Usage usage   `json:"usage"`
+					Cost  float64 `json:"total_cost_usd"`
+				}
+				if json.Unmarshal(line, &ev) == nil {
+					c := ev.Usage.consumption()
+					c.CostUSD, c.Runs = ev.Cost, 1
+					total = total.Add(c)
+					// The run's own events were counted toward it; the
+					// result is the authority for the whole run.
+					live = agent.Consumption{}
+					clear(seen)
+				}
+			case bytes.HasPrefix(line, []byte(`{"type":"assistant"`)):
+				var ev struct {
+					Message struct {
+						ID    string `json:"id"`
+						Usage usage  `json:"usage"`
+					} `json:"message"`
+				}
+				if json.Unmarshal(line, &ev) == nil && ev.Message.ID != "" && !seen[ev.Message.ID] {
+					seen[ev.Message.ID] = true
+					live = live.Add(ev.Message.Usage.consumption())
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	if live.Total() > 0 {
+		live.Live = true
+		total = total.Add(live)
+	}
+	return total, true
+}
+
+// Delivery is how an item reaches Claude Code: the PostToolUse hook the
+// runner wires with --settings runs after every tool call, the lead's and
+// its subagents' alike, and the guest build delivers only when the hook's
+// input proves the lead (guest.LeadProof); then what every harness has.
+func (Harness) Delivery() []agent.DeliveryPath {
+	return append([]agent.DeliveryPath{{
+		Via:     agent.ViaHook,
+		When:    "after the lead's next tool call, through its PostToolUse hook (a subagent's tool call does not take it)",
+		MidTurn: true,
+	}}, agent.CommonDelivery()...)
 }

@@ -42,6 +42,29 @@ guest:
   proxy:
     credentials:
       ANTHROPIC_API_KEY: [api.anthropic.com]
+  forwards: [5173, 9222]
+  agent:
+    harness: claude-code
+    prompt_file: brief.md
+    workdir: /work/myproj
+    model: claude-fable-5-1
+    timeout: 6h
+    idle_timeout: 20m
+    memory_max: 80%
+    until_done: true
+    budgets:
+      hours: 24
+      tokens: 50000000
+      usage: { window: five_hour, max: 0.9 }
+      restarts: 10
+    watch:
+      idle_minutes: 120
+      unit_minutes: 30
+      status_minutes: 90
+      usage: { window: five_hour, max: 0.7 }
+      on:
+        idle: { send: "No commit in two hours. Say in STATUS.md what you are waiting on." }
+        status: { send: "STATUS.md is stale. Rewrite it." }
 `
 
 func TestParseReadsTheExample(t *testing.T) {
@@ -140,8 +163,31 @@ var badEdits = map[string]func(string) string{
 	"proxied endpoint with a lower-case method": func(s string) string {
 		return strings.Replace(s, "[api.anthropic.com]", `["post api.anthropic.com"]`, 1)
 	},
-	"unknown agent": func(s string) string {
-		return strings.Replace(s, "  name: myproj\n", "  name: myproj\n  agent: codex\n", 1)
+	"unknown agent": func(s string) string { return strings.Replace(s, "harness: claude-code", "harness: codex", 1) },
+	// The agent block's durations are one number and one unit, as timeout(1)
+	// reads them; its budgets and thresholds are positive, its windows named.
+	"agent timeout with two units": func(s string) string { return strings.Replace(s, "timeout: 6h", "timeout: 1h30m", 1) },
+	"agent idle timeout in words":  func(s string) string { return strings.Replace(s, "idle_timeout: 20m", "idle_timeout: soon", 1) },
+	"agent memory max in words":    func(s string) string { return strings.Replace(s, "memory_max: 80%", "memory_max: lots", 1) },
+	"agent workdir relative":       func(s string) string { return strings.Replace(s, "workdir: /work/myproj", "workdir: myproj", 1) },
+	"usage window unknown": func(s string) string {
+		return strings.Replace(s, "window: five_hour, max: 0.9", "window: hourly, max: 0.9", 1)
+	},
+	"usage max above one": func(s string) string { return strings.Replace(s, "max: 0.9 }", "max: 9 }", 1) },
+	"negative budget":     func(s string) string { return strings.Replace(s, "hours: 24", "hours: -1", 1) },
+	"empty budgets": func(s string) string {
+		return strings.Replace(s, "    budgets:\n      hours: 24\n      tokens: 50000000\n      usage: { window: five_hour, max: 0.9 }\n      restarts: 10\n", "    budgets: {}\n", 1)
+	},
+	"on names an unknown threshold": func(s string) string { return strings.Replace(s, "idle: { send:", "commit: { send:", 1) },
+	"on without its threshold":      func(s string) string { return strings.Replace(s, "      status_minutes: 90\n", "", 1) },
+	"on with nothing to send": func(s string) string {
+		return strings.Replace(s, `send: "STATUS.md is stale. Rewrite it."`, `send: ""`, 1)
+	},
+	"forward out of range": func(s string) string {
+		return strings.Replace(s, "forwards: [5173, 9222]", "forwards: [5173, 92220]", 1)
+	},
+	"forward listed twice": func(s string) string {
+		return strings.Replace(s, "forwards: [5173, 9222]", "forwards: [5173, 5173]", 1)
 	},
 	"proxied host with a port": func(s string) string {
 		return strings.Replace(s, "[api.anthropic.com]", "[\"api.anthropic.com:443\"]", 1)
@@ -366,14 +412,53 @@ func TestEndpointGrammar(t *testing.T) {
 }
 
 // An agent the manifest names must be one rig runs; leaving it out is the
-// first harness.
+// first harness. The short form is the name alone.
 func TestAgentIsAKnownHarness(t *testing.T) {
 	m, err := Parse([]byte("guest:\n  name: a\n  image: rig-base\n  agent: claude-code\n"))
-	if err != nil || m.Guest.Agent != "claude-code" {
+	if err != nil || m.AgentHarness() != "claude-code" || m.Guest.Agent.IsZero() {
 		t.Fatalf("agent: %v %+v", err, m)
 	}
 	if Harnesses[0] != "claude-code" {
 		t.Errorf("the default harness is %q", Harnesses[0])
+	}
+	if m, err := Parse([]byte("guest:\n  name: a\n  image: rig-base\n")); err != nil || !m.Guest.Agent.IsZero() {
+		t.Errorf("left out, the section is zero: %v %+v", err, m.Guest.Agent)
+	}
+}
+
+// The long form carries the run's settings, the budgets and the thresholds;
+// its prompt file resolves against the manifest's directory.
+func TestAgentBlockIsTheRunsSettings(t *testing.T) {
+	m, err := Parse([]byte(example))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := m.Guest.Agent
+	if a.Harness != "claude-code" || a.PromptFile != "brief.md" || a.Workdir != "/work/myproj" || a.Model != "claude-fable-5-1" ||
+		a.Timeout != "6h" || a.IdleTimeout != "20m" || a.MemoryMax != "80%" || !a.UntilDone {
+		t.Errorf("settings: %+v", a)
+	}
+	if b := a.Budgets; b == nil || b.Hours != 24 || b.Tokens != 50000000 || b.Restarts != 10 || b.Usage == nil || b.Usage.Window != "five_hour" || b.Usage.Max != 0.9 {
+		t.Errorf("budgets: %+v", a.Budgets)
+	}
+	if w := a.Watch; w == nil || w.IdleMinutes != 120 || w.UnitMinutes != 30 || w.StatusMinutes != 90 || w.Usage == nil || w.Usage.Max != 0.7 ||
+		len(w.On) != 2 || !strings.HasPrefix(w.On["idle"].Send, "No commit") {
+		t.Errorf("watch: %+v", a.Watch)
+	}
+	if m.Guest.Forwards[0] != 5173 || m.Guest.Forwards[1] != 9222 {
+		t.Errorf("forwards: %v", m.Guest.Forwards)
+	}
+	if d, err := ParseDuration(a.IdleTimeout); err != nil || d.Minutes() != 20 {
+		t.Errorf("idle_timeout: %v %v", d, err)
+	}
+	m.Dir = "/home/me/proj"
+	if r := m.ResolvedAgent(); r.PromptFile != "/home/me/proj/brief.md" || r.Model != a.Model {
+		t.Errorf("resolved: %+v", r)
+	}
+	// A watch block whose on: names a threshold without setting it is a rule
+	// that can never fire, which is the schema's blind spot and validate's job.
+	if _, err := Parse([]byte(badEdits["on without its threshold"](example))); err == nil || !strings.Contains(err.Error(), "no status threshold") {
+		t.Errorf("want the missing threshold named, got %v", err)
 	}
 }
 

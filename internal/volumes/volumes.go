@@ -51,6 +51,17 @@ func Held(inst *incus.Instance) []string {
 	return out
 }
 
+// Mounts maps each volume an instance mounts to its path in the guest.
+func Mounts(inst *incus.Instance) map[string]string {
+	out := map[string]string{}
+	for name, d := range inst.Devices {
+		if strings.HasPrefix(name, devicePrefix) && d.Type() == "disk" {
+			out[d["source"]] = d["path"]
+		}
+	}
+	return out
+}
+
 // Plan works out the instance's devices with exactly the declared volumes
 // mounted. Devices rig did not put there are left alone. Pure.
 func Plan(inst *incus.Instance, vols []manifest.Volume, pool string) (map[string]incus.Device, []string) {

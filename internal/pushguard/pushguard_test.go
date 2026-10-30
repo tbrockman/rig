@@ -7,16 +7,22 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tbrockman/rig/internal/incus"
 )
 
 // fakeGuest is an in-memory stand-in for the guest filesystem.
 type fakeGuest struct {
 	files map[string][]byte
+	dirs  map[string]bool
 }
 
-func newGuest() *fakeGuest { return &fakeGuest{files: map[string][]byte{}} }
+func newGuest() *fakeGuest { return &fakeGuest{files: map[string][]byte{}, dirs: map[string]bool{}} }
 
 func (g *fakeGuest) Pull(_, p string) ([]byte, error) {
+	if g.dirs[p] {
+		return nil, &incus.NotAFileError{Path: p, Type: "directory"}
+	}
 	b, ok := g.files[p]
 	if !ok {
 		return nil, os.ErrNotExist
@@ -140,6 +146,42 @@ func TestUnrecordedGuestFileIsProtected(t *testing.T) {
 	}
 	if !strings.Contains(conflicts[0].Why, "no record") {
 		t.Fatalf("reason should distinguish unrecorded from modified, got %q", conflicts[0].Why)
+	}
+}
+
+// One file is guarded exactly as a directory of one would be.
+func TestASingleFileIsGuardedToo(t *testing.T) {
+	g := newGuest()
+	dir := stage(t, map[string]string{"MISSION.md": "v1"})
+	file := filepath.Join(dir, "MISSION.md")
+	if c := push(t, g, file, "/seed/MISSION.md"); c != nil {
+		t.Fatalf("first push reported conflicts: %v", c)
+	}
+	if string(g.files["/seed/MISSION.md"]) != "v1" {
+		t.Fatal("push did not land at the path it was given")
+	}
+	g.files["/seed/MISSION.md"] = []byte("v1, amended by the agent")
+	conflicts, err := Check(g, "vm", file, "/seed/MISSION.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conflicts) != 1 || conflicts[0].GuestPath != "/seed/MISSION.md" {
+		t.Fatalf("an edited single file must be protected: %v", conflicts)
+	}
+}
+
+// A guest directory where the push would write a file is not "not there":
+// treating it so sends the write on to fail, or worse, into it.
+func TestAGuestDirectoryInTheWayIsAConflict(t *testing.T) {
+	g := newGuest()
+	g.dirs["/seed/notes"] = true
+	dir := stage(t, map[string]string{"notes": "a file"})
+	conflicts, err := Check(g, "vm", dir, "/seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conflicts) != 1 || !strings.Contains(conflicts[0].Why, "directory") {
+		t.Fatalf("want one conflict naming the directory, got %v", conflicts)
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -117,8 +118,18 @@ type Guest struct {
 	// Which of host.devices this VM gets.
 	Devices []string `yaml:"devices,omitempty"`
 	// Guest ports published on a host address, in Compose's syntax. Each one
-	// opens that port alone through the isolation.
+	// opens that port alone through the isolation ACL, through the network,
+	// and can be bound to an address other machines reach. For your own
+	// preview of something the guest serves, forwards is the default and
+	// this the exception.
 	Ports []Port `yaml:"ports,omitempty"`
+	// Guest ports carried to this host's loopback over vsock, which is not
+	// IP: the isolation ACL that `rig verify` proves is untouched, the port
+	// exists on 127.0.0.1 of this host only, and a host process holds it
+	// (rig start leaves one, rig-forward-<vm>, that ends with the VM and is
+	// left again at the next start). The manifest form of `rig forward`;
+	// it works with network: none too, since no NIC is involved.
+	Forwards []int `yaml:"forwards,omitempty"`
 	// Named Incus volumes mounted in the guest. They outlive the VM, so data
 	// survives it being recreated; host directories are refused.
 	Volumes []Volume `yaml:"volumes,omitempty"`
@@ -129,10 +140,11 @@ type Guest struct {
 	// start to stop, toggled with both Ctrl keys. The guest needs
 	// rig.nixosModules.desktop.
 	Input string `yaml:"input,omitempty" jsonschema:"enum=host"`
-	// Which coding agent `rig agent` runs in this guest: claude-code, the
-	// default when left out. The harness decides the binary, how it is
-	// installed and launched, and which credentials it authenticates with.
-	Agent string `yaml:"agent,omitempty" jsonschema:"enum=claude-code"`
+	// The coding agent `rig agent` runs in this guest, and how: the harness
+	// name alone (claude-code, the default), or a block with the run's
+	// settings, which `rig agent start` reads as its defaults; a flag given
+	// to it wins, and is recorded until the file's settings next change.
+	Agent Agent `yaml:"agent,omitempty"`
 	// The host's proxy (witmproxy), which this guest reaches over a second
 	// NIC that leads nowhere else. Its one job so far is credentials the
 	// guest never holds: see proxy.credentials. Set up once per host with
@@ -195,6 +207,229 @@ func (e Endpoint) String() string {
 
 // Harnesses are the agents rig knows how to run; the first is the default.
 var Harnesses = []string{"claude-code"}
+
+// Agent is guest.agent in its long form. Everything here is a default for
+// `rig agent start`, except budgets and watch, which it enforces and
+// `rig agent watch` reports.
+type Agent struct {
+	// claude-code, the default when left out. The harness decides the
+	// binary, how it is installed and launched, and which credentials it
+	// authenticates with.
+	Harness string `yaml:"harness,omitempty" jsonschema:"enum=claude-code"`
+	// The brief: a file on this host, relative to this file, sent once when
+	// the session is created; later changes reach the agent as diffs.
+	PromptFile string `yaml:"prompt_file,omitempty"`
+	// Where the agent works in the guest: /work when left out.
+	Workdir string `yaml:"workdir,omitempty"`
+	// The model, as the harness names it; the guest's default when left out.
+	Model string `yaml:"model,omitempty"`
+	// Kill one run after this long (6h when left out) and resume it: the
+	// outer backstop for a run that never reaches a turn boundary, not a
+	// mission limit. A healthy run it cuts loses a few minutes to
+	// reconciliation; idle_timeout is the one that fires only on a run that
+	// has stopped working.
+	Timeout string `yaml:"timeout,omitempty"`
+	// Kill one run after this long with no tool call in its event log, and
+	// resume it with a note saying so. A run that is visibly working is never
+	// interrupted. Off when left out; 20m is a reasonable value.
+	IdleTimeout string `yaml:"idle_timeout,omitempty"`
+	// MemoryMax= on the agent's unit, in systemd's syntax: 80% when left out,
+	// of the guest's memory, so a runaway child is killed before the guest
+	// hits a global OOM and takes the agent with it.
+	MemoryMax string `yaml:"memory_max,omitempty"`
+	// Treat a clean exit as a turn boundary, not a result: resume until the
+	// agent runs `rig done`. Off when left out, as the honest default for an
+	// unattended process.
+	UntilDone bool `yaml:"until_done,omitempty"`
+	// Hard limits. Crossing one stops the agent the way `rig agent stop`
+	// does, at once, with a BUDGET marker saying which fired and at what
+	// value; the session is kept, so raising the budget and running
+	// `rig agent start` resumes it where it stopped.
+	Budgets *Budgets `yaml:"budgets,omitempty"`
+	// Soft thresholds. Each crossing and clearing is a `rig agent watch`
+	// event and a line in `rig agent status --full`; on: may add a message.
+	// Nothing here stops the agent.
+	Watch *Watch `yaml:"watch,omitempty"`
+}
+
+// Budgets is guest.agent.budgets: what an unattended agent may not run
+// past. hours, restarts and tokens are enforced in the guest, by the
+// runner, so the stop depends on nobody watching from the host; usage needs
+// the credential and is enforced by `rig agent watch` on the host.
+type Budgets struct {
+	// Wall-clock hours since `rig agent start`, restarts included.
+	Hours float64 `yaml:"hours,omitempty"`
+	// Tokens consumed over the session, in and out, cache reads and writes
+	// included, summed from the harness's own event log.
+	Tokens int64 `yaml:"tokens,omitempty"`
+	// A subscription window's utilization, where the credential has one (an
+	// OAuth login; an API key has none); read from the provider on the host.
+	Usage *Usage `yaml:"usage,omitempty"`
+	// Restarts since `rig agent start`, turn boundaries included; beyond
+	// this the unit is not restarted again. Distinct from the burst limit
+	// that stops a flapping unit within the hour.
+	Restarts int `yaml:"restarts,omitempty"`
+}
+
+// Usage is a subscription window and a fraction of it.
+type Usage struct {
+	// five_hour or seven_day.
+	Window string `yaml:"window" jsonschema:"required,enum=five_hour,enum=seven_day"`
+	// The fraction of the window, above 0 and at most 1: 0.9 is 90%.
+	Max float64 `yaml:"max" jsonschema:"required"`
+}
+
+// Watch is guest.agent.watch: facts about the run rig observes without the
+// harness's help, each with the point past which the operator wants to hear.
+type Watch struct {
+	// Minutes with no new commit on the branch checked out in the workdir.
+	IdleMinutes int `yaml:"idle_minutes,omitempty"`
+	// Minutes a transient unit the agent started (systemd-run: a dev server,
+	// a build) has been running.
+	UnitMinutes int `yaml:"unit_minutes,omitempty"`
+	// A glob naming which transient units count, such as "mono-*". Every
+	// transient service but rig's own when left out.
+	Units string `yaml:"units,omitempty"`
+	// Minutes STATUS.md has gone untouched.
+	StatusMinutes int `yaml:"status_minutes,omitempty"`
+	// A subscription window's utilization, as under budgets, as a warning.
+	Usage *Usage `yaml:"usage,omitempty"`
+	// What a crossing does besides the event: by threshold (idle, unit,
+	// status, usage), a message to send the agent, so it is asked to account
+	// for itself. The event alone when left out.
+	On map[string]Action `yaml:"on,omitempty"`
+}
+
+// Action is what one watch threshold does when crossed.
+type Action struct {
+	// A message to send the agent through the channel, once per crossing,
+	// as `rig agent send` would.
+	Send string `yaml:"send" jsonschema:"required"`
+}
+
+// The watch thresholds `on:` may name, and the windows a usage limit may.
+var (
+	WatchThresholds = []string{"idle", "unit", "status", "usage"}
+	UsageWindows    = []string{"five_hour", "seven_day"}
+)
+
+// UnmarshalYAML reads guest.agent in either form: the harness name alone, or
+// the block.
+func (a *Agent) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind == yaml.ScalarNode {
+		*a = Agent{Harness: n.Value}
+		return nil
+	}
+	type long Agent
+	var l long
+	if err := n.Decode(&l); err != nil {
+		return err
+	}
+	*a = Agent(l)
+	return nil
+}
+
+// IsZero reports whether the section says nothing, so yaml's omitempty
+// leaves it out when a manifest is written back.
+func (a Agent) IsZero() bool { return a == (Agent{}) }
+
+// AgentHarness is the harness guest.agent names, "" for the default.
+func (m *Manifest) AgentHarness() string { return m.Guest.Agent.Harness }
+
+// Resolved is the agent section with its prompt file made absolute against
+// the manifest's directory, for recording on the instance, where the file's
+// directory is not to hand.
+func (m *Manifest) ResolvedAgent() Agent {
+	a := m.Guest.Agent
+	if a.PromptFile != "" {
+		a.PromptFile = m.Resolve(a.PromptFile)
+	}
+	return a
+}
+
+// Durations in guest.agent are one number and one unit, the form both
+// timeout(1) in the runner and Go read: 6h, 20m, 90s.
+var durationRE = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?[smh]$`)
+
+// ParseDuration reads a guest.agent duration.
+func ParseDuration(s string) (time.Duration, error) {
+	if !durationRE.MatchString(s) {
+		return 0, fmt.Errorf("%q is not a duration like 6h, 20m or 90s", s)
+	}
+	return time.ParseDuration(s)
+}
+
+// memoryMaxRE is systemd's MemoryMax= as rig passes it: a percentage of the
+// guest's memory, or a size with a binary suffix.
+var memoryMaxRE = regexp.MustCompile(`^[0-9]+(%|[KMGT])?$`)
+
+func (a *Agent) validate() error {
+	if a.Harness != "" && !slices.Contains(Harnesses, a.Harness) {
+		return fmt.Errorf("guest.agent.harness %q: rig knows %s; leave it out for %s", a.Harness, strings.Join(Harnesses, ", "), Harnesses[0])
+	}
+	for _, d := range []struct{ field, value string }{{"timeout", a.Timeout}, {"idle_timeout", a.IdleTimeout}} {
+		if d.value == "" {
+			continue
+		}
+		if _, err := ParseDuration(d.value); err != nil {
+			return fmt.Errorf("guest.agent.%s: %w", d.field, err)
+		}
+	}
+	if a.Workdir != "" && !strings.HasPrefix(a.Workdir, "/") {
+		return fmt.Errorf("guest.agent.workdir %q must be an absolute path in the guest", a.Workdir)
+	}
+	if a.MemoryMax != "" && !memoryMaxRE.MatchString(a.MemoryMax) {
+		return fmt.Errorf("guest.agent.memory_max %q: a percentage of the guest's memory (80%%) or a size (24G)", a.MemoryMax)
+	}
+	if b := a.Budgets; b != nil {
+		switch {
+		case b.Hours < 0, b.Tokens < 0, b.Restarts < 0:
+			return fmt.Errorf("guest.agent.budgets: a budget is a positive number, or left out")
+		case b.Hours == 0 && b.Tokens == 0 && b.Restarts == 0 && b.Usage == nil:
+			return fmt.Errorf("guest.agent.budgets: names no budget; leave it out")
+		}
+		if err := b.Usage.validate("guest.agent.budgets.usage"); err != nil {
+			return err
+		}
+	}
+	if w := a.Watch; w != nil {
+		if w.IdleMinutes < 0 || w.UnitMinutes < 0 || w.StatusMinutes < 0 {
+			return fmt.Errorf("guest.agent.watch: a threshold is a positive number of minutes, or left out")
+		}
+		if err := w.Usage.validate("guest.agent.watch.usage"); err != nil {
+			return err
+		}
+		if w.Units != "" && strings.ContainsAny(w.Units, " /'\"") {
+			return fmt.Errorf("guest.agent.watch.units %q: a glob over unit names, such as \"mono-*\"", w.Units)
+		}
+		for _, name := range sortedKeys(w.On) {
+			if !slices.Contains(WatchThresholds, name) {
+				return fmt.Errorf("guest.agent.watch.on.%s: the thresholds are %s", name, strings.Join(WatchThresholds, ", "))
+			}
+			if strings.TrimSpace(w.On[name].Send) == "" {
+				return fmt.Errorf("guest.agent.watch.on.%s: send: needs the message to send", name)
+			}
+			set := map[string]bool{"idle": w.IdleMinutes > 0, "unit": w.UnitMinutes > 0, "status": w.StatusMinutes > 0, "usage": w.Usage != nil}
+			if !set[name] {
+				return fmt.Errorf("guest.agent.watch.on.%s: no %s threshold is set for it to act on", name, name)
+			}
+		}
+	}
+	return nil
+}
+
+func (u *Usage) validate(where string) error {
+	if u == nil {
+		return nil
+	}
+	if !slices.Contains(UsageWindows, u.Window) {
+		return fmt.Errorf("%s.window %q: %s", where, u.Window, strings.Join(UsageWindows, " or "))
+	}
+	if u.Max <= 0 || u.Max > 1 {
+		return fmt.Errorf("%s.max %v: a fraction of the window, above 0 and at most 1", where, u.Max)
+	}
+	return nil
+}
 
 // Proxied reports whether the manifest asks for any credential to be held
 // by the proxy rather than the guest.
@@ -535,8 +770,18 @@ func (m *Manifest) validate() error {
 	default:
 		return fmt.Errorf("guest.input %q: leave it out, or say %q to lend the guest this host's keyboard and mouse", m.Guest.Input, InputHost)
 	}
-	if m.Guest.Agent != "" && !slices.Contains(Harnesses, m.Guest.Agent) {
-		return fmt.Errorf("guest.agent %q: rig knows %s; leave it out for %s", m.Guest.Agent, strings.Join(Harnesses, ", "), Harnesses[0])
+	if err := m.Guest.Agent.validate(); err != nil {
+		return err
+	}
+	seenFwd := map[int]bool{}
+	for _, p := range m.Guest.Forwards {
+		if p < 1 || p > 65535 {
+			return fmt.Errorf("guest.forwards: %d is not a port", p)
+		}
+		if seenFwd[p] {
+			return fmt.Errorf("guest.forwards lists %d twice", p)
+		}
+		seenFwd[p] = true
 	}
 	if m.Guest.Network == NetworkNone && len(m.Guest.Ports) > 0 {
 		return fmt.Errorf("guest.network is %q but guest.ports publishes %d port(s): a published port needs a network device", NetworkNone, len(m.Guest.Ports))

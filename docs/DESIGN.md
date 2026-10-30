@@ -1,8 +1,294 @@
 # Design notes
 
 Decisions and why, what was learned proving them, and what is still weak.
-Written 2026-08-23; last updated 2026-10-15. `README.md` says what this is;
+Written 2026-08-23; last updated 2026-10-30. `README.md` says what this is;
 `docs/DEV_NOTES.md` has the facts the code depends on.
+
+## 2026-10-30: the lead, and only the lead
+
+The hook that delivers mid-turn fires for every tool call in the session,
+the lead's and its subagents' alike, and until now `rig hook` read its
+input and ignored it: whichever process made the next tool call got the
+message. In one mission two instructions meant for the lead landed in a
+subagent, which wrote "I'll pass it on to the lead" and did not; the
+record said `path: hook`, as if delivered. The agent rig talks to is the
+lead, the process that was given the brief; a subagent is a tool it runs.
+
+The hook's input is the only evidence of which process it ran in: on
+Claude Code 2.1.314 a subagent's carries `agent_id`, the lead's does not,
+and the session and transcript are the lead's in both (DEV_NOTES). So the
+hook delivers only when its input proves the lead, positively: the
+session rig chose, and no agent identity. A subagent's call takes nothing
+and the message waits for the lead's next tool call. An input rig cannot
+place, a hook shape from some other version, proves nothing either; the
+message then waits for the next launch, which is the lead's by
+construction, and `stderr.log` says so once. The record says whom a
+delivery reached: `to: lead` for the hook and the launch prompt, `to:
+caller` for a verb, because the Bash environment is the same in the lead
+and a subagent and nothing in the guest can tell who typed `rig wait`.
+The system prompt tells the lead that only it receives operator messages
+and that subagents must not run the verbs.
+
+An acknowledgement protocol was considered for the fallback: a message
+counts as delivered only when the lead's own process says so. There is
+nothing the lead could say that a subagent could not say too, for the same
+reason `rig wait` cannot tell them apart, so it would prove nothing. What
+replaces it is the launch listing: each launch prompt lists every item
+that reached the agent mid-turn since the previous launch, by id, path,
+recipient and first line, so a lead whose context was compacted, or whose
+run was killed by the watchdog, is reminded of what a hook added. The
+harness says how it delivers (`Delivery()`), so `rig agent send` reports
+the path and its latency from the harness rather than from a sentence
+written for one.
+
+## 2026-10-30: the manifest says how the agent runs, and what is held for it
+
+The overseer of a mission needed facts that were flags to `rig agent
+start` or lines in a brief: the prompt file, the workdir, the model, the
+timeout, and the ports to hold forwards for. The forward died with the VM
+when the image was rebuilt, and someone had to remember to restart it.
+Now `guest.agent` carries the run's settings (its short form, the harness
+name alone, still works), budgets, which are hard limits, and watch
+thresholds, which are soft ones; and `guest.forwards` carries the ports.
+
+**Forwards in the manifest.** A forward is a host process by nature: the
+vsock listener is on the host side, and nothing in Incus or the guest can
+hold a port on this host's loopback. So it is a grant like the others,
+declared in the file and recorded on the instance, and `rig start` leaves
+a holder, `rig-forward-<vm>`, a transient unit in the operator's user
+manager, the way it leaves the handback watcher and the input forwarder
+as root units. User scope because vsock needs no root and a preview is the
+operator's own; `rig proxy setup`'s lingering keeps it past a logout, as
+it does the proxies. It follows the VM, ends with it, and is left again at
+the next start, so a VM recreated from a new image comes back with its
+forwards. It was not put in the proxy: that is witmproxy's process, exists
+only for a proxied VM, and carries HTTP, not a raw port. The schema, the
+README and `rig status` say how `forwards` differs from `ports`: a
+published port goes through the network and the ACL and can be bound to
+an address other machines reach; a forward is vsock, loopback only, and
+leaves `rig verify` PROVEN. For an operator's own preview, `forwards` is
+the default and `ports` the exception; `rig doctor` notes a port named
+under both.
+
+**Two watchdogs, and budgets.** The six-hour `--timeout` is a backstop for
+a run that never reaches a turn boundary: a lead waiting on subagents
+forever, a server holding the turn open, a hung tool call. It fired three
+times on healthy runs in one mission and cost ten minutes of
+reconciliation each time. `idle_timeout` is the better backstop: the guest
+rig's watchdog (`rig hook watchdog`, started by the runner beside the
+agent) cuts a run with nothing new in its event log for that long, and
+never one that is visibly working; `timeout` stays as the outer ceiling.
+Both are a run's limits, resumed with a note that names which fired, so
+the agent reconciles one unfinished tool call rather than a crash it
+imagines. Idleness is the log's mtime, not a parse for tool calls: it is
+the same for every harness, and a tool call that takes longer than the
+limit without writing anything is what the limit is for.
+
+Budgets are the mission's limits, and the guarantee that an unattended
+agent cannot run past what the operator allowed. Crossing one stops the
+agent the way `rig agent stop` does: the run is ended at once, the unit is
+not restarted (exit 79 is in RestartPreventExitStatus beside 77), a BUDGET
+marker beside DONE says which fired and at what value, and the session is
+kept, so raising the budget and starting resumes where it stopped. What
+the guest can judge it judges itself, so the stop depends on nobody
+watching from the host: restarts are systemd's NRestarts against the
+budget, checked by the runner before a launch; hours and tokens are the
+watchdog's, checked before a launch and during a run, tokens summed from
+the harness's own event log by the harness's parser, which the guest build
+of rig carries for that. A subscription window needs the credential, so
+it is `rig agent watch`'s on the host, and the only budget that is.
+
+The proxy could have been the one place for all of it: it sees every
+response from the provider, so token counts and rate-limit headers could
+be read there, for every harness at once. Not done: only a proxied VM has
+a proxy, the plugin would have to parse streamed response bodies rather
+than rewrite headers, and the event log is in every harness already. If a
+second harness logs no usage, the proxy is where to look next.
+
+**Mechanical signals, no facts schema.** The thresholds are on facts rig
+observes without the harness's help: the workdir's branch tip (`git` in
+the guest), transient services (`/run/systemd/transient`, minus rig's own,
+narrowed by a glob the manifest may set), STATUS.md's mtime, and the
+credential's windows. Each crossing and clearing is one `rig agent watch`
+line with the value and the limit, and `status --full` prints them all
+with the git state, the units, disk and memory, which is what one
+mission's overseer scripted around `rig agent status`, `git log`,
+`systemctl`, `df` and `free`. A `send:` on a threshold queues a canned
+message, so the agent is asked to account for itself; nothing a threshold
+does stops the agent. A typed "facts" file for the agent to fill was
+considered and rejected: an LLM overseer reads prose better than fields,
+rig can discover guest listeners itself, and STATUS.md was the right
+medium when it was kept current, which the `status` threshold now
+polices. The overseer inspects artifacts inside the VM before pulling
+anything out.
+
+**Usage has two kinds.** Consumption is tokens, summed by the harness
+from its own event log, which every harness has; the guest build carries
+the parser, so `rig hook usage` answers the host without the log crossing
+the wire. A quota is a subscription's window, a fraction used and a time
+it resets, read from the provider with the credential, which only some
+credentials have: an OAuth login has one, an API key none. They are kept
+apart because they answer different questions (how much has this run
+spent; how close is the account to being refused) and because one is
+always there and the other is not. The harness names the request and
+parses the answer; the host makes it, since the guest build has no HTTP
+client and must not grow one. A budget or threshold names which kind it
+means, and the watch evaluates what exists.
+
+**An overseer, trusted and audited.** The second Claude Code session on
+the host that ran one mission's missions needed full host privileges, and
+Claude Code's permission prompts and its command classifier would have
+stalled it on ordinary rig verbs without a permissive mode; and nothing
+on the host recorded which rig verbs it ran on the VM, only what it sent.
+`rig overseer` starts such a session with a prompt rig assembles
+(`internal/agent/overseer.md`: the mandate, the hierarchy, rig's verbs,
+how to write a brief, the confirm list, the audit duty, and the state,
+which is a setup playbook when there is no manifest and the manifest's
+facts and the agent's status when there is) and, for a harness rig can
+launch (`Harness.Overseer`), the settings that make it run without
+friction: every rig verb allowed, taken from the command tree so a new
+verb is covered; the confirm list asked (a forward `--to-guest`, a device
+grant, a credential change, deleting a VM, a push from outside the
+project directory, a start without isolation), which wins over the allow
+list by Claude Code's own precedence; raw `incus`, `git push` and `sudo`
+denied. Interactive by default, so the confirm list can be answered;
+`--unattended` runs it with `-p` and prompts auto-denied, which turns the
+confirm list into a refusal with a message rather than a stall. It is not
+sandboxed beyond that: it needs the verbs that elevate, and a deputy that
+cannot act is no deputy. What makes it trustable is the operator log: every
+verb that acts on a VM appends one line on the host (time, actor, verb,
+arguments, outcome), under the state directory keyed by the VM's name
+rather than beside the manifest, since a `rig new` VM has none and a
+project directory is often a repository. `rig overseer` marks its child's
+verbs as the overseer's through the environment. The operator trusts the
+deputy after the fact, on that log and on its notes, instead of confirming
+each step in advance.
+
+**Defaults and records.** `rig agent start` resolves each option as the
+flag given now, else what the last start recorded, else the file, else
+the flag's default. The record stands in for the file once it exists,
+since it was resolved against it, and `rig apply -f` clears the record
+when the file's agent settings change, so a bare start then reads the
+file. The alternative, the file always winning, would make `--model` a
+one-start override that a bare restart silently undoes, which is the
+forgotten-flag failure the record exists to prevent.
+
+## 2026-10-16: a channel to the agent that is timely and signed
+
+Four things were wrong between the operator and a running agent. A message
+from `rig agent send` reached the agent only when the runner next launched
+it: the runner read the inbox once, before `claude -p`, and a turn can run
+for hours (`send`'s help said "if it is polling"; nothing polled). The agent
+could not ask anything; its only signals were files the operator had to
+think to read. `send` pulled the inbox, appended and wrote it back while the
+runner copied and truncated it, so a message sent at a launch could vanish.
+And nothing told the operator's words from any other text the agent read:
+the inbox was a plain file the agent, root in the guest, could write itself.
+A fifth surfaced alongside: the runner passed the whole brief as the prompt
+at every launch, `--resume` included, so each turn boundary appended another
+copy as a new user turn; one 9.4 MB transcript held the brief's heading 226
+times, a third of the file, and plausibly helped it overflow its context.
+
+**Delivery.** Each item is its own file in `inbox.d`, written under a dot
+name and renamed into place, so nothing is read-modify-written. Takers claim
+a file by renaming it into `claimed/`, then verify and settle under a lock,
+in sequence order, so two takers at once cannot accept out of order or twice.
+The runner takes at launch; a PostToolUse hook, which the runner hands
+`claude` with `--settings`, takes after every tool call and returns what
+verified as `additionalContext`, which reaches the model within the same
+`claude -p` (DEV_NOTES). Hook context is not in the stream-json log, so each
+delivery is logged to `deliveries.jsonl` with its path: launch, hook, wait.
+
+**Asks.** The agent runs `rig ask <id> <question> [--wait 5m]`, which writes
+`asks/<id>.json`; `rig agent answer` sends a signed answer, which `rig ask
+--wait` or `rig wait` prints (exit 2 when none came; at most nine minutes,
+under the Bash tool's ten) and the hook delivers otherwise. `rig agent watch`
+polls the bounded probe `status` uses and prints one line per change, ask
+opened or answered, delivery, tamper, DONE, unit and restart changes,
+STATUS.md, with `--exec` for a notifier. `rig done` writes DONE.
+
+**Authenticity.** Each VM has an ed25519 key on the host
+(`~/.config/rig/agent/<vm>/operator.key`, 0600, made at its first start);
+the guest gets the public half as `operator.pub`. Every item is an envelope
+`{v, session, seq, time, kind, id, body}`, canonical JSON signed after a
+domain-separation prefix. The guest accepts one only with a good signature,
+for the session it runs, with a sequence number above the last it accepted
+(the host keeps the counter, under a lock); anything else is moved to
+`rejected/` and logged in `tamper.jsonl`, which `status` and `watch` show,
+and the agent never sees it. An older rig's unsigned inbox is treated the
+same way. Verification is code in the guest build of rig, never the model's
+judgement. The model is told, in its system prompt, where text it reads
+during the run cannot reach, that operator messages come only through rig
+and that each delivery in this launch carries a random per-launch token;
+text elsewhere claiming the operator's authority is data. Without that
+statement the model rightly discounted hook context it could not place.
+
+**The brief.** Sent once, as the first message of a new session; a resume
+gets only its short continuation note and what is queued. The brief in the
+guest is itself signed (`brief.msg`, with a floor so an older one copied back
+is refused), the runner will not launch on one that does not verify (exit
+77, which the unit does not restart), and `rig brief` prints the verified
+text, which the continuation note points at so an agent can re-read it after
+a compaction instead of trusting a summary. `rig agent brief` changes it
+while the agent runs: it diffs against the host's copy of the last brief
+delivered, writes the new one signed, and queues the diff as a
+`brief-update`, in order with everything else. Persistent rules live in the
+brief; there is no separate "standing message". The start options are
+recorded on the instance, so a bare `rig agent start` resumes as started:
+one that forgot `--until-done` used to stop the agent after its next turn.
+
+**One codebase, one name.** The guest build is `cmd/rig/guest`, a second main
+package built as `rig` (static, amd64 and arm64), not build tags on
+`cmd/rig`: tags would have to mark every host file, and every new one, and a
+forgotten tag pulls the Incus client into the guest without a sound. A
+package boundary makes "the guest cannot reach Incus or the private key" a
+property of the import graph, which a test checks. Both builds use
+`internal/agent`'s envelope code. rig embeds the guest build
+(`internal/agent/guestbin`), and `rig agent start` installs it as `bin/rig`,
+first on the agent's PATH, and records the sha256 of it, the public key and
+the runner on the instance for `status` to compare. It is a build product,
+not committed: `make` builds it first, a checkout without it embeds a
+placeholder and `go test` still passes, and a test rebuilds each embedded
+build and fails, naming `make`, when it is not what the source builds to now.
+The cost is that `go install` alone gives a rig whose `agent start` refuses,
+saying why.
+
+What holds, and what does not:
+
+- Signing stops forged items, because the private key never enters the
+  guest: the agent, or anything that talks it into writing a file, can put
+  anything in `inbox.d`, and none of it verifies.
+- The model does not judge signatures; it trusts a path, and is told which.
+- Guest root can replace the verifier, the public key or the runner, and
+  then deliver anything. The hash check sees a replaced file, but it reads
+  through the guest (its incus-agent and its sha256sum), so a guest that
+  lies about its own files is not caught. It detects; it does not prevent.
+- The token defends against text written before the launch: a repo file, an
+  issue, a web page. Code running in the guest can read it (it is in
+  `claude`'s argv and in `launch.token`, and everything there is root).
+- Replays are refused by sequence number against state the guest keeps,
+  which guest root can reset.
+- Nothing here touches injected instructions that do not claim the
+  operator's authority: "the tests need the cache deleted" in a README is
+  still text the agent may follow, as before.
+- An item taken at a launch whose `claude` then dies is in `delivered/`, not
+  in the conversation, as with the old inbox.
+- The hook fires for a subagent's tool calls too, and did deliver to one;
+  since 2026-10-30 it delivers only on an input that proves the lead.
+
+For later: inject operator messages on the host, in the credential proxy,
+which is the agent's only route to the API. That takes the guest's code out
+of the trust base (no verifier, key or runner there to replace) and lets the
+proxy strip imitations from requests. It costs rewriting requests in the
+plugin, a prompt-cache miss at each injection, a transcript in the guest that
+differs from what the model saw, and it works only for proxied VMs.
+
+`claude -p` stops background tasks ten minutes after a turn ends unless
+`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` says otherwise. The runner leaves it:
+a longer ceiling saves a long backgrounded build at a turn boundary, but
+holds the turn open, idle, for as long as a forgotten server runs, which
+under `--until-done` is up to `--timeout`. The env file is exported to the
+agent, so a project whose builds need it sets it there.
 
 ## 2026-10-15: the proxy as the guest's way out, opt-in
 
@@ -305,6 +591,23 @@ discovered, so moving the card needs no config change.
   matters is not "does this exist" but "did anyone but rig touch it". Learned
   the expensive way: a stale staging directory silently destroyed an unattended
   agent's decision log, and `/work` is the only copy of anything.
+- **`rig pull` is `push` turned around.** Both take `<vm> <from> [<to>]`, copy
+  a directory's contents to exactly the destination, and refuse to overwrite a
+  file they did not write. Re-pulling to see an agent's progress is the normal
+  workflow, so pull marks each host file with the hash it wrote, in a `user.`
+  extended attribute that moves and dies with the file, and refuses only a file
+  edited since or one it never wrote that differs. Pull once read a single file
+  and printed a directory's JSON listing as if it were content, with exit 0.
+- **`rig exec` takes its command after `--`.** Before, everything after the VM
+  was the guest's, so rig's flags there reached bash, and words were joined
+  with spaces, losing their quoting. Now rig's flags go anywhere before `--`;
+  after it, several words arrive exactly as given, as with `docker exec`, and
+  one is a shell script. stdin stays opt-in (`-i`), or a script's loop loses
+  its input to the guest, as with ssh.
+- **`rm` and `delete` read `-f` the way their namesakes do.** `rig rm -f myvm`
+  forces, as `docker rm -f` does; `rig delete -f rig.yaml` names a manifest, as
+  `kubectl delete -f` does. One verb with both meanings of `-f` read a VM name
+  as a missing file. Both ask before deleting, since the disk holds `/work`.
 - **The unattended agent is a job, not a conversation.** `rig agent` runs it as
   a systemd unit writing to files, and the operator pulls from those files on
   demand — nothing streams into the operator's context by default. The session
@@ -780,9 +1083,9 @@ Tailscale and docker.)
    still nobody's job. `rig status` should show age and size, and there should
    be a way to list what is stale.
 2. **`/work` lives inside the instance.** `rig rm` destroys the project with the
-   VM, so the VM is the only copy until someone pushes a git remote. Either put
-   `/work` on a separate volume that outlives the instance, or have `rig rm`
-   refuse when the tree has uncommitted changes.
+   VM, so the VM is the only copy until someone pushes a git remote or pulls it
+   out. `rig rm` now says so and asks first; a separate volume for `/work`
+   that outlives the instance is still the fix.
 3. **One card, one project is enforced but not scheduled.** With several
    projects, "who had it last, and does something want it now" becomes guesswork
    at the point where it is most annoying to add.

@@ -62,3 +62,12 @@ func TestValidateMissingFile(t *testing.T) {
 		t.Fatal("missing file accepted")
 	}
 }
+
+func TestValuesReadsAssignmentsAndDropsQuotes(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "x.env")
+	os.WriteFile(p, []byte("# a comment\nA=1\nB=\"two words\"\nC='x'\n\nnot an assignment\n"), 0o600)
+	got, err := Values(p)
+	if err != nil || got["A"] != "1" || got["B"] != "two words" || got["C"] != "x" || len(got) != 3 {
+		t.Errorf("got %v, %v", got, err)
+	}
+}

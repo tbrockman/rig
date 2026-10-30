@@ -60,27 +60,65 @@ func reflectSchema(sourceDir string) (*jsonschema.Schema, error) {
 }
 
 // fieldsTable renders the fields and their descriptions as the Markdown table
-// in README.md, so the README says what the schema says.
+// in README.md, so the README says what the schema says. A field that is a
+// block of its own (a $ref to a definition, or a map of them) is followed by
+// its fields, prefixed; a definition wrapped in oneOf for a short form is
+// read through its long one.
 func fieldsTable(s *jsonschema.Schema) string {
 	var b strings.Builder
 	b.WriteString("| Field | |\n|---|---|\n")
 	// Markdown would take a | for a cell border and <name> for an HTML tag.
 	cell := strings.NewReplacer("|", "\\|", "<", "&lt;", ">", "&gt;").Replace
-	// Blocks with fields of their own, and the definition each reflects to.
-	nested := map[string]string{"return": "Return", "proxy": "Proxy"}
-	rows := func(prefix, def string) {
-		for name, p := range s.Definitions[def].Properties.FromOldest() {
+	// Entries listed only as their element: volumes and ports keep their
+	// Compose short form as the whole story.
+	leaf := map[string]bool{"volumes": true, "ports": true}
+	var rows func(prefix, def string)
+	rows = func(prefix, def string) {
+		for name, p := range objectOf(s.Definitions[def]).Properties.FromOldest() {
 			fmt.Fprintf(&b, "| `%s%s` | %s |\n", prefix, name, cell(p.Description))
-			if sub, ok := nested[name]; ok {
-				for field, q := range s.Definitions[sub].Properties.FromOldest() {
-					fmt.Fprintf(&b, "| `%s%s.%s` | %s |\n", prefix, name, field, cell(q.Description))
-				}
+			if leaf[name] {
+				continue
+			}
+			if ref := definitionOf(p); ref != "" {
+				rows(prefix+name+".", ref)
+			} else if ap := objectOf(p).AdditionalProperties; ap != nil && definitionOf(ap) != "" {
+				rows(prefix+name+".<name>.", definitionOf(ap))
 			}
 		}
 	}
 	rows("host.devices.<name>.", "Device")
 	rows("guest.", "Guest")
 	return b.String()
+}
+
+// objectOf is the schema that holds a field's properties: the schema
+// itself, or the one alternative of a oneOf/anyOf wrapper that does.
+func objectOf(p *jsonschema.Schema) *jsonschema.Schema {
+	if p == nil {
+		return &jsonschema.Schema{}
+	}
+	if p.Properties != nil || p.AdditionalProperties != nil {
+		return p
+	}
+	for _, alts := range [][]*jsonschema.Schema{p.OneOf, p.AnyOf} {
+		for _, alt := range alts {
+			if alt.Properties != nil || alt.AdditionalProperties != nil {
+				return alt
+			}
+		}
+	}
+	return p
+}
+
+// definitionOf names the definition a property refers to, or "".
+func definitionOf(p *jsonschema.Schema) string {
+	if p == nil {
+		return ""
+	}
+	if ref, ok := strings.CutPrefix(p.Ref, "#/$defs/"); ok {
+		return ref
+	}
+	return ""
 }
 
 // The pieces below are what reflection cannot see: patterns shared with
@@ -142,6 +180,9 @@ func (Return) JSONSchemaExtend(s *jsonschema.Schema) {
 func (Guest) JSONSchemaExtend(s *jsonschema.Schema) {
 	prop(s, "name").Pattern = nameRE.String()
 	prop(s, "devices").Items.Pattern = nameRE.String()
+	fwd := prop(s, "forwards")
+	fwd.Items.Minimum, fwd.Items.Maximum = "1", "65535"
+	fwd.UniqueItems = true
 	s.AnyOf = []*jsonschema.Schema{required("image"), required("flake")}
 	s.AllOf = []*jsonschema.Schema{
 		// A published port, and the proxy, need a network device.
@@ -151,6 +192,51 @@ func (Guest) JSONSchemaExtend(s *jsonschema.Schema) {
 		// A proxied credential comes from the env file.
 		{If: required("proxy"), Then: required("env_file")},
 	}
+}
+
+// The short form of guest.agent is the harness name; the long form the block.
+func (Agent) JSONSchemaExtend(s *jsonschema.Schema) {
+	for _, name := range []string{"timeout", "idle_timeout"} {
+		prop(s, name).Pattern = durationRE.String()
+	}
+	prop(s, "memory_max").Pattern = memoryMaxRE.String()
+	prop(s, "workdir").Pattern = `^/`
+	harnesses := make([]any, len(Harnesses))
+	for i, h := range Harnesses {
+		harnesses[i] = h
+	}
+	long := *s
+	*s = jsonschema.Schema{
+		Description: long.Description,
+		OneOf:       []*jsonschema.Schema{{Type: "string", Enum: harnesses}, &long},
+	}
+}
+
+func (Budgets) JSONSchemaExtend(s *jsonschema.Schema) {
+	for _, name := range []string{"hours", "tokens", "restarts"} {
+		prop(s, name).ExclusiveMinimum = "0"
+	}
+	s.MinProperties = ptr(uint64(1))
+}
+
+func (Usage) JSONSchemaExtend(s *jsonschema.Schema) {
+	prop(s, "max").ExclusiveMinimum = "0"
+	prop(s, "max").Maximum = "1"
+}
+
+func (Action) JSONSchemaExtend(s *jsonschema.Schema) {
+	prop(s, "send").MinLength = ptr(uint64(1))
+}
+
+func (Watch) JSONSchemaExtend(s *jsonschema.Schema) {
+	for _, name := range []string{"idle_minutes", "unit_minutes", "status_minutes"} {
+		prop(s, name).ExclusiveMinimum = "0"
+	}
+	thresholds := make([]any, len(WatchThresholds))
+	for i, t := range WatchThresholds {
+		thresholds[i] = t
+	}
+	prop(s, "on").PropertyNames = &jsonschema.Schema{Enum: thresholds}
 }
 
 func (Proxy) JSONSchemaExtend(s *jsonschema.Schema) {

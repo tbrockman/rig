@@ -196,3 +196,26 @@ func TestATargetThatDoesNotExistHereIsAdvisory(t *testing.T) {
 		t.Error("an underivable target is not a candidate; its range is moot, not a gap")
 	}
 }
+
+// A control that loses one packet is not a broken mechanism, and one that
+// never answers is reported only after every try.
+func TestAControlIsRetriedButOnlyUntilItAnswers(t *testing.T) {
+	answers := []Reach{Blocked, Reachable, Blocked}
+	calls := 0
+	probe := func() (Reach, string) {
+		r := answers[calls]
+		calls++
+		return r, "dropped"
+	}
+	reach, _, n := retryControl(3, probe)
+	if reach != Reachable || n != 2 || calls != 2 {
+		t.Errorf("got %v after %d tries (%d calls); want reachable after 2", reach, n, calls)
+	}
+
+	calls = 0
+	answers = []Reach{Blocked, Blocked, Blocked}
+	reach, detail, n := retryControl(3, probe)
+	if reach == Reachable || n != 3 || detail != "dropped" {
+		t.Errorf("got %v, %q after %d tries; want unreachable after 3", reach, detail, n)
+	}
+}

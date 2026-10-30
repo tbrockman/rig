@@ -32,10 +32,11 @@ func (a *app) initCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "init <dir>",
 		GroupID: "vm",
-		Short:   "Write a rig.yaml and a guest image flake into a directory",
+		Short:   "Write a rig.yaml, a guest image flake and a brief template into a directory",
 		Long: "Writes a starting point into <dir>: a rig.yaml that grants nothing\n" +
 			"yet, with this host's NVIDIA card as a commented example when there is\n" +
-			"one, and under guest/ the flake the VM's image is built from.\n\n" +
+			"one, under guest/ the flake the VM's image is built from, and brief.md,\n" +
+			"the shape of an unattended agent's brief, to fill in.\n\n" +
 			"--with adds rig's optional guest modules: nvidia (the driver; also grants\n" +
 			"the card in rig.yaml), docker, desktop (an X11 session on the card; implies\n" +
 			"nvidia, and lends the host's keyboard and mouse). --image names an image\n" +
@@ -87,6 +88,14 @@ func (a *app) initCmd() *cobra.Command {
 				return err
 			}
 			text := fillManifest(string(b), name, pci, id)
+			// The brief names the project too, so an agent's branch and workdir
+			// are its from the first line.
+			bf := filepath.Join(dir, "brief.md")
+			if raw, err := os.ReadFile(bf); err == nil {
+				if err := os.WriteFile(bf, []byte(strings.ReplaceAll(string(raw), "PROJECT", name)), 0o644); err != nil {
+					return err
+				}
+			}
 			if ref, err := schemaRef(); err == nil {
 				text = pointAtSchema(text, ref)
 			} else {
