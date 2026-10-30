@@ -65,6 +65,31 @@ func Validate(file string) error {
 	return nil
 }
 
+// Values reads the variables a file defines, for a reader on this host that
+// needs one of them (a harness asking the provider about its credential's
+// quota). A value's surrounding quotes are dropped, as a shell would.
+// Nothing here logs or prints a value.
+func Values(file string) (map[string]string, error) {
+	content, err := os.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	vars := map[string]string{}
+	scanner := bufio.NewScanner(strings.NewReader(string(content)))
+	for scanner.Scan() {
+		text := strings.TrimSpace(scanner.Text())
+		if !assignment.MatchString(text) {
+			continue
+		}
+		k, v, _ := strings.Cut(text, "=")
+		if len(v) >= 2 && (v[0] == '"' && v[len(v)-1] == '"' || v[0] == '\'' && v[len(v)-1] == '\'') {
+			v = v[1 : len(v)-1]
+		}
+		vars[k] = v
+	}
+	return vars, scanner.Err()
+}
+
 // Count returns how many variables the file defines.
 func Count(file string) int {
 	content, err := os.ReadFile(file)

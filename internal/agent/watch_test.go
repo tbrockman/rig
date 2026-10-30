@@ -24,6 +24,10 @@ func TestChangesStartWithWhereThingsStand(t *testing.T) {
 	if got := types(evs); got != "watching,ask-opened,ask-opened,integrity,done" {
 		t.Fatalf("got %s", got)
 	}
+	cur.Budget = "hours: 25.0 of 24"
+	if evs := Changes(nil, cur, nil); evs[len(evs)-1].Type != EvBudget || evs[len(evs)-1].Value("reason") != cur.Budget {
+		t.Errorf("a budget that already fired is reported at the start: %+v", evs)
+	}
 	if evs[0].Value("open-asks") != "2" || evs[1].Value("id") != "old" || evs[2].Value("id") != "new" {
 		t.Errorf("open asks oldest first, answered ones left out: %+v", evs)
 	}
@@ -38,11 +42,12 @@ func TestChangesSayEachThingOnce(t *testing.T) {
 		Asks: []Ask{{ID: "b", Text: "which?"}, {ID: "a"}}, Answers: map[string]Envelope{"a": {}},
 		Deliveries: 4, RecentDeliveries: []Delivery{{Seq: 1}, {Seq: 2}, {Seq: 3, Kind: "message", ID: "m3", Path: "hook"}, {Seq: 4, Kind: "answer", ID: "a", Path: "wait"}},
 		Tampers: 1, RecentTampers: []Tamper{{File: "rejected/x.msg.1", Reason: "bad signature"}},
-		SHA256: map[string]string{BinName: "swapped"}, Done: true, Summary: "finished"}
+		SHA256: map[string]string{BinName: "swapped"}, Done: true, Summary: "finished",
+		Budget: "tokens: 60,000 of 50,000", Watchdog: "idle: nothing new for 21m"}
 	cfg := map[string]string{Installed[1].Key: "good"}
 
 	evs := Changes(&prev, cur, cfg)
-	want := "unit,restarts,ask-opened,ask-answered,delivered,delivered,tamper,integrity,done,status-changed"
+	want := "unit,restarts,ask-opened,ask-answered,delivered,delivered,tamper,integrity,done,budget,watchdog,status-changed"
 	if got := types(evs); got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}

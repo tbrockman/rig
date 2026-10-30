@@ -19,20 +19,21 @@ type countingHarness struct{ stub }
 
 type stub struct{}
 
-func (stub) Name() string                              { return "counting" }
-func (stub) Binary() string                            { return "x" }
-func (stub) InstallHint() string                       { return "" }
-func (stub) Probe() string                             { return "" }
-func (stub) Runner() []byte                            { return nil }
-func (stub) Credentials() []agent.Credential           { return nil }
-func (stub) TrustEnv(_, _ string) []string             { return nil }
-func (stub) LastError(string) string                   { return "" }
-func (stub) ExplainError(m string) string              { return m }
-func (stub) AssistantText(string, int) []string        { return nil }
-func (stub) TailSpeechCmd(int) string                  { return "" }
-func (stub) TailResultsCmd(int) string                 { return "" }
-func (stub) Delivery() []agent.DeliveryPath            { return agent.CommonDelivery() }
-func (stub) Usage(io.Reader) (agent.Consumption, bool) { return agent.Consumption{}, false }
+func (stub) Name() string                                                  { return "counting" }
+func (stub) Binary() string                                                { return "x" }
+func (stub) InstallHint() string                                           { return "" }
+func (stub) Probe() string                                                 { return "" }
+func (stub) Runner() []byte                                                { return nil }
+func (stub) Credentials() []agent.Credential                               { return nil }
+func (stub) TrustEnv(_, _ string) []string                                 { return nil }
+func (stub) LastError(string) string                                       { return "" }
+func (stub) ExplainError(m string) string                                  { return m }
+func (stub) AssistantText(string, int) []string                            { return nil }
+func (stub) TailSpeechCmd(int) string                                      { return "" }
+func (stub) TailResultsCmd(int) string                                     { return "" }
+func (stub) Delivery() []agent.DeliveryPath                                { return agent.CommonDelivery() }
+func (stub) Usage(io.Reader) (agent.Consumption, bool)                     { return agent.Consumption{}, false }
+func (stub) QuotaRequests(map[string]string) ([]agent.QuotaRequest, error) { return nil, nil }
 
 func (countingHarness) Usage(events io.Reader) (agent.Consumption, bool) {
 	buf, _ := io.ReadAll(events)

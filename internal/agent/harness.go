@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Harness is what differs between agents. Everything else in this package is
@@ -116,20 +117,34 @@ import (
 // `rig agent status` names; 77 (ExitUnverified) is a launch refused because
 // nothing from the operator verifies, said in stderr.log, and not restarted.
 type Harness interface {
-	Name() string                                        // "claude-code": the value rig.yaml's agent field takes, and what the instance records
-	Binary() string                                      // what the runner execs: "claude"
-	InstallHint() string                                 // the in-guest command that installs the binary onto UnitPATH
-	Probe() string                                       // a guest command that prints the binary's path on UnitPATH, or nothing
-	Runner() []byte                                      // the script the unit runs; it honours the runner contract documented in this package
-	Credentials() []Credential                           // the env vars it authenticates with, most preferred first
-	TrustEnv(caFile, bundleFile string) []string         // KEY=VALUE lines that make it trust an extra CA (bundleFile = system roots plus that CA, caFile = the CA alone)
-	LastError(resultsTail string) string                 // why a run stopped, from TailResultsCmd's output; "" when nothing
-	ExplainError(msg string) string                      // adds the fix to errors whose cause is not obvious from the text
-	AssistantText(speechTail string, limit int) []string // what the agent said, newest last, from TailSpeechCmd's output
-	TailSpeechCmd(limitBytes int) string                 // guest command: a bounded tail of the agent's own speech
-	TailResultsCmd(limitBytes int) string                // guest command: a bounded tail of the run's result events
-	Delivery() []DeliveryPath                            // how an operator's item reaches the agent, soonest first
-	Usage(events io.Reader) (Consumption, bool)          // tokens consumed, summed from the event log; false for a harness that logs none
+	Name() string                                                 // "claude-code": the value rig.yaml's agent field takes, and what the instance records
+	Binary() string                                               // what the runner execs: "claude"
+	InstallHint() string                                          // the in-guest command that installs the binary onto UnitPATH
+	Probe() string                                                // a guest command that prints the binary's path on UnitPATH, or nothing
+	Runner() []byte                                               // the script the unit runs; it honours the runner contract documented in this package
+	Credentials() []Credential                                    // the env vars it authenticates with, most preferred first
+	TrustEnv(caFile, bundleFile string) []string                  // KEY=VALUE lines that make it trust an extra CA (bundleFile = system roots plus that CA, caFile = the CA alone)
+	LastError(resultsTail string) string                          // why a run stopped, from TailResultsCmd's output; "" when nothing
+	ExplainError(msg string) string                               // adds the fix to errors whose cause is not obvious from the text
+	AssistantText(speechTail string, limit int) []string          // what the agent said, newest last, from TailSpeechCmd's output
+	TailSpeechCmd(limitBytes int) string                          // guest command: a bounded tail of the agent's own speech
+	TailResultsCmd(limitBytes int) string                         // guest command: a bounded tail of the run's result events
+	Delivery() []DeliveryPath                                     // how an operator's item reaches the agent, soonest first
+	Usage(events io.Reader) (Consumption, bool)                   // tokens consumed, summed from the event log; false for a harness that logs none
+	QuotaRequests(vars map[string]string) ([]QuotaRequest, error) // how to ask the provider for the credential's windows, best source first; none when the credential has no window (an API key)
+}
+
+// QuotaRequest is how the host asks a provider for a credential's windows:
+// the harness names the request and parses the answer, and the host makes
+// it (cmd/rig), since this package is in the guest build too and carries
+// no HTTP client. The credential is in Headers and goes nowhere else.
+// Source says, for the operator, whose credential this is: the env file's,
+// or a login on this host assumed to be the same account.
+type QuotaRequest struct {
+	Source  string
+	URL     string
+	Headers map[string]string
+	Parse   func(body []byte, now time.Time) (*Quota, error)
 }
 
 // Consumption is what a session has used, from the harness's own event log:

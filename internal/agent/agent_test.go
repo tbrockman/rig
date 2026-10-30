@@ -208,7 +208,7 @@ func TestStatusProbeReadsTheChannel(t *testing.T) {
 	write(DeliveriesName, `{"time":"t","seq":3,"kind":"answer","id":"docs","path":"hook"}`+"\n")
 	write(TamperName, `{"time":"t","file":"rejected/x","reason":"bad signature"}`+"\n")
 
-	out, err := exec.Command("bash", "-c", statusProbe(d)).CombinedOutput()
+	out, err := exec.Command("bash", "-c", statusProbe(d, ProbeOpts{})).CombinedOutput()
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -237,8 +237,48 @@ func TestStatusProbeReadsTheChannel(t *testing.T) {
 	if p.Tampers != 1 || p.RecentTampers[0].Reason != "bad signature" {
 		t.Errorf("tampers: %d %+v", p.Tampers, p.RecentTampers)
 	}
-	if StatusProbe() != statusProbe(Dir) {
+	if StatusProbe() != statusProbe(Dir, ProbeOpts{}) {
 		t.Error("the probe rig sends must be this one, at " + Dir)
+	}
+	if p.DiskFreeKB == 0 || p.MemAvailKB == 0 || p.Listening == nil {
+		t.Errorf("disk, memory and listeners are read without asking: %+v", p)
+	}
+}
+
+// With a workdir, the probe reads the branch, its tip and how dirty the tree
+// is; a workdir that is not a checkout says nothing rather than failing.
+func TestStatusProbeReadsTheWorkdirsGitState(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git")
+	}
+	d := t.TempDir()
+	work := filepath.Join(d, "work")
+	os.MkdirAll(work, 0o755)
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", work}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@x", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@x")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git("init", "-q", "-b", "agent/work")
+	os.WriteFile(filepath.Join(work, "a"), []byte("1"), 0o644)
+	git("add", "a")
+	git("commit", "-q", "-m", "first commit")
+	os.WriteFile(filepath.Join(work, "b"), []byte("2"), 0o644)
+
+	out, err := exec.Command("bash", "-c", statusProbe(d, ProbeOpts{Workdir: work})).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	p := ParseProbe(string(out))
+	if p.Branch != "agent/work" || p.Head == 0 || !strings.HasSuffix(p.Tip, " first commit") || p.Dirty != 1 || len(p.Worktrees) != 1 {
+		t.Errorf("git state: %+v", p)
+	}
+	out, _ = exec.Command("bash", "-c", statusProbe(d, ProbeOpts{Workdir: d})).CombinedOutput()
+	if p := ParseProbe(string(out)); p.Branch != "" || p.Head != 0 {
+		t.Errorf("not a checkout, yet: %+v", p)
 	}
 }
 

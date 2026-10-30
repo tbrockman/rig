@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/ed25519"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -61,7 +63,7 @@ func (a *app) agentCmd() *cobra.Command {
 	}
 	cmd.AddCommand(a.agentInstallCmd(), a.agentStartCmd(), a.agentBriefCmd(), a.agentSendCmd(),
 		a.agentAnswerCmd(), a.agentAsksCmd(), a.agentStatusCmd(), a.agentWatchCmd(),
-		a.agentLogCmd(), a.agentStopCmd())
+		a.agentLogCmd(), a.agentUsageCmd(), a.agentStopCmd())
 	return cmd
 }
 
@@ -451,7 +453,8 @@ func startOptions(changed func(flag string) bool, recorded, fromManifest, given 
 }
 
 func (a *app) agentStatusCmd() *cobra.Command {
-	return &cobra.Command{
+	var full bool
+	cmd := &cobra.Command{
 		Use:   "status <vm>",
 		Short: "Is it alive, what does it ask, has anything been tampered with, what does it say",
 		Long: "One bounded read of the agent's state. Open asks come first, since they are\n" +
@@ -460,7 +463,11 @@ func (a *app) agentStatusCmd() *cobra.Command {
 			"signature failed, an unsigned inbox), and whether the guest build of rig,\n" +
 			"the operator key and the runner are still what rig agent start wrote: rig\n" +
 			"records their hashes on the instance, and a mismatch means something in the\n" +
-			"guest replaced what decides who the operator is. Then STATUS.md.",
+			"guest replaced what decides who the operator is. Then STATUS.md.\n\n" +
+			"--full adds what an overseer otherwise scripts: the workdir's branch and\n" +
+			"tip, its worktrees, the transient units running, disk, memory, usage of\n" +
+			"both kinds (tokens from the event log; the credential's windows), and each\n" +
+			"of the manifest's watch thresholds with its state.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			name := args[0]
@@ -478,7 +485,15 @@ func (a *app) agentStatusCmd() *cobra.Command {
 				}
 				return strings.TrimSpace(string(b))
 			}
-			raw, _ := a.exec(name, agent.StatusProbe())
+			var w *watcher
+			probe := agent.StatusProbe()
+			if full {
+				if w, err = a.newWatcher(name); err != nil {
+					return err
+				}
+				probe = agent.StatusProbeWith(w.probe)
+			}
+			raw, _ := a.exec(name, probe)
 			p := agent.ParseProbe(raw)
 			ago := func(stamp string) string {
 				t, err := time.Parse(time.RFC3339, stamp)
@@ -596,6 +611,10 @@ func (a *app) agentStatusCmd() *cobra.Command {
 				}
 			}
 
+			if full {
+				a.printFull(name, w, p)
+			}
+
 			if s := get(agent.Dir + "/STATUS.md"); s != "" {
 				fmt.Printf("\n--- STATUS.md (the agent's own words) ---\n%s\n", s)
 			} else {
@@ -605,6 +624,176 @@ func (a *app) agentStatusCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&full, "full", false, "also the workdir's git state, transient units, disk, memory, usage and the watch thresholds")
+	return cmd
+}
+
+// printFull is status --full's second half: the run's facts, usage of both
+// kinds, and the thresholds with their state.
+func (a *app) printFull(name string, w *watcher, p agent.Probe) {
+	row := func(k, v string) {
+		if v == "" {
+			v = "—"
+		}
+		fmt.Printf("  %-14s %s\n", k, v)
+	}
+	age := func(unix int64) string {
+		if unix == 0 || p.Now == 0 {
+			return ""
+		}
+		return agent.Age(p.Now-unix) + " ago"
+	}
+	fmt.Printf("\n--- the run (workdir %s) ---\n", w.probe.Workdir)
+	if p.Branch != "" {
+		row("branch", fmt.Sprintf("%s at %s (%s)", p.Branch, agent.Clean(p.Tip, 120), age(p.Head)))
+		row("dirty files", strconv.Itoa(p.Dirty))
+		for i, wt := range p.Worktrees {
+			k := ""
+			if i == 0 {
+				k = "worktrees"
+			}
+			row(k, agent.Clean(wt, 200))
+		}
+	} else {
+		row("branch", "no git checkout at "+w.probe.Workdir)
+	}
+	if len(p.Units) == 0 {
+		row("units", "no transient service running")
+	}
+	for i, u := range p.Units {
+		k := ""
+		if i == 0 {
+			k = "units"
+		}
+		row(k, fmt.Sprintf("%s (running %s)", agent.Clean(u.Name, 80), strings.TrimSuffix(age(u.Since), " ago")))
+	}
+	if p.DiskFreeKB > 0 || p.DiskUsedKB > 0 {
+		row("disk", fmt.Sprintf("%s used, %s free on /", gib(p.DiskUsedKB), gib(p.DiskFreeKB)))
+	}
+	if p.MemAvailKB > 0 || p.MemUsedKB > 0 {
+		row("memory", fmt.Sprintf("%s used, %s available", gib(p.MemUsedKB), gib(p.MemAvailKB)))
+	}
+	c, err := a.consumptionOf(name, w.harness)
+	switch {
+	case err != nil:
+		row("consumption", err.Error())
+	default:
+		row("consumption", c.String())
+	}
+	q, ok, err := a.quotaOf(w.envFile, w.harness)
+	switch {
+	case err != nil:
+		row("quota", err.Error())
+	case !ok:
+		row("quota", "none: the credential has no subscription window")
+	default:
+		for i, line := range strings.Split(q.String(), "\n") {
+			k := ""
+			if i == 0 {
+				k = "quota"
+			}
+			row(k, line)
+		}
+		row("", "from "+q.Source)
+	}
+	readings := agent.Evaluate(w.thresholds, p, q, forwardActive(name))
+	if len(readings) == 0 {
+		fmt.Println("\nno watch thresholds: guest.agent.watch in rig.yaml sets them")
+		return
+	}
+	fmt.Println("\n--- watch thresholds ---")
+	for _, r := range readings {
+		fmt.Println("  " + r.Line())
+	}
+}
+
+func gib(kb int64) string { return fmt.Sprintf("%.1fG", float64(kb)/(1<<20)) }
+
+// consumptionOf asks the guest rig to sum the event log; the log itself
+// never crosses the wire.
+func (a *app) consumptionOf(name string, h agent.Harness) (agent.Consumption, error) {
+	out, err := a.exec(name, fmt.Sprintf("RIG_AGENT_HARNESS=%s RIG_AGENT_DIR=%s %s hook usage", h.Name(), agent.Dir, agent.GuestBinPath))
+	var exit *incus.ExitError
+	switch {
+	case errors.As(err, &exit) && exit.Code == 2:
+		return agent.Consumption{}, errors.New("no event log yet")
+	case err != nil:
+		return agent.Consumption{}, fmt.Errorf("the guest rig could not sum the event log (an older guest rig? rig agent stop && rig agent start %s reinstalls it): %v", name, err)
+	}
+	var c agent.Consumption
+	out = strings.TrimSpace(out)
+	if !strings.HasPrefix(out, "{") {
+		return c, fmt.Errorf("the guest rig in %s predates `rig hook usage`; rig agent stop %s && rig agent start %s reinstalls it", name, name, name)
+	}
+	if err := json.Unmarshal([]byte(out), &c); err != nil {
+		return c, fmt.Errorf("the guest rig's usage is not readable: %v", err)
+	}
+	return c, nil
+}
+
+func (a *app) agentUsageCmd() *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "usage <vm>",
+		Short: "What the agent has consumed: tokens from its event log, and the credential's windows",
+		Long: "Usage has two kinds, kept apart. Consumption is tokens: in, out, cache\n" +
+			"read and cache write, summed by the harness from its own event log in the\n" +
+			"guest, which every harness has. A quota is a subscription's window: the\n" +
+			"fraction used and when it resets, read from the provider with the\n" +
+			"credential on this host, which only some credentials have (an OAuth login;\n" +
+			"an API key has none). guest.agent.budgets and .watch name which kind they\n" +
+			"mean (tokens, or usage: { window, max }).",
+		Args: cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			name := args[0]
+			if err := a.requireInstance(name); err != nil {
+				return err
+			}
+			inst, h, err := a.harnessOf(name)
+			if err != nil {
+				return err
+			}
+			c, cerr := a.consumptionOf(name, h)
+			q, ok, qerr := a.quotaOf(inst.Config[creds.InstanceKey], h)
+			if asJSON {
+				out := map[string]any{"consumption": nil, "quota": nil}
+				if cerr == nil {
+					out["consumption"] = c
+				} else {
+					out["consumption_error"] = cerr.Error()
+				}
+				if ok && qerr == nil {
+					out["quota"] = q
+				} else if qerr != nil {
+					out["quota_error"] = qerr.Error()
+				}
+				return printJSON(out)
+			}
+			if cerr != nil {
+				fmt.Printf("consumption  %v\n", cerr)
+			} else {
+				fmt.Printf("consumption  %s (over %d run(s))\n", c, c.Runs)
+			}
+			switch {
+			case qerr != nil:
+				fmt.Printf("quota        %v\n", qerr)
+			case !ok:
+				fmt.Println("quota        none: the credential has no subscription window (an API key), so only tokens can be budgeted")
+			default:
+				for i, line := range strings.Split(q.String(), "\n") {
+					if i == 0 {
+						fmt.Printf("quota        %s\n", line)
+					} else {
+						fmt.Printf("             %s\n", line)
+					}
+				}
+				fmt.Printf("             from %s\n", q.Source)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "machine-readable output")
+	return cmd
 }
 
 // integrity says whether what decides who the operator is in the guest is

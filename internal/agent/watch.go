@@ -33,6 +33,17 @@ const (
 	EvStatus      = "status-changed"
 	EvUnreachable = "unreachable" // error: the probe failed; said once until it works again
 	EvReachable   = "reachable"
+	EvBudget      = "budget"   // reason: a budget fired and stopped the agent, session kept
+	EvWatchdog    = "watchdog" // reason: a run's limit cut it; it resumes with a note
+
+	// The soft thresholds (thresholds.go): state is crossed or cleared.
+	EvIdle        = "idle"         // state, age, limit: no new commit on the workdir's branch
+	EvLongUnit    = "long-unit"    // state, unit, age, limit: a transient unit the agent started, still running
+	EvStaleStatus = "stale-status" // state, age, limit: STATUS.md untouched
+	EvUsage       = "usage"        // state, window, utilization, limit: a subscription window
+	EvForwardDown = "forward-down" // port, reason: a declared forward has nothing behind it
+	EvForwardUp   = "forward-up"   // port
+	EvSent        = "sent"         // threshold, id: the message on: named for a crossing was queued
 )
 
 func ev(typ string, kv ...string) Event {
@@ -91,6 +102,9 @@ func Changes(prev *Probe, cur Probe, config map[string]string) []Event {
 		if cur.Done {
 			out = append(out, ev(EvDone, "summary", cur.Summary))
 		}
+		if cur.Budget != "" {
+			out = append(out, ev(EvBudget, "reason", cur.Budget))
+		}
 		return out
 	}
 
@@ -136,6 +150,12 @@ func Changes(prev *Probe, cur Probe, config map[string]string) []Event {
 
 	if cur.Done && !prev.Done {
 		out = append(out, ev(EvDone, "summary", cur.Summary))
+	}
+	if cur.Budget != "" && cur.Budget != prev.Budget {
+		out = append(out, ev(EvBudget, "reason", cur.Budget))
+	}
+	if cur.Watchdog != "" && cur.Watchdog != prev.Watchdog {
+		out = append(out, ev(EvWatchdog, "reason", cur.Watchdog))
 	}
 	if cur.StatusMD != prev.StatusMD && cur.StatusMD != "" {
 		out = append(out, ev(EvStatus))

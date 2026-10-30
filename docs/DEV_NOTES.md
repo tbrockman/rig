@@ -200,7 +200,14 @@ look like something else. Decisions and their history are in DESIGN.md.
   carry `parent_tool_use_id`. The OAuth usage endpoint
   (`GET https://api.anthropic.com/api/oauth/usage`, `Authorization: Bearer`
   the access token, `anthropic-beta: oauth-2025-04-20`) returns the same
-  windows for the credential, with `utilization` in percent.
+  windows for the credential, with `utilization` in percent. Not for every credential: a token
+  from `claude setup-token` is refused with 403 "OAuth token does not meet
+  scope requirement user:profile" (checked 2026-10-30 against the
+  mono-agent env), so only a full login's access token
+  (`~/.claude/.credentials.json`, or a CLAUDE_CREDENTIALS_B64 snapshot of
+  it) reads the quota. `rig agent usage` falls back to this host's own
+  login and says so: it is the operator's account, not necessarily the
+  agent's.
 - Without a statement of where operator messages come from, the model
   discounts hook-delivered text ("can't verify it's from an operator"). With
   an `--append-system-prompt` line saying rig delivers them this way, it acts

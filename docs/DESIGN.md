@@ -105,6 +105,36 @@ a proxy, the plugin would have to parse streamed response bodies rather
 than rewrite headers, and the event log is in every harness already. If a
 second harness logs no usage, the proxy is where to look next.
 
+**Mechanical signals, no facts schema.** The thresholds are on facts rig
+observes without the harness's help: the workdir's branch tip (`git` in
+the guest), transient services (`/run/systemd/transient`, minus rig's own,
+narrowed by a glob the manifest may set), STATUS.md's mtime, and the
+credential's windows. Each crossing and clearing is one `rig agent watch`
+line with the value and the limit, and `status --full` prints them all
+with the git state, the units, disk and memory, which is what one
+mission's overseer scripted around `rig agent status`, `git log`,
+`systemctl`, `df` and `free`. A `send:` on a threshold queues a canned
+message, so the agent is asked to account for itself; nothing a threshold
+does stops the agent. A typed "facts" file for the agent to fill was
+considered and rejected: an LLM overseer reads prose better than fields,
+rig can discover guest listeners itself, and STATUS.md was the right
+medium when it was kept current, which the `status` threshold now
+polices. The overseer inspects artifacts inside the VM before pulling
+anything out.
+
+**Usage has two kinds.** Consumption is tokens, summed by the harness
+from its own event log, which every harness has; the guest build carries
+the parser, so `rig hook usage` answers the host without the log crossing
+the wire. A quota is a subscription's window, a fraction used and a time
+it resets, read from the provider with the credential, which only some
+credentials have: an OAuth login has one, an API key none. They are kept
+apart because they answer different questions (how much has this run
+spent; how close is the account to being refused) and because one is
+always there and the other is not. The harness names the request and
+parses the answer; the host makes it, since the guest build has no HTTP
+client and must not grow one. A budget or threshold names which kind it
+means, and the watch evaluates what exists.
+
 **Defaults and records.** `rig agent start` resolves each option as the
 flag given now, else what the last start recorded, else the file, else
 the flag's default. The record stands in for the file once it exists,

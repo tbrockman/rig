@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -21,6 +22,9 @@ import (
 
 	"github.com/tbrockman/rig/internal/agent"
 	"github.com/tbrockman/rig/internal/agent/operator"
+	"github.com/tbrockman/rig/internal/creds"
+	"github.com/tbrockman/rig/internal/incus"
+	"github.com/tbrockman/rig/internal/manifest"
 )
 
 // The operator's half of the channel to a running agent: what it sends is
@@ -416,10 +420,22 @@ func (a *app) agentWatchCmd() *cobra.Command {
 			"  tamper          file, reason: something the guest refused to deliver\n" +
 			"  integrity       file: an installed file is no longer what rig agent start wrote\n" +
 			"  done            summary: the agent ran rig done\n" +
+			"  budget          reason: a budget stopped the agent (session kept)\n" +
+			"  watchdog        reason: a run's limit cut it; it resumes with a note\n" +
 			"  unit            from, to: the unit's state\n" +
 			"  restarts        from, to\n" +
 			"  status-changed  STATUS.md changed\n" +
 			"  unreachable     error: the read failed (once, until it works again: reachable)\n\n" +
+			"The manifest's guest.agent.watch thresholds, each when crossed and when\n" +
+			"cleared (state=crossed|cleared), with the value and the limit:\n" +
+			"  idle            age, limit: no new commit on the workdir's branch\n" +
+			"  long-unit       unit, age, limit: a transient unit the agent started, still running\n" +
+			"  stale-status    age, limit: STATUS.md untouched\n" +
+			"  usage           window, utilization, limit: a subscription window (read every 5 minutes)\n" +
+			"  forward-down    port, reason: a declared forward with no holder here or no listener there (forward-up when it is back)\n" +
+			"  sent            threshold, id: the message guest.agent.watch.on named for a crossing was queued\n" +
+			"A usage budget (guest.agent.budgets.usage) is judged here too, since it\n" +
+			"needs the credential: crossing it stops the agent as rig agent stop would.\n\n" +
 			"--exec runs a command for each event, through sh -c, with the line in\n" +
 			"RIG_EVENT, the event name in RIG_EVENT_TYPE and the VM in RIG_VM; for\n" +
 			"example, a desktop notification:\n" +
@@ -442,13 +458,18 @@ func (a *app) agentWatchCmd() *cobra.Command {
 					runForEvent(ctx, run, name, e, line)
 				}
 			}
+			w, err := a.newWatcher(name)
+			if err != nil {
+				return err
+			}
 			var prev *agent.Probe
+			var readings []agent.Reading
 			down := false
 			for {
 				inst, _, err := a.c.Instance(name)
 				raw := ""
 				if err == nil {
-					raw, err = a.exec(name, agent.StatusProbe())
+					raw, err = a.exec(name, agent.StatusProbeWith(w.probe))
 				}
 				switch {
 				case err != nil && !down:
@@ -464,6 +485,21 @@ func (a *app) agentWatchCmd() *cobra.Command {
 						emit(e)
 					}
 					prev = &cur
+					// The thresholds, and the one budget this host judges.
+					quota := w.quota(inst, emit)
+					now := agent.Evaluate(w.thresholds, cur, quota, forwardActive(name))
+					for _, e := range agent.ThresholdEvents(readings, now) {
+						emit(e)
+						if id, ok := w.react(e); ok {
+							emit(agent.NewEvent(agent.EvSent, "threshold", e.Type, "id", id))
+						}
+					}
+					readings = now
+					if reason, over := w.usageBudgetOver(quota); over && cur.Active == "active" && cur.Budget == "" {
+						if err := a.stopForBudget(name, reason); err != nil {
+							emit(agent.NewEvent(agent.EvUnreachable, "error", "stopping for the usage budget: "+err.Error()))
+						}
+					}
 				}
 				select {
 				case <-ctx.Done():
@@ -476,6 +512,210 @@ func (a *app) agentWatchCmd() *cobra.Command {
 	cmd.Flags().DurationVar(&interval, "interval", 5*time.Second, "how often to read the guest")
 	cmd.Flags().StringVar(&run, "exec", "", "a command to run for each event, with it in RIG_EVENT")
 	return cmd
+}
+
+// watcher is what `rig agent watch` carries across polls beyond the probe:
+// the manifest's thresholds, the quota it reads now and then, and the
+// messages a crossing sends.
+type watcher struct {
+	a          *app
+	name       string
+	harness    agent.Harness
+	spec       manifest.Agent
+	probe      agent.ProbeOpts
+	thresholds agent.Thresholds
+	envFile    string
+	lastQuota  time.Time
+	cached     *agent.Quota
+	quotaErr   string // said once, until it changes
+}
+
+func (a *app) newWatcher(name string) (*watcher, error) {
+	inst, h, err := a.harnessOf(name)
+	if err != nil {
+		return nil, err
+	}
+	spec, err := recordedAgent(inst)
+	if err != nil {
+		return nil, err
+	}
+	forwards, err := recordedForwards(inst)
+	if err != nil {
+		return nil, err
+	}
+	return &watcher{
+		a: a, name: name, harness: h, spec: spec,
+		probe:      probeOpts(inst, spec),
+		thresholds: thresholdsOf(spec, forwards),
+		envFile:    inst.Config[creds.InstanceKey],
+	}, nil
+}
+
+// probeOpts is what the probe needs of the run: the workdir the last start
+// recorded, else the file's, else the default; and the units glob.
+func probeOpts(inst *incus.Instance, spec manifest.Agent) agent.ProbeOpts {
+	o := agent.ProbeOpts{Workdir: agent.RecordedOptions(inst.Config).Workdir}
+	if o.Workdir == "" {
+		o.Workdir = spec.Workdir
+	}
+	if o.Workdir == "" {
+		o.Workdir = "/work"
+	}
+	if spec.Watch != nil {
+		o.Units = spec.Watch.Units
+	}
+	return o
+}
+
+// thresholdsOf is the manifest's watch block in the watch's terms, plus the
+// declared forwards, which are watched whether or not a watch block exists.
+func thresholdsOf(spec manifest.Agent, forwards []int) agent.Thresholds {
+	t := agent.Thresholds{Forwards: forwards}
+	if w := spec.Watch; w != nil {
+		t.Idle = time.Duration(w.IdleMinutes) * time.Minute
+		t.Unit = time.Duration(w.UnitMinutes) * time.Minute
+		t.Status = time.Duration(w.StatusMinutes) * time.Minute
+		if w.Usage != nil {
+			t.Usage = &agent.UsageLimit{Window: w.Usage.Window, Max: w.Usage.Max}
+		}
+	}
+	return t
+}
+
+// wantsQuota is whether anything in the manifest asks about a window.
+func (w *watcher) wantsQuota() bool {
+	return w.thresholds.Usage != nil || (w.spec.Budgets != nil && w.spec.Budgets.Usage != nil)
+}
+
+// quota is the credential's windows, read every five minutes when something
+// asks about them: the endpoint is the provider's, not to be polled every
+// few seconds. A read that fails is said once.
+func (w *watcher) quota(inst *incus.Instance, emit func(agent.Event)) *agent.Quota {
+	if !w.wantsQuota() || time.Since(w.lastQuota) < 5*time.Minute {
+		return w.cached
+	}
+	w.lastQuota = time.Now()
+	q, ok, err := w.a.quotaOf(inst.Config[creds.InstanceKey], w.harness)
+	switch {
+	case err != nil && err.Error() != w.quotaErr:
+		w.quotaErr = err.Error()
+		emit(agent.NewEvent(agent.EvUnreachable, "error", "quota: "+err.Error()))
+	case err == nil:
+		w.quotaErr = ""
+		if ok {
+			w.cached = q
+		}
+	}
+	return w.cached
+}
+
+// react sends the message guest.agent.watch.on names for a threshold that
+// was just crossed, and returns the message's id.
+func (w *watcher) react(e agent.Event) (string, bool) {
+	if w.spec.Watch == nil || e.Value("state") != "crossed" {
+		return "", false
+	}
+	name := map[string]string{agent.EvIdle: "idle", agent.EvLongUnit: "unit", agent.EvStaleStatus: "status", agent.EvUsage: "usage"}[e.Type]
+	action, ok := w.spec.Watch.On[name]
+	if !ok || action.Send == "" {
+		return "", false
+	}
+	ch, err := w.a.openChannel(w.name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "rig: cannot send for %s: %v\n", name, err)
+		return "", false
+	}
+	env, err := w.a.deliver(ch, agent.KindMessage, "", action.Send)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "rig: cannot send for %s: %v\n", name, err)
+		return "", false
+	}
+	return env.ID, true
+}
+
+// usageBudgetOver is whether the manifest's usage budget is crossed.
+func (w *watcher) usageBudgetOver(q *agent.Quota) (string, bool) {
+	if w.spec.Budgets == nil || w.spec.Budgets.Usage == nil {
+		return "", false
+	}
+	u := w.spec.Budgets.Usage
+	win, ok := q.Window(u.Window)
+	if !ok || win.Utilization <= u.Max {
+		return "", false
+	}
+	return fmt.Sprintf("usage: %s window at %.0f%% of %.0f%%", u.Window, win.Utilization*100, u.Max*100), true
+}
+
+// quotaOf reads the credential file's variables, has the harness name the
+// request, and makes it: the credential goes to the provider and nowhere
+// else, and is never printed.
+func (a *app) quotaOf(envFile string, h agent.Harness) (*agent.Quota, bool, error) {
+	if envFile == "" {
+		return nil, false, nil
+	}
+	vars, err := creds.Values(envFile)
+	if err != nil {
+		return nil, true, err
+	}
+	reqs, err := h.QuotaRequests(vars)
+	if err != nil || len(reqs) == 0 {
+		return nil, false, err
+	}
+	// Best source first; the next is tried when the provider refuses one
+	// (a setup-token lacks the scope), and the last refusal is the error.
+	for _, req := range reqs {
+		q, err := fetchQuota(req)
+		if err == nil {
+			q.Source = req.Source
+			return q, true, nil
+		}
+		if !errors.Is(err, errRefused) {
+			return nil, true, err
+		}
+		if req.Source == reqs[len(reqs)-1].Source {
+			return nil, true, fmt.Errorf("%s: %w", req.Source, err)
+		}
+	}
+	return nil, true, nil
+}
+
+// errRefused is the provider answering, and saying no: the next source may
+// do better.
+var errRefused = errors.New("refused")
+
+// quotaClient makes the quota request; a test points it elsewhere.
+var quotaClient = &http.Client{Timeout: 20 * time.Second}
+
+func fetchQuota(req agent.QuotaRequest) (*agent.Quota, error) {
+	r, err := http.NewRequest(http.MethodGet, req.URL, nil)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range req.Headers {
+		r.Header.Set(k, v)
+	}
+	resp, err := quotaClient.Do(r)
+	if err != nil {
+		return nil, fmt.Errorf("reading the subscription's usage: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: the usage endpoint answered %s: %s", errRefused, resp.Status, agent.Clean(string(body), 200))
+	}
+	return req.Parse(body, time.Now())
+}
+
+// stopForBudget does in the guest what the runner does for a budget it
+// judges itself: the marker, then the stop. The next probe reports it.
+func (a *app) stopForBudget(name, reason string) error {
+	cmd := fmt.Sprintf("printf '%%s\\n%%s\\n' %s \"$(date -Is)\" > %s/%s && systemctl stop %s",
+		shellQuote([]string{reason}), agent.Dir, agent.BudgetName, agent.Unit)
+	_, err := a.exec(name, cmd)
+	return err
 }
 
 // runForEvent runs --exec's command for one event. Its output goes to stderr,

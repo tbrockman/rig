@@ -241,6 +241,34 @@ type Probe struct {
 	RecentDeliveries []Delivery // its last few, oldest first
 	Tampers          int        // lines in tamper.jsonl
 	RecentTampers    []Tamper   // its last few, oldest first
+
+	// The workdir's git state, when ProbeOpts named one and it is a checkout.
+	Branch    string
+	Head      int64 // unix seconds of the branch's tip commit
+	Tip       string
+	Dirty     int      // files git status lists
+	Worktrees []string // git worktree list, one line each
+
+	Units      []TransientUnit // transient services running, other than rig's
+	DiskUsedKB int64           // / in the guest
+	DiskFreeKB int64
+	MemUsedKB  int64
+	MemAvailKB int64
+	Listening  map[int]bool // TCP ports with a listener in the guest; nil when the guest did not say
+}
+
+// TransientUnit is a systemd-run service running in the guest, with when
+// it went active.
+type TransientUnit struct {
+	Name  string
+	Since int64 // unix seconds, 0 when unknown
+}
+
+// ProbeOpts widens the probe to what the agent's run adds: the workdir's
+// git state, and the transient units, narrowed by a glob when one is set.
+type ProbeOpts struct {
+	Workdir string
+	Units   string // a shell glob over unit names; "" is every transient service but rig's
 }
 
 // How many of each list item the probe reads, and how many bytes of each.
@@ -260,14 +288,21 @@ const (
 // Every line is key=value. What the guest wrote (asks, answers, log lines) is
 // cut to a bounded length and one line each; it is data from the guest, which
 // the host displays only after cleaning it (Clean).
-func StatusProbe() string { return statusProbe(Dir) }
+func StatusProbe() string { return statusProbe(Dir, ProbeOpts{}) }
 
-func statusProbe(dir string) string {
+// StatusProbeWith is StatusProbe plus what ProbeOpts asks for.
+func StatusProbeWith(o ProbeOpts) string { return statusProbe(Dir, o) }
+
+func statusProbe(dir string, o ProbeOpts) string {
 	sums := ""
 	for _, f := range Installed {
 		sums += fmt.Sprintf("echo \"sha256:%[1]s=$(test -f $d/%[1]s && sha256sum < $d/%[1]s | cut -c1-64)\"\n", f.Name)
 	}
-	return fmt.Sprintf(`u=%[1]s d=%[2]s
+	glob := o.Units
+	if glob == "" {
+		glob = "*"
+	}
+	return fmt.Sprintf(`u=%[1]s d=%[2]s w=%[16]s
 echo "active=$(systemctl is-active $u 2>/dev/null)"
 echo "restarts=$(systemctl show $u -p NRestarts --value 2>/dev/null)"
 echo "started=$(date -d "$(systemctl show $u -p ActiveEnterTimestamp --value 2>/dev/null)" +%%s 2>/dev/null)"
@@ -289,11 +324,33 @@ done
 echo "deliveries=$(cat $d/%[11]s 2>/dev/null | wc -l)"
 tail -n %[13]d $d/%[11]s 2>/dev/null | cut -c1-1024 | sed 's/^/delivery=/'
 echo "tampers=$(cat $d/%[12]s 2>/dev/null | wc -l)"
-tail -n %[13]d $d/%[12]s 2>/dev/null | cut -c1-1024 | sed 's/^/tamper=/'`,
+tail -n %[13]d $d/%[12]s 2>/dev/null | cut -c1-1024 | sed 's/^/tamper=/'
+if [ -n "$w" ] && git -C "$w" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "branch=$(git -C "$w" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  echo "head=$(git -C "$w" log -1 --format=%%ct 2>/dev/null)"
+  echo "tip=$(git -C "$w" log -1 --format='%%h %%s' 2>/dev/null | head -c 200 | tr -d '\n')"
+  echo "dirty=$(git -C "$w" status --short 2>/dev/null | wc -l)"
+  git -C "$w" worktree list 2>/dev/null | cut -c1-300 | sed 's/^/worktree=/'
+fi
+for f in /run/systemd/transient/*.service; do
+  [ -e "$f" ] || continue
+  n=$(basename "$f")
+  case "$n" in $u.service|rig-*.service) continue;; esac
+  case "$n" in %[17]s) ;; *) continue;; esac
+  [ "$(systemctl is-active "$n" 2>/dev/null)" = active ] || continue
+  t=$(systemctl show "$n" -p ActiveEnterTimestamp --value 2>/dev/null)
+  echo "unit=$n $([ -n "$t" ] && date -d "$t" +%%s 2>/dev/null)"
+done
+echo "disk=$(df -Pk / 2>/dev/null | awk 'NR==2{print $3, $4}')"
+echo "mem=$(free -k 2>/dev/null | awk 'NR==2{print $3, $7}')"
+echo "listen=$(ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -un | tr '\n' ' ')"`,
 		Unit, dir, DoneName, InboxName, EnvelopeExt, LegacyInboxName, sums,
 		AsksName, maxProbed, AnswersName, DeliveriesName, TamperName, recentLogs,
-		BudgetName, WatchdogName)
+		BudgetName, WatchdogName, shellWord(o.Workdir), glob)
 }
+
+// shellWord quotes s for the probe's shell; "" is ”.
+func shellWord(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 // ParseProbe reads StatusProbe's output. Anything missing stays zero: a probe
 // that could not answer must not invent a number status will present as fact.
@@ -361,6 +418,34 @@ func ParseProbe(out string) Probe {
 			var t Tamper
 			if json.Unmarshal([]byte(v), &t) == nil {
 				p.RecentTampers = append(p.RecentTampers, t)
+			}
+		case "branch":
+			p.Branch = strings.TrimSpace(v)
+		case "head":
+			p.Head = num(v)
+		case "tip":
+			p.Tip = strings.TrimSpace(v)
+		case "dirty":
+			p.Dirty = int(num(v))
+		case "worktree":
+			p.Worktrees = append(p.Worktrees, strings.TrimSpace(v))
+		case "unit":
+			name, since, _ := strings.Cut(strings.TrimSpace(v), " ")
+			if name != "" {
+				p.Units = append(p.Units, TransientUnit{Name: name, Since: num(since)})
+			}
+		case "disk":
+			used, free, _ := strings.Cut(strings.TrimSpace(v), " ")
+			p.DiskUsedKB, p.DiskFreeKB = num(used), num(free)
+		case "mem":
+			used, avail, _ := strings.Cut(strings.TrimSpace(v), " ")
+			p.MemUsedKB, p.MemAvailKB = num(used), num(avail)
+		case "listen":
+			p.Listening = map[int]bool{}
+			for _, port := range strings.Fields(v) {
+				if n, err := strconv.Atoi(port); err == nil {
+					p.Listening[n] = true
+				}
 			}
 		default:
 			if name, ok := strings.CutPrefix(k, "sha256:"); ok {

@@ -187,9 +187,10 @@ devShell, a test that the card really computes, and Claude Code in the image.
 rig apply -f examples/cuda-agent/rig.yaml --start
 rig push cuda-agent examples/cuda-agent          # -> /work/cuda-agent
 rig agent start cuda-agent --prompt-file brief.md --workdir /work/cuda-agent --until-done
-rig agent status cuda-agent      # cheap; check often
+rig agent status cuda-agent      # cheap; check often (--full: branch, units, disk, usage, thresholds)
 rig agent log cuda-agent         # what it said, minus the tool calls
-rig agent watch cuda-agent       # one line per change: asks, deliveries, tamper, done
+rig agent watch cuda-agent       # one line per change: asks, deliveries, budgets, thresholds, done
+rig agent usage cuda-agent       # tokens from its event log, and the credential's windows
 rig agent send cuda-agent "Skip E3; the docs are out of scope."
 rig agent answer cuda-agent cuda "Stay on 12.4."   # the agent asked: rig ask cuda "..."
 rig agent brief cuda-agent       # after editing brief.md: the agent gets the diff
@@ -271,7 +272,7 @@ values); `rig creds` swaps a key without a restart, as before.
 | `creds` | Swap the credential in a running VM |
 | `proxy setup/status/log` | The host proxies that hold proxied credentials, one per guest |
 | `agent install/start/stop` | The coding agent (Claude Code by default) as a systemd unit that resumes its session after a crash |
-| `agent status/watch/log` | What it is doing, one line per change for a notifier, what it said |
+| `agent status/watch/log/usage` | What it is doing (`--full` for the run's facts), one line per change for a notifier, what it said, what it has consumed |
 | `agent send/answer/asks/brief` | Signed messages, answers to its `rig ask`s, and brief changes as diffs, delivered mid-turn |
 
 | Grants and isolation | |

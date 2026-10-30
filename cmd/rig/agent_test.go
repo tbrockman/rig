@@ -85,7 +85,8 @@ func TestAgentVerbsSayWhatTheyDoNow(t *testing.T) {
 	watch := a.agentWatchCmd().Long
 	for _, ev := range []string{agent.EvWatching, agent.EvAskOpened, agent.EvAskAnswered, agent.EvDelivered,
 		agent.EvTamper, agent.EvIntegrity, agent.EvDone, agent.EvUnit, agent.EvRestarts, agent.EvStatus,
-		agent.EvUnreachable, "RIG_EVENT"} {
+		agent.EvUnreachable, agent.EvBudget, agent.EvWatchdog, agent.EvIdle, agent.EvLongUnit, agent.EvStaleStatus,
+		agent.EvUsage, agent.EvForwardDown, agent.EvForwardUp, agent.EvSent, "RIG_EVENT"} {
 		if !strings.Contains(watch, ev) {
 			t.Errorf("watch's help does not document %s", ev)
 		}
