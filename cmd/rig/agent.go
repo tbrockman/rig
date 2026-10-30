@@ -185,6 +185,18 @@ func (a *app) agentStartCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// The one budget the guest cannot judge: a usage window already
+			// crossed would have the watch stop the agent at its first poll,
+			// so refuse here, where the operator is, and name the reset.
+			if b := spec.Budgets; b != nil && b.Usage != nil {
+				if q, ok, err := a.quotaOf(inst.Config[creds.InstanceKey], h); err == nil && ok {
+					if w, found := q.Window(b.Usage.Window); found && w.Utilization > b.Usage.Max {
+						return fmt.Errorf("the usage budget is already crossed: %s window at %.0f%% of %.0f%% (from %s), resets %s.\n"+
+							"  Wait for the reset, or raise guest.agent.budgets.usage in rig.yaml and rig apply -f",
+							b.Usage.Window, w.Utilization*100, b.Usage.Max*100, q.Source, w.ResetsAt.UTC().Format(time.RFC3339))
+					}
+				}
+			}
 			opts, err := startOptions(cmd.Flags().Changed, agent.RecordedOptions(inst.Config), manifestDefaults(spec), agent.StartOptions{
 				PromptFile: promptFile, Workdir: workdir, Model: model, Timeout: timeout, IdleTimeout: idleTimeout,
 				MemoryMax: memMax, UntilDone: untilDone, Restarts: restarts,
