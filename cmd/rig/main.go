@@ -10,11 +10,10 @@
 package main
 
 import (
-	"encoding/json"
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -23,6 +22,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 
 	"github.com/tbrockman/rig/internal/cpuset"
 	"github.com/tbrockman/rig/internal/creds"
@@ -33,7 +33,6 @@ import (
 	"github.com/tbrockman/rig/internal/policy"
 	"github.com/tbrockman/rig/internal/ports"
 	"github.com/tbrockman/rig/internal/proxy"
-	"github.com/tbrockman/rig/internal/pushguard"
 	"github.com/tbrockman/rig/internal/volumes"
 )
 
@@ -73,7 +72,7 @@ func main() {
 			"  rig init myproj                        # a rig.yaml and a guest flake\n" +
 			"  rig apply -f myproj/rig.yaml --start   # the VM that file describes\n" +
 			"  rig doctor myproj && rig verify myproj # configured, then proven\n" +
-			"  rig shell myproj\n\n" +
+			"  rig sh myproj\n\n" +
 			"Exit status is 0 or 1 except where a verb says otherwise: verify exits 2\n" +
 			"for \"could not be proven\", and exec carries the guest command's status out.\n" +
 			"Progress notes go to stdout prefixed \"rig:\"; errors go to stderr.\n\n" +
@@ -99,8 +98,8 @@ func main() {
 	)
 	root.AddCommand(
 		a.initCmd(), a.schemaCmd(),
-		a.newCmd(), a.startCmd(), a.stopCmd(), a.restartCmd(), a.rmCmd(),
-		a.statusCmd(), a.doctorCmd(), a.verifyCmd(), a.logsCmd(),
+		a.newCmd(), a.startCmd(), a.stopCmd(), a.restartCmd(), a.rmCmd(), a.deleteCmd(),
+		a.listCmd(), a.statusCmd(), a.doctorCmd(), a.verifyCmd(), a.logsCmd(),
 		a.execCmd(), a.shellCmd(), a.pushCmd(), a.pullCmd(), a.agentCmd(),
 		a.credsCmd(), a.proxyCmd(),
 		a.mountCmd(), a.unmountCmd(), a.forwardCmd(),
@@ -344,14 +343,13 @@ func (a *app) afterNew(name, profile string, start bool) error {
 	if err != nil {
 		return err
 	}
+	// The caller has said it was created; this adds what that does not show.
 	if len(wanted) > 0 {
 		var names []string
 		for _, d := range wanted {
 			names = append(names, d.Name)
 		}
-		note("created %s; it will claim %s on start", name, strings.Join(names, ", "))
-	} else {
-		note("created %s (no host devices)", name)
+		note("it will claim %s on start", strings.Join(names, ", "))
 	}
 	if start {
 		return a.startInstance(name, 3*time.Minute, true)
@@ -809,6 +807,7 @@ func (a *app) applyCmd() *cobra.Command {
 				if err := a.newFromManifest(m, profile); err != nil {
 					return err
 				}
+				note("created %s from %s", name, m.Path)
 				return a.afterNew(name, profile, start)
 			}
 			if dryRun {
@@ -863,188 +862,144 @@ func (a *app) applyCmd() *cobra.Command {
 	return cmd
 }
 
+// rmLong is what rm and delete both do, since delete is rm by manifest.
+const rmLong = "Deletes the VM and its disk, after asking: everything on that disk is gone\n" +
+	"for good, /work included. Only volumes outlive it, and they are kept unless\n" +
+	"--volumes says otherwise. A running VM is refused unless --force stops it\n" +
+	"first. Without a terminal to ask on, --yes is required."
+
 func (a *app) rmCmd() *cobra.Command {
-	var force, dropVolumes bool
-	var file string
+	var force, dropVolumes, yes bool
 	cmd := &cobra.Command{
-		Use:     "rm <vm> | rm -f rig.yaml",
-		Aliases: []string{"delete"},
+		Use:     "rm <vm>",
 		GroupID: "vm",
-		Short:   "Delete a stopped VM that rig created (also: rig delete -f rig.yaml)",
-		Args:    cobra.MaximumNArgs(1),
+		Short:   "Delete a VM that rig created, and its disk (by manifest: rig delete -f)",
+		Long:    rmLong,
+		Args:    cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			var name string
-			switch {
-			case file != "" && len(args) == 0:
-				m, err := manifest.Load(file)
-				if err != nil {
-					return err
-				}
-				name = m.Guest.Name
-			case file == "" && len(args) == 1:
-				name = args[0]
-			default:
-				return errors.New("name the VM, or pass -f rig.yaml, not both")
+			// `rig rm -f rig.yaml` was this verb's manifest form, before -f
+			// came to mean force here as it does for docker rm.
+			if strings.HasSuffix(args[0], ".yaml") || strings.HasSuffix(args[0], ".yml") {
+				return fmt.Errorf("%s is a manifest, and rm takes a VM's name. By manifest:\n  rig delete -f %s", args[0], args[0])
 			}
-			if err := a.requireInstance(name); err != nil {
-				return err
-			}
-			inst, _, err := a.c.Instance(name)
-			if err != nil {
-				return err
-			}
-			if inst.Config[managedKey] != "true" {
-				return fmt.Errorf("%s was not created by rig (no %s marker).\n"+
-					"Delete it deliberately with incus if that is what you want.", name, managedKey)
-			}
-			if !inst.Stopped() {
-				if !force {
-					return fmt.Errorf("%s is %s. Stop it first, or pass --force.",
-						name, strings.ToLower(inst.Status))
-				}
-				if err := a.stop(name, 2*time.Minute, false); err != nil {
-					return err
-				}
-			}
-			note("deleting %s and its disk (including /work)", name)
-			if err := a.c.DeleteInstance(name); err != nil {
-				return err
-			}
-			note("deleted %s", name)
-			a.proxyRemove(inst)
-			// Volumes outlive the VM on purpose, unless asked otherwise; either
-			// way, say which, so none is forgotten or mistaken for deleted.
-			pool := volumes.Pool(inst)
-			for _, v := range volumes.Held(inst) {
-				if !dropVolumes {
-					note("kept volume %s (it outlives the VM; a new VM's manifest can mount it again)", v)
-					continue
-				}
-				if err := a.c.DeleteCustomVolume(pool, v); err != nil {
-					note("WARNING: could not delete volume %s: %v", v, err)
-					continue
-				}
-				note("deleted volume %s and everything on it", v)
-			}
-			// The per-instance ACL for its published ports is not part of the
-			// instance, so Incus does not take it along.
-			if err := ports.Cleanup(a.c, name); err != nil {
-				note("WARNING: could not delete %s's port ACL: %v", name, err)
-			}
-			return nil
+			return a.remove(args[0], force, yes, dropVolumes)
 		},
 	}
-	cmd.Flags().StringVarP(&file, "file", "f", "", "the manifest naming the VM")
-	cmd.Flags().BoolVar(&force, "force", false, "stop it first if it is running")
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "stop it first if it is running")
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "do not ask; for scripts, which have no terminal to ask on")
 	cmd.Flags().BoolVar(&dropVolumes, "volumes", false,
 		"also delete the volumes it mounts, and everything on them (by default they are kept)")
 	return cmd
 }
 
-// --- inspection ----------------------------------------------------------
-
-func (a *app) statusCmd() *cobra.Command {
-	var asJSON bool
+func (a *app) deleteCmd() *cobra.Command {
+	var force, dropVolumes, yes bool
+	var file string
 	cmd := &cobra.Command{
-		Use:     "status",
+		Use:     "delete -f rig.yaml",
 		GroupID: "vm",
-		Short:   "Who holds which host device, and which VMs exist",
-		Args:    cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			instances, err := a.c.Instances()
-			if err != nil {
-				return err
-			}
-			if err := devices.CheckProfiles(a.c, instances); err != nil {
-				return err
-			}
-			holders := devices.Holders(instances)
-
-			type row struct {
-				Name     string   `json:"name"`
-				Status   string   `json:"status"`
-				HasGPU   bool     `json:"has_gpu"`
-				Devices  []string `json:"devices"`
-				Isolated bool     `json:"isolated"`
-				Managed  bool     `json:"managed"`
-			}
-			rows := []row{}
-			for i := range instances {
-				inst := &instances[i]
-				hasGPU := false
-				held := []string{}
-				for _, h := range holders {
-					if h.Instance != inst.Name {
-						continue
-					}
-					held = append(held, h.Device)
-					if h.Kind == manifest.KindGPU {
-						hasGPU = true
-					}
-				}
-				unisolated, _ := policy.Report(inst, a.cfg.ACL)
-				rows = append(rows, row{inst.Name, inst.Status, hasGPU, held,
-					len(unisolated) == 0, inst.Config[managedKey] == "true"})
-			}
-
-			if asJSON {
-				if holders == nil {
-					holders = []devices.Holder{}
-				}
-				// "card" is the address the next claim would use, discovered
-				// even when nothing holds it, so callers need not re-implement
-				// the lookup.
-				card, _ := devices.DiscoverPCI(a.c, a.cfg)
-				enc := json.NewEncoder(os.Stdout)
-				enc.SetIndent("", "  ")
-				return enc.Encode(map[string]any{
-					"card": card, "holders": holders, "instances": rows,
-				})
-			}
-
-			// One line per exclusive device, and a loud one for an address
-			// configured twice: that is the state where the next start
-			// hot-unplugs hardware from a running guest, silently.
-			byAddr := map[string][]devices.Holder{}
-			for _, h := range holders {
-				if h.Exclusive() {
-					byAddr[h.PCI] = append(byAddr[h.PCI], h)
-				}
-			}
-			if len(byAddr) == 0 {
-				fmt.Println("no host device is assigned to a VM.")
-			}
-			for _, addr := range sortedKeys(byAddr) {
-				hs := byAddr[addr]
-				if len(hs) == 1 {
-					fmt.Printf("%s %s held by %s (%s) as %s\n", hs[0].Kind, addr, hs[0].Instance, hs[0].Status, hs[0].Device)
-					continue
-				}
-				var who []string
-				for _, h := range hs {
-					who = append(who, h.Instance)
-				}
-				fmt.Printf("!! %s %s is configured on MULTIPLE instances (%s) — starting a second\n", hs[0].Kind, addr, strings.Join(who, ", "))
-				fmt.Println("   one will hot-unplug it from the first. Fix with `rig release`.")
-			}
-			fmt.Println()
-			for _, r := range rows {
-				mark := " "
-				if len(r.Devices) > 0 {
-					mark = "*"
-				}
-				flags := ""
-				if !r.Isolated {
-					flags = "  !! NO ISOLATION"
-				}
-				fmt.Printf(" %s %-20s %-10s%s\n", mark, r.Name, r.Status, flags)
+		Short:   "Delete the VM a manifest describes, and its disk (by name: rig rm)",
+		Long:    rmLong + "\n\n-f names the manifest, as it does for apply.",
+		Args: func(_ *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				return fmt.Errorf("delete takes -f rig.yaml, not a name. By name:\n  rig rm %s", args[0])
 			}
 			return nil
 		},
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if file == "" {
+				return errors.New("rig delete needs -f rig.yaml. By name:  rig rm <vm>")
+			}
+			m, err := manifest.Load(file)
+			if err != nil {
+				return err
+			}
+			return a.remove(m.Guest.Name, force, yes, dropVolumes)
+		},
 	}
-	cmd.Flags().BoolVar(&asJSON, "json", false, "machine-readable output")
+	cmd.Flags().StringVarP(&file, "file", "f", "", "the manifest naming the VM")
+	cmd.Flags().BoolVar(&force, "force", false, "stop it first if it is running")
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "do not ask; for scripts, which have no terminal to ask on")
+	cmd.Flags().BoolVar(&dropVolumes, "volumes", false,
+		"also delete the volumes it mounts, and everything on them (by default they are kept)")
 	return cmd
 }
+
+// remove is rm and delete: it asks, stops the VM if force allows, and deletes
+// it with what it alone owns, keeping its volumes unless dropVolumes.
+func (a *app) remove(name string, force, yes, dropVolumes bool) error {
+	if err := a.requireInstance(name); err != nil {
+		return err
+	}
+	inst, _, err := a.c.Instance(name)
+	if err != nil {
+		return err
+	}
+	if inst.Config[managedKey] != "true" {
+		return fmt.Errorf("%s was not created by rig (no %s marker).\n"+
+			"Delete it deliberately with incus if that is what you want.", name, managedKey)
+	}
+	if !inst.Stopped() && !force {
+		return fmt.Errorf("%s is %s. Stop it first, or pass --force.",
+			name, strings.ToLower(inst.Status))
+	}
+	if !yes {
+		vols := volumes.Held(inst)
+		note("this deletes %s's disk for good, and everything on it that is not on a volume:", name)
+		note("  /work, /home, and every other change made inside the guest.")
+		switch {
+		case len(vols) == 0:
+			note("it mounts no volumes, so nothing of it is kept.")
+		case dropVolumes:
+			note("--volumes: its volumes go too: %s", strings.Join(vols, ", "))
+		default:
+			note("kept: its volumes %s", strings.Join(vols, ", "))
+		}
+		if !inst.Stopped() {
+			note("it is %s; it is stopped first.", strings.ToLower(inst.Status))
+		}
+		ok, err := confirm("Delete "+name+"?", "--yes")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("kept %s; nothing was deleted", name)
+		}
+	}
+	if !inst.Stopped() {
+		if err := a.stop(name, 2*time.Minute, false); err != nil {
+			return err
+		}
+	}
+	note("deleting %s and its disk (including /work)", name)
+	if err := a.c.DeleteInstance(name); err != nil {
+		return err
+	}
+	note("deleted %s", name)
+	a.proxyRemove(inst)
+	// Volumes outlive the VM on purpose, unless asked otherwise; either
+	// way, say which, so none is forgotten or mistaken for deleted.
+	pool := volumes.Pool(inst)
+	for _, v := range volumes.Held(inst) {
+		if !dropVolumes {
+			note("kept volume %s (it outlives the VM; a new VM's manifest can mount it again)", v)
+			continue
+		}
+		if err := a.c.DeleteCustomVolume(pool, v); err != nil {
+			note("WARNING: could not delete volume %s: %v", v, err)
+			continue
+		}
+		note("deleted volume %s and everything on it", v)
+	}
+	// The per-instance ACL for its published ports is not part of the
+	// instance, so Incus does not take it along.
+	if err := ports.Cleanup(a.c, name); err != nil {
+		note("WARNING: could not delete %s's port ACL: %v", name, err)
+	}
+	return nil
+}
+
+// --- inspection ----------------------------------------------------------
 
 // doctor answers "is this VM what I think it is" in one command, so the answer
 // does not depend on remembering six checks in the right order.
@@ -1380,23 +1335,40 @@ func (a *app) doctorCmd() *cobra.Command {
 }
 
 func (a *app) logsCmd() *cobra.Command {
-	return &cobra.Command{
+	var lines int
+	var follow bool
+	cmd := &cobra.Command{
 		Use:     "logs <vm>",
 		GroupID: "vm",
 		Short:   "Console log, for when a VM never comes up",
-		Args:    cobra.ExactArgs(1),
+		Long: "Prints what the VM wrote to its console: the boot, and anything after.\n" +
+			"-n keeps the last lines; -f keeps printing as the console grows, until\n" +
+			"interrupted.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			if err := a.requireInstance(args[0]); err != nil {
+			name := args[0]
+			if err := a.requireInstance(name); err != nil {
 				return err
 			}
-			log, err := a.c.ConsoleLog(args[0])
+			log, err := a.c.ConsoleLog(name)
 			if err != nil {
 				return err
 			}
-			fmt.Println(log)
-			return nil
+			out := tailLines(log, lines)
+			fmt.Print(out)
+			if !strings.HasSuffix(out, "\n") {
+				fmt.Println()
+			}
+			if !follow {
+				return nil
+			}
+			return followConsole(time.Second, log, func() (string, error) { return a.c.ConsoleLog(name) },
+				func(s string) { fmt.Print(s) })
 		},
 	}
+	cmd.Flags().IntVarP(&lines, "lines", "n", 0, "only the last this many lines (default: all)")
+	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "keep printing as the console grows")
+	return cmd
 }
 
 // --- working inside a guest ----------------------------------------------
@@ -1406,37 +1378,81 @@ func (a *app) execCmd() *cobra.Command {
 	var stdin bool
 	var timeout time.Duration
 	cmd := &cobra.Command{
-		Use:     "exec <vm> <command>...",
+		Use:     "exec [flags] <vm> -- <command>...",
 		GroupID: "guest",
 		Short:   "Run a command in the guest",
-		Long: "Run a command in the guest through a login shell, so the guest's own\n" +
-			"PATH applies.\n\n" +
-			"rig's own flags must come before the instance name, because everything\n" +
-			"after it belongs to the guest command:\n" +
-			"  rig exec --dir /work/foo myvm ls -la",
-		Args:                  cobra.MinimumNArgs(2),
+		Long: "Runs a command in the guest through a login shell, so the guest's own\n" +
+			"PATH applies. The command goes after --, and nothing after it is rig's;\n" +
+			"rig's flags go anywhere before it.\n\n" +
+			"Several words arrive exactly as given, as with docker exec; one is a\n" +
+			"shell script, for pipes, && and the like:\n" +
+			"  rig exec myvm --dir /work/foo -- ls -la\n" +
+			"  rig exec myvm -- 'cd /work/foo && git log --oneline | head'\n\n" +
+			"stdin is not forwarded unless -i says so, as with docker exec: forwarded\n" +
+			"by default, a script looping over its own input would lose it to the\n" +
+			"guest. The guest command's exit status is rig's.",
+		Args:                  cobra.MinimumNArgs(1),
 		DisableFlagsInUseLine: true,
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(c *cobra.Command, args []string) error {
+			switch dash := c.ArgsLenAtDash(); {
+			case dash < 0 && len(args) > 1:
+				return fmt.Errorf("the guest's command goes after --, where rig reads nothing:\n"+
+					"  rig exec %s -- %s", args[0], quoteForDisplay(args[1:]))
+			case dash < 0 || len(args) == dash:
+				return fmt.Errorf("no command; it goes after --:\n  rig exec %s -- <command>", args[0])
+			case dash != 1:
+				return fmt.Errorf("name one VM before --, and put the command after it:\n"+
+					"  rig exec %s -- %s", args[0], quoteForDisplay(args[dash:]))
+			}
 			if err := a.requireInstance(args[0]); err != nil {
 				return err
 			}
-			_, err := a.c.Exec(args[0], strings.Join(args[1:], " "), incus.ExecOpts{
+			_, err := a.c.Exec(args[0], guestCommand(args[1:]), incus.ExecOpts{
 				Dir: dir, Stdin: stdin, Timeout: timeout, Streaming: true,
 			})
 			return err
 		},
 	}
-	// Everything after the instance name is the guest's, flags included.
-	cmd.Flags().SetInterspersed(false)
+	// Without --, the guest command's own flags reach rig's parser first.
+	cmd.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
+		return fmt.Errorf("%w\nThe guest's command goes after --, where rig reads nothing:\n"+
+			"  rig exec <vm> -- <command>", err)
+	})
 	cmd.Flags().StringVar(&dir, "dir", "", "working directory in the guest")
-	cmd.Flags().BoolVar(&stdin, "stdin", false, "forward stdin")
+	cmd.Flags().BoolVarP(&stdin, "stdin", "i", false, "forward stdin")
 	cmd.Flags().DurationVar(&timeout, "timeout", 0, "kill the command after this long")
 	return cmd
 }
 
+// guestCommand is what the guest's shell runs. One argument is a script, pipes
+// and && included; several are a command and its arguments, quoted so each
+// arrives as given.
+func guestCommand(words []string) string {
+	if len(words) == 1 {
+		return words[0]
+	}
+	return shellQuote(words)
+}
+
+// quoteForDisplay renders words as they would be typed, quoting only those
+// the shell would otherwise split or expand.
+func quoteForDisplay(words []string) string {
+	out := make([]string, len(words))
+	for i, w := range words {
+		out[i] = w
+		if w == "" || strings.ContainsFunc(w, func(r rune) bool {
+			return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("-_./=:,@%+", r))
+		}) {
+			out[i] = shellQuote([]string{w})
+		}
+	}
+	return strings.Join(out, " ")
+}
+
 func (a *app) shellCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:     "shell <vm>",
+		Use:     "sh <vm>",
+		Aliases: []string{"shell"},
 		GroupID: "guest",
 		Short:   "Interactive login shell in the guest",
 		Args:    cobra.ExactArgs(1),
@@ -1449,107 +1465,28 @@ func (a *app) shellCmd() *cobra.Command {
 	}
 }
 
-func (a *app) pushCmd() *cobra.Command {
-	var dest string
-	var force bool
-	cmd := &cobra.Command{
-		Use:     "push <vm> <src-dir>",
-		GroupID: "guest",
-		Short:   "Copy a host directory's contents into the guest",
-		Long: "Copies the *contents* of <src-dir> to <dest>, which defaults to\n" +
-			"/work/<basename>. Unlike `incus file push -r`, the destination is\n" +
-			"exactly the destination — no directory named after the source appears.",
-		Args: cobra.ExactArgs(2),
-		RunE: func(_ *cobra.Command, args []string) error {
-			name, src := args[0], strings.TrimRight(args[1], "/")
-			if err := a.requireInstance(name); err != nil {
-				return err
-			}
-			target := dest
-			if target == "" {
-				abs, err := filepath.Abs(src)
-				if err != nil {
-					return err
-				}
-				target = path.Join("/work", filepath.Base(abs))
-			}
-			// Refuse to destroy anything rig did not itself write. /work lives
-			// inside the instance, so a clobbered guest file may have been the
-			// only copy.
-			if !force {
-				conflicts, err := pushguard.Check(a.c, name, src, target)
-				if err != nil {
-					return err
-				}
-				if len(conflicts) > 0 {
-					return pushguard.Error(conflicts, name, target)
-				}
-			}
-
-			n, err := a.c.PushDir(name, src, target)
-			if err != nil {
-				return err
-			}
-
-			// Record what we wrote, so the next push can tell our own writes
-			// from someone else's. A failure here is not fatal — the push
-			// already happened — but it must be visible, because the next push
-			// will refuse rather than clobber and that needs explaining.
-			contents, readErr := pushguard.ReadAll(src)
-			if readErr == nil {
-				readErr = pushguard.Record(a.c, name, src, target, contents)
-			}
-			if readErr != nil {
-				note("WARNING: pushed, but could not record what was written: %v", readErr)
-				note("         The next push to %s will ask for --force.", target)
-			}
-
-			note("pushed %d file(s) to %s:%s", n, name, target)
-			return nil
-		},
-	}
-	cmd.Flags().StringVar(&dest, "dest", "", "guest directory (default /work/<source basename>)")
-	cmd.Flags().BoolVar(&force, "force", false,
-		"overwrite guest files rig did not write — read them first, the guest copy may be the only one")
-	return cmd
-}
-
-func (a *app) pullCmd() *cobra.Command {
-	var out string
-	var force bool
-	cmd := &cobra.Command{
-		Use:     "pull <vm> <guest-path>",
-		GroupID: "guest",
-		Short:   "Read a file out of the guest",
-		Args:    cobra.ExactArgs(2),
-		RunE: func(_ *cobra.Command, args []string) error {
-			if err := a.requireInstance(args[0]); err != nil {
-				return err
-			}
-			content, err := a.c.Pull(args[0], args[1])
-			if err != nil {
-				return err
-			}
-			if out == "" {
-				_, err = os.Stdout.Write(content)
-				return err
-			}
-			// Same hazard in the other direction, and cheaper to guard: --out
-			// names one file, so an accidental overwrite is a whole host file.
-			if _, err := os.Stat(out); err == nil && !force {
-				return fmt.Errorf("%s already exists.\n"+
-					"  Look at it first, then:  rig pull --force --out %s %s %s",
-					out, out, args[0], args[1])
-			}
-			return os.WriteFile(out, content, 0o644)
-		},
-	}
-	cmd.Flags().StringVar(&out, "out", "", "write to this file instead of stdout")
-	cmd.Flags().BoolVar(&force, "force", false, "overwrite --out if it already exists")
-	return cmd
-}
-
 // --- helpers -------------------------------------------------------------
+
+// confirm asks a yes-or-no question on the terminal; anything but yes is no.
+// Without a terminal there is no one to ask, so it refuses and names the flag
+// that answers in advance, rather than reading a script's stdin as consent.
+func confirm(question, flag string) (bool, error) {
+	if !isTerminal(os.Stdin) {
+		return false, fmt.Errorf("there is no terminal to ask on; pass %s to answer yes in advance", flag)
+	}
+	fmt.Printf("%s [y/N] ", question)
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true, nil
+	}
+	return false, nil
+}
+
+func isTerminal(f *os.File) bool {
+	_, err := unix.IoctlGetTermios(int(f.Fd()), unix.TCGETS)
+	return err == nil
+}
 
 // driftAlias picks the image alias `doctor` measures an instance against.
 //

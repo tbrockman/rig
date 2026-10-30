@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -135,9 +136,36 @@ func (a *app) queued(name string) {
 	note("%s queued; the agent is not running (%s), and gets it when it next starts", n, state)
 }
 
+// messageText is what a send or an answer says: its words, or with --file a
+// file's contents (- for stdin), for text with lines and quotes in it.
+func messageText(words []string, file string) (string, error) {
+	var b []byte
+	var err error
+	switch {
+	case file != "" && len(words) > 0:
+		return "", errors.New("give the text as words or with --file, not both")
+	case file == "-":
+		b, err = io.ReadAll(os.Stdin)
+	case file != "":
+		b, err = os.ReadFile(file)
+	case len(words) == 0:
+		return "", errors.New("no text: give it as words, or with --file (- reads stdin)")
+	default:
+		return strings.Join(words, " "), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(string(b)) == "" {
+		return "", fmt.Errorf("%s is empty", firstNonEmpty(strings.TrimPrefix(file, "-"), "stdin"))
+	}
+	return strings.TrimRight(string(b), "\n"), nil
+}
+
 func (a *app) agentSendCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "send <vm> <message>...",
+	var file string
+	cmd := &cobra.Command{
+		Use:   "send <vm> [<message>...]",
 		Short: "Send the agent a message, delivered after its next tool call",
 		Long: "Signs the message with this VM's operator key and queues it in the guest\n" +
 			"(" + agent.InboxDir + ", one file per message, renamed into place). The\n" +
@@ -145,14 +173,19 @@ func (a *app) agentSendCmd() *cobra.Command {
 			"call, through Claude Code's PostToolUse hook, or at its next launch,\n" +
 			"whichever comes first; a turn can run for hours, and the message no longer\n" +
 			"waits for it to end. Nothing is held open, so neither side can hang on the\n" +
-			"other. `rig agent status` and `watch` say when it was delivered.",
-		Args: cobra.MinimumNArgs(2),
+			"other. `rig agent status` and `watch` say when it was delivered.\n\n" +
+			"--file sends a file's contents instead of words, and --file - reads stdin.",
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
+			text, err := messageText(args[1:], file)
+			if err != nil {
+				return err
+			}
 			ch, err := a.openChannel(args[0])
 			if err != nil {
 				return err
 			}
-			e, err := a.deliver(ch, agent.KindMessage, "", strings.Join(args[1:], " "))
+			e, err := a.deliver(ch, agent.KindMessage, "", text)
 			if err != nil {
 				return err
 			}
@@ -161,22 +194,30 @@ func (a *app) agentSendCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&file, "file", "", "send this file's contents; - reads stdin")
+	return cmd
 }
 
 func (a *app) agentAnswerCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "answer <vm> <id> <text>...",
+	var file string
+	cmd := &cobra.Command{
+		Use:   "answer <vm> <id> [<text>...]",
 		Short: "Answer one of the agent's asks",
 		Long: "Answers ask <id>, which `rig agent asks` and `status` list. Signed and\n" +
 			"queued like a message: an agent blocked in `rig ask --wait` or `rig wait`\n" +
 			"prints it, and otherwise it arrives after the agent's next tool call.\n" +
 			"Answering again replaces the earlier answer for an agent that has not\n" +
-			"read it yet, and reaches one that has as a second answer.",
-		Args: cobra.MinimumNArgs(3),
+			"read it yet, and reaches one that has as a second answer.\n\n" +
+			"--file answers with a file's contents, and --file - reads stdin.",
+		Args: cobra.MinimumNArgs(2),
 		RunE: func(_ *cobra.Command, args []string) error {
 			name, id := args[0], args[1]
 			if !agent.ValidID(id) {
 				return fmt.Errorf("%q is not an ask id", id)
+			}
+			text, err := messageText(args[2:], file)
+			if err != nil {
+				return err
 			}
 			ch, err := a.openChannel(name)
 			if err != nil {
@@ -190,7 +231,7 @@ func (a *app) agentAnswerCmd() *cobra.Command {
 			if strings.Contains(out, "answered") {
 				note("%q was answered already; sending this one too", id)
 			}
-			if _, err := a.deliver(ch, agent.KindAnswer, id, strings.Join(args[2:], " ")); err != nil {
+			if _, err := a.deliver(ch, agent.KindAnswer, id, text); err != nil {
 				return err
 			}
 			note("answered %q on %s", id, name)
@@ -198,6 +239,8 @@ func (a *app) agentAnswerCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&file, "file", "", "answer with this file's contents; - reads stdin")
+	return cmd
 }
 
 func (a *app) agentAsksCmd() *cobra.Command {

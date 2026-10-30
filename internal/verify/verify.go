@@ -276,7 +276,9 @@ func (r *Runner) controls() {
 	}
 
 	for _, c := range list {
-		reach, detail := r.probeGuest(c.m, c.ip, c.port)
+		reach, detail, tries := retryControl(controlTries, func() (Reach, string) {
+			return r.probeGuest(c.m, c.ip, c.port)
+		})
 		ok := reach == Reachable
 		r.working[c.m] = ok
 		outcome := Pass
@@ -285,12 +287,32 @@ func (r *Runner) controls() {
 		} else {
 			outcome = Unproven
 			detail = firstNonEmpty(detail, "mechanism unusable: "+string(c.m)+" results cannot be trusted")
+			detail = fmt.Sprintf("%s (%d tries)", detail, tries)
 		}
 		r.record(Check{Label: c.label, Outcome: outcome, Detail: detail}, true)
 	}
 	if r.Bridge == "" {
 		r.record(Check{Label: "dns works (bridge resolver)", Outcome: Unproven,
 			Detail: "no bridge address discovered"}, true)
+	}
+}
+
+// controlTries is how often a control, or a check that must reach its target,
+// is tried before it counts as failed. The DNS probes are one UDP datagram
+// each way, and losing either made one run in three or four fail. A retry
+// only ever turns a lost packet back into the reach it should have been, so
+// it cannot hide a leak; block checks, where a lost packet would read as a
+// pass, are not what it is for.
+const controlTries = 3
+
+// retryControl runs probe until it reaches its target or has had tries goes,
+// and says how many it took.
+func retryControl(tries int, probe func() (Reach, string)) (Reach, string, int) {
+	for n := 1; ; n++ {
+		reach, detail := probe()
+		if reach == Reachable || n >= tries {
+			return reach, detail, n
+		}
 	}
 }
 
@@ -401,7 +423,15 @@ func (r *Runner) check(t Target) {
 		return
 	}
 
-	reach, detail := r.probeGuest(t.Mechanism, t.IP, t.Port)
+	// A lost packet fails a must-be-allowed check as surely as a broken
+	// network does, so it gets the controls' retries.
+	tries := 1
+	if t.Expect == Reachable {
+		tries = controlTries
+	}
+	reach, detail, _ := retryControl(tries, func() (Reach, string) {
+		return r.probeGuest(t.Mechanism, t.IP, t.Port)
+	})
 	c := Check{Label: t.Label, Detail: detail, Advisory: advisory && t.Expect == Blocked}
 	switch {
 	case reach == Unknown:

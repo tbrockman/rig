@@ -11,9 +11,9 @@ printf 'ANTHROPIC_API_KEY=sk-ant-...\n' > ~/.config/rig/cuda-agent.env && chmod 
 
 rig apply -f rig.yaml --start
 rig push cuda-agent .                  # -> /work/cuda-agent
-rig exec --dir /work/cuda-agent cuda-agent nix develop "path:." -c make run
+rig exec --dir /work/cuda-agent cuda-agent -- nix develop "path:." -c make run
 rig verify cuda-agent
-rig exec --dir /work/cuda-agent cuda-agent nix develop "path:." -c ./run-agent
+rig exec --dir /work/cuda-agent cuda-agent -- nix develop "path:." -c ./run-agent
 ```
 
 ## Why the toolchain is here

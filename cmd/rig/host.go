@@ -79,10 +79,20 @@ func (a *app) hostCmd() *cobra.Command {
 	// held refuses while any instance still has the device configured: the
 	// rebind would race Incus and both sides lose. Checked before elevation,
 	// so the refusal costs no password prompt.
-	held := func(addr string) error {
+	//
+	// Incus is the record of who holds what, so failing to read it means
+	// "unknown", never "nobody": a VM's QEMU keeps running while the daemon is
+	// down or restarting, and taking its card from under it can hang the host.
+	held := func(addr string, force bool) error {
 		instances, err := a.c.Instances()
-		if err != nil {
+		if err != nil && force {
+			note("WARNING: could not ask Incus whether a VM holds %s (%v); going ahead, as --force says", addr, err)
 			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("cannot ask Incus whether a VM holds %s: %w\n"+
+				"A VM keeps running while Incus is down, and taking the card from one can hang\n"+
+				"this host. Bring Incus back first; if you know no VM has the card, pass --force.", addr, err)
 		}
 		for _, h := range devices.Holders(instances) {
 			if h.PCI == addr {
@@ -93,8 +103,30 @@ func (a *app) hostCmd() *cobra.Command {
 		return nil
 	}
 
+	var deskForce bool
+	desktop := &cobra.Command{
+		Use:   "desktop",
+		Short: "Reclaim the card for this host and start the desktop",
+		Args:  cobra.NoArgs,
+		RunE: func(*cobra.Command, []string) error {
+			s, err := card()
+			if err != nil {
+				return err
+			}
+			if err := held(s.PCI, deskForce); err != nil {
+				return err
+			}
+			if os.Geteuid() != 0 {
+				return elevate(withForce(returnArgs(s), deskForce))
+			}
+			return s.Return()
+		},
+	}
+	desktop.Flags().BoolVar(&deskForce, "force", false, "go ahead when Incus cannot be asked whether a VM holds the card")
+
 	var retSpec hostdev.Spec
 	var retModules string
+	var retForce bool
 	ret := &cobra.Command{
 		Use:   "return",
 		Short: "Hand one device back to the host by its recipe (what rig stop runs)",
@@ -106,11 +138,11 @@ func (a *app) hostCmd() *cobra.Command {
 			if retModules != "" {
 				retSpec.Modules = strings.Split(retModules, ",")
 			}
-			if err := held(retSpec.PCI); err != nil {
+			if err := held(retSpec.PCI, retForce); err != nil {
 				return err
 			}
 			if os.Geteuid() != 0 {
-				return elevate(returnArgs(retSpec))
+				return elevate(withForce(returnArgs(retSpec), retForce))
 			}
 			return retSpec.Return()
 		},
@@ -120,6 +152,7 @@ func (a *app) hostCmd() *cobra.Command {
 	ret.Flags().BoolVar(&retSpec.Reset, "reset", false, "function-level reset before the host driver binds")
 	ret.Flags().StringVar(&retSpec.Alive, "alive", "", "sysfs pattern under the device that proves it came up")
 	ret.Flags().StringVar(&retSpec.Unit, "unit", "", "host unit to start afterwards")
+	ret.Flags().BoolVar(&retForce, "force", false, "go ahead when Incus cannot be asked whether a VM holds the device")
 
 	var freeSpec hostdev.Spec
 	var freeModules string
@@ -202,24 +235,7 @@ func (a *app) hostCmd() *cobra.Command {
 				return a.printHolders()
 			},
 		},
-		&cobra.Command{
-			Use:   "desktop",
-			Short: "Reclaim the card for this host and start the desktop",
-			Args:  cobra.NoArgs,
-			RunE: func(*cobra.Command, []string) error {
-				s, err := card()
-				if err != nil {
-					return err
-				}
-				if err := held(s.PCI); err != nil {
-					return err
-				}
-				if os.Geteuid() != 0 {
-					return elevate(returnArgs(s))
-				}
-				return s.Return()
-			},
-		},
+		desktop,
 		&cobra.Command{
 			Use:   "headless",
 			Short: "Stop the desktop and free the card for VMs",
@@ -273,6 +289,14 @@ func (a *app) printHolders() error {
 		fmt.Printf("  %s (%s): %s %s %s\n", h.Instance, h.Status, h.Device, h.Kind, h.PCI)
 	}
 	return nil
+}
+
+// withForce passes --force on to the root half, which asks Incus again.
+func withForce(args []string, force bool) []string {
+	if force {
+		return append(args, "--force")
+	}
+	return args
 }
 
 // returnArgs and freeArgs render a spec as the argv of the root half, so the

@@ -422,6 +422,23 @@ discovered, so moving the card needs no config change.
   matters is not "does this exist" but "did anyone but rig touch it". Learned
   the expensive way: a stale staging directory silently destroyed an unattended
   agent's decision log, and `/work` is the only copy of anything.
+- **`rig pull` is `push` turned around.** Both take `<vm> <from> [<to>]`, copy
+  a directory's contents to exactly the destination, and refuse to overwrite a
+  file they did not write. Re-pulling to see an agent's progress is the normal
+  workflow, so pull marks each host file with the hash it wrote, in a `user.`
+  extended attribute that moves and dies with the file, and refuses only a file
+  edited since or one it never wrote that differs. Pull once read a single file
+  and printed a directory's JSON listing as if it were content, with exit 0.
+- **`rig exec` takes its command after `--`.** Before, everything after the VM
+  was the guest's, so rig's flags there reached bash, and words were joined
+  with spaces, losing their quoting. Now rig's flags go anywhere before `--`;
+  after it, several words arrive exactly as given, as with `docker exec`, and
+  one is a shell script. stdin stays opt-in (`-i`), or a script's loop loses
+  its input to the guest, as with ssh.
+- **`rm` and `delete` read `-f` the way their namesakes do.** `rig rm -f myvm`
+  forces, as `docker rm -f` does; `rig delete -f rig.yaml` names a manifest, as
+  `kubectl delete -f` does. One verb with both meanings of `-f` read a VM name
+  as a missing file. Both ask before deleting, since the disk holds `/work`.
 - **The unattended agent is a job, not a conversation.** `rig agent` runs it as
   a systemd unit writing to files, and the operator pulls from those files on
   demand — nothing streams into the operator's context by default. The session
@@ -897,9 +914,9 @@ Tailscale and docker.)
    still nobody's job. `rig status` should show age and size, and there should
    be a way to list what is stale.
 2. **`/work` lives inside the instance.** `rig rm` destroys the project with the
-   VM, so the VM is the only copy until someone pushes a git remote. Either put
-   `/work` on a separate volume that outlives the instance, or have `rig rm`
-   refuse when the tree has uncommitted changes.
+   VM, so the VM is the only copy until someone pushes a git remote or pulls it
+   out. `rig rm` now says so and asks first; a separate volume for `/work`
+   that outlives the instance is still the fix.
 3. **One card, one project is enforced but not scheduled.** With several
    projects, "who had it last, and does something want it now" becomes guesswork
    at the point where it is most annoying to add.

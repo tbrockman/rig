@@ -45,9 +45,8 @@ import (
 func vsockPort(tcpPort int) uint32 { return uint32(tcpPort) }
 
 func (a *app) forwardCmd() *cobra.Command {
-	var toGuest bool
+	var toGuest, bindAll, stopIt bool
 	var hostPort int
-	var bindAll bool
 
 	cmd := &cobra.Command{
 		Use:     "forward <vm> <port>",
@@ -60,7 +59,9 @@ func (a *app) forwardCmd() *cobra.Command {
 			"  rig forward <vm> 9222              # guest:9222 -> 127.0.0.1:9222 here\n\n" +
 			"With --to-guest, this host's port is exposed there:\n" +
 			"  rig forward <vm> 8787 --to-guest   # here:8787 -> 127.0.0.1:8787 in the guest\n\n" +
-			"Blocks while it holds the tunnel; Ctrl-C tears down both ends.\n\n" +
+			"Blocks while it holds the tunnel; Ctrl-C, or closing the terminal, tears\n" +
+			"down both ends. --stop removes a guest half left behind by a rig that\n" +
+			"was killed outright.\n\n" +
 			"To reach it from a third machine — a laptop ssh'd into this host — do not\n" +
 			"bind this to a public address. Tunnel over the ssh you already have:\n" +
 			"  ssh -L 9222:127.0.0.1:9222 <this-host>",
@@ -82,6 +83,20 @@ func (a *app) forwardCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			pidfile := guestPIDFile(port)
+			if stopIt {
+				out, _ := a.exec(name, guestPIDAlive(pidfile))
+				pid := strings.TrimSpace(out)
+				if !inst.Running() || pid == "" {
+					note("no forward for port %d is running in %s", port, name)
+					return nil
+				}
+				if _, err := a.exec(name, guestStop(pidfile)); err != nil {
+					return fmt.Errorf("stopping the guest half: %w", err)
+				}
+				note("stopped the guest half of the forward for port %d in %s (pid %s)", port, name, pid)
+				return nil
+			}
 			if !inst.Running() {
 				return fmt.Errorf("%s is %s; a tunnel needs a running guest",
 					name, strings.ToLower(inst.Status))
@@ -97,7 +112,7 @@ func (a *app) forwardCmd() *cobra.Command {
 				return fmt.Errorf("no `socat` in %s, which runs the guest half of the tunnel.\n"+
 					"The base image carries it; this guest was made from one that predates that.\n"+
 					"Rebuild and recreate (rig image build, then rig new), or install it by hand:\n"+
-					"  rig exec %s nix profile install nixpkgs#socat", name, name)
+					"  rig exec %s -- nix profile install nixpkgs#socat", name, name)
 			}
 
 			var guestCmd string
@@ -115,12 +130,11 @@ func (a *app) forwardCmd() *cobra.Command {
 			// or a leftover from a rig that died without tearing down; either
 			// way it is named rather than killed, because killing something
 			// this did not start is not this command's decision to make.
-			pidfile := guestPIDFile(port)
 			if out, _ := a.exec(name, guestPIDAlive(pidfile)); strings.TrimSpace(out) != "" {
 				pid := strings.TrimSpace(out)
 				return fmt.Errorf("a forward for port %d is already running in %s (pid %s).\n"+
-					"  rig exec %s kill %s   # if it is a leftover rather than someone's live tunnel",
-					port, name, pid, name, pid)
+					"  rig forward %s %d --stop   # if it is a leftover rather than someone's live tunnel",
+					port, name, pid, name, port)
 			}
 			if _, err := a.exec(name, guestStart(pidfile, guestCmd)); err != nil {
 				return fmt.Errorf("starting the guest half: %w", err)
@@ -136,8 +150,10 @@ func (a *app) forwardCmd() *cobra.Command {
 				return fmt.Errorf("the guest half never started listening on port %d.\n%s", port, strings.TrimSpace(out))
 			}
 
+			// SIGHUP too: closing the terminal is the other ordinary way this
+			// ends, and without it the guest half outlived every such tunnel.
 			stop := make(chan os.Signal, 1)
-			signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+			signal.Notify(stop, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
 			if toGuest {
 				return a.forwardToGuest(name, port, hostPort, stop)
@@ -148,6 +164,7 @@ func (a *app) forwardCmd() *cobra.Command {
 	f := cmd.Flags()
 	f.BoolVar(&toGuest, "to-guest", false, "expose this host's port inside the guest, instead of the other way round")
 	f.IntVar(&hostPort, "host-port", 0, "listen on this port here instead of the same number")
+	f.BoolVar(&stopIt, "stop", false, "stop the guest half of this port's forward, left behind by a rig that did not exit cleanly")
 	f.BoolVar(&bindAll, "bind-all", false,
 		"listen on 0.0.0.0 rather than 127.0.0.1 — this exposes a guest port to your whole LAN")
 	return cmd

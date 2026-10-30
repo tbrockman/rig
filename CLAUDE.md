@@ -60,7 +60,7 @@ survive). Nix sees only files git knows about, so `git add` a new file under
 | `internal/policy` | the isolation ACL and the `rig` profile |
 | `internal/ports`, `volumes`, `cpuset`, `input` | the other grants |
 | `internal/verify` | probing a live guest |
-| `internal/agent`, `creds`, `pushguard` | the agent unit, the harness interface (`agent/claudecode` implements it) and the signed channel (`agent/guest` its guest half, `agent/operator` the host's keys, `agent/guestbin` the embedded guest build); credential injection; push's overwrite guard |
+| `internal/agent`, `creds`, `pushguard`, `pullguard` | the agent unit, the harness interface (`agent/claudecode` implements it) and the signed channel (`agent/guest` its guest half, `agent/operator` the host's keys, `agent/guestbin` the embedded guest build); credential injection; push's and pull's overwrite guards |
 | `internal/proxy` | credentials the guest never holds: the rules, the guest's half, each guest's witmproxy instance and its API |
 | `internal/incus`, `vsock` | the Incus REST client; AF_VSOCK |
 | `plugin/` | rig's witmproxy plugin (Rust, `@joinezco/rig`); its signed build is embedded from `internal/proxy/plugin` |

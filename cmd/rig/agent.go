@@ -575,17 +575,42 @@ func describeOptions(o agent.StartOptions) string {
 
 func (a *app) agentLogCmd() *cobra.Command {
 	var lines int
+	var follow, stderr bool
 	cmd := &cobra.Command{
 		Use:   "log <vm>",
 		Short: "The agent's recent words, without the tool-call noise",
 		Long: "Reads a bounded tail of the event stream and prints only what the agent\n" +
 			"said. The raw log is megabytes of tool calls; this is the part worth an\n" +
-			"operator's attention, and it stays small enough to read often.",
+			"operator's attention, and it stays small enough to read often.\n\n" +
+			"--stderr prints the agent's stderr and the runner's notes instead: why a\n" +
+			"launch was refused, a crash, each resume. -f keeps printing either as it\n" +
+			"grows, reading the guest every few seconds, until interrupted.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			name := args[0]
 			if err := a.requireInstance(name); err != nil {
 				return err
+			}
+			if stderr {
+				read := func() ([]string, error) {
+					out, err := a.exec(name, "tail -n 500 "+agent.StderrPath+" 2>/dev/null || true")
+					if out = strings.TrimRight(out, "\n"); out == "" {
+						return nil, err
+					}
+					return strings.Split(out, "\n"), err
+				}
+				all, err := read()
+				if err != nil {
+					return err
+				}
+				show := func(l string) { fmt.Println(l) }
+				for _, l := range all[max(0, len(all)-lines):] {
+					show(l)
+				}
+				if !follow {
+					return nil
+				}
+				return followPolled(3*time.Second, all, read, show)
 			}
 			_, h, err := a.harnessOf(name)
 			if err != nil {
@@ -594,17 +619,25 @@ func (a *app) agentLogCmd() *cobra.Command {
 			// Filter and tail in the guest, so a huge log never crosses the
 			// wire and the window is spent on speech rather than on the tool
 			// output surrounding it.
-			out, err := a.exec(name, h.TailSpeechCmd(400000))
+			read := func(limit int) ([]string, bool, error) {
+				out, err := a.exec(name, h.TailSpeechCmd(400000))
+				if err != nil {
+					return nil, false, err
+				}
+				return h.AssistantText(out, limit), strings.Contains(out, agent.NoEvents), nil
+			}
+			window := max(lines, 50)
+			all, noEvents, err := read(window)
 			if err != nil {
 				return err
 			}
-			if strings.Contains(out, agent.NoEvents) {
+			show := func(t string) { fmt.Printf("• %s\n\n", t) }
+			switch {
+			case noEvents && !follow:
 				note("no event log yet — the agent has not started writing one.\n"+
 					"  rig agent status %s   # is the unit even up", name)
 				return nil
-			}
-			texts := h.AssistantText(out, lines)
-			if len(texts) == 0 {
+			case len(all) == 0 && !follow:
 				// Now a real statement about the agent rather than about the
 				// read: the window held only the agent's own events, and none
 				// of them was speech.
@@ -612,13 +645,21 @@ func (a *app) agentLogCmd() *cobra.Command {
 					"  rig agent status %s   # unit, restarts, and any last error", name)
 				return nil
 			}
-			for _, t := range texts {
-				fmt.Printf("• %s\n\n", t)
+			for _, t := range all[max(0, len(all)-lines):] {
+				show(t)
 			}
-			return nil
+			if !follow {
+				return nil
+			}
+			return followPolled(5*time.Second, all, func() ([]string, error) {
+				texts, _, err := read(window)
+				return texts, err
+			}, show)
 		},
 	}
-	cmd.Flags().IntVar(&lines, "lines", 10, "how many of the most recent messages to show")
+	cmd.Flags().IntVarP(&lines, "lines", "n", 10, "how many of the most recent messages, or lines with --stderr, to show")
+	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "keep printing as the agent goes on")
+	cmd.Flags().BoolVar(&stderr, "stderr", false, "the agent's stderr and the runner's notes, rather than what it said")
 	return cmd
 }
 

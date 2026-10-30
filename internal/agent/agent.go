@@ -40,6 +40,7 @@ const (
 	PromptPath = Dir + "/prompt"
 	DonePath   = Dir + "/" + DoneName
 	EventsPath = Dir + "/events.jsonl"
+	StderrPath = Dir + "/stderr.log"
 	SessionKey = "user.rig.agent.session"
 	Unit       = "rig-agent"
 )

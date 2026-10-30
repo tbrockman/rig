@@ -62,7 +62,7 @@ image.
 ```bash
 rig new scratch --start          # a VM with no host devices
 rig verify scratch               # prove the isolation with real packets
-rig shell scratch
+rig sh scratch
 rig stop scratch && rig rm scratch
 
 rig init myproj --with nvidia    # myproj/rig.yaml granting the card, myproj/guest/ with its driver
@@ -222,14 +222,14 @@ values); `rig creds` swaps a key without a restart, as before.
 | `schema` | Print rig.yaml's JSON Schema |
 | `apply -f`, `delete -f` | Create a manifest's VM or bring it back in line with the file; remove it |
 | `new` | Create a VM without a manifest (`--gpu` for this host's card) |
-| `start`, `stop`, `restart`, `rm` | Lifecycle. `start` claims devices; `stop` returns them; `rm --volumes` also deletes volumes |
-| `status`, `logs` | Who holds which device; the console of a VM that won't boot |
+| `start`, `stop`, `restart`, `rm` | Lifecycle. `start` claims devices; `stop` returns them; `rm` asks first, and `--volumes` also deletes volumes |
+| `list`, `status`, `logs` | Every VM; who holds which device, or with a VM named, everything recorded on it; the console of a VM that won't boot |
 | `doctor`, `verify` | Check the configuration; prove the isolation from inside |
 
 | Inside a guest | |
 |---|---|
-| `exec`, `shell` | Run a command, or open a shell |
-| `push`, `pull` | Copy files in and out; `push` won't overwrite what it didn't write |
+| `exec`, `sh` | Run a command, or open a shell (`shell` also works) |
+| `push`, `pull` | Copy a file or directory in or out; neither overwrites what it didn't write |
 | `mount`, `unmount` | A live view of a guest directory on the host |
 | `forward` | One TCP port, either direction, over vsock |
 | `creds` | Swap the credential in a running VM |

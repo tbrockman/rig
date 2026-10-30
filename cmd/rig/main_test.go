@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -828,5 +829,80 @@ func TestNetworkPlanAddsAndRemovesTheProxyNIC(t *testing.T) {
 	}
 	if ip := policy.ProxyIPOf(tampered); ip != "10.207.0.5" {
 		t.Errorf("ProxyIPOf = %q", ip)
+	}
+}
+
+// rm deletes /work with the disk. A script has no one to ask, and reading its
+// stdin as consent would let a stray "y" delete a VM; it must say --yes.
+func TestConfirmRefusesWithoutATerminal(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.WriteString("y\n")
+	w.Close()
+	saved := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = saved }()
+
+	ok, err := confirm("Delete myvm?", "--yes")
+	if ok || err == nil || !strings.Contains(err.Error(), "--yes") {
+		t.Errorf("got %v, %v; want a refusal naming --yes", ok, err)
+	}
+}
+
+// rm and delete are one deletion reached two ways, each with its own
+// convention for -f: force, as in docker rm; the manifest, as in kubectl
+// delete. Both ask, and both say what is lost.
+func TestRmAndDeleteFollowTheirConventionsForF(t *testing.T) {
+	a := &app{}
+	rm, del := a.rmCmd(), a.deleteCmd()
+	if f := rm.Flags().ShorthandLookup("f"); f == nil || f.Name != "force" {
+		t.Error("rm -f must mean --force")
+	}
+	if f := del.Flags().ShorthandLookup("f"); f == nil || f.Name != "file" {
+		t.Error("delete -f must name the manifest")
+	}
+	for _, c := range []*cobra.Command{rm, del} {
+		if c.Flags().ShorthandLookup("y") == nil {
+			t.Errorf("%s needs --yes / -y for scripts", c.Name())
+		}
+		for _, want := range []string{"/work", "for good"} {
+			if !strings.Contains(c.Long, want) {
+				t.Errorf("%s's help must mention %q", c.Name(), want)
+			}
+		}
+	}
+	rm.SetArgs([]string{"rig.yaml"})
+	rm.SetOut(io.Discard)
+	rm.SetErr(io.Discard)
+	if err := rm.Execute(); err == nil || !strings.Contains(err.Error(), "rig delete -f rig.yaml") {
+		t.Errorf("rm given a manifest must point at delete -f, got %v", err)
+	}
+	del.SetArgs([]string{"myvm"})
+	del.SetOut(io.Discard)
+	del.SetErr(io.Discard)
+	if err := del.Execute(); err == nil || !strings.Contains(err.Error(), "rig rm myvm") {
+		t.Errorf("delete given a name must point at rm, got %v", err)
+	}
+}
+
+// An Incus that cannot be read says nothing about who holds the card: QEMU
+// outlives the daemon. Reclaiming the card then must stop, before sudo, and
+// say how to go ahead deliberately.
+func TestReclaimingTheCardRefusesWhenIncusCannotBeAsked(t *testing.T) {
+	a := &app{c: incus.New(filepath.Join(t.TempDir(), "no-incus.socket"))}
+	for _, verb := range [][]string{
+		{"desktop", "--pci", "0000:2b:00.0"},
+		{"return", "--pci", "0000:2b:00.0"},
+	} {
+		c := a.hostCmd()
+		c.SetArgs(verb)
+		c.SetOut(io.Discard)
+		c.SetErr(io.Discard)
+		err := c.Execute()
+		if err == nil || !strings.Contains(err.Error(), "cannot ask Incus") || !strings.Contains(err.Error(), "--force") {
+			t.Errorf("host %s: got %v; want a refusal naming --force", verb[0], err)
+		}
 	}
 }

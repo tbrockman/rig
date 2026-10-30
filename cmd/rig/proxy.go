@@ -402,6 +402,9 @@ func (a *app) proxyLogCmd() *cobra.Command {
 		Long:  "Runs `witm service logs` for the guest's witmproxy instance.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
+			if err := a.requireInstance(args[0]); err != nil {
+				return err
+			}
 			inst, _, err := a.c.Instance(args[0])
 			if err != nil {
 				return err

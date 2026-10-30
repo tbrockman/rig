@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -28,6 +29,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/tbrockman/rig/internal/incus"
 )
 
 // ManifestPath is in /var/lib rather than /run: it has to survive a reboot,
@@ -75,8 +78,12 @@ func Load(c Client, instance string) Manifest {
 
 // Files lists the regular files under hostDir, relative to it, in the same way
 // PushDir selects them. Shared so the guard can never check a different set of
-// files than the push writes.
+// files than the push writes. A single file is itself, as ".", so the same
+// joins name it on both sides.
 func Files(hostDir string) ([]string, error) {
+	if st, err := os.Stat(hostDir); err == nil && st.Mode().IsRegular() {
+		return []string{"."}, nil
+	}
 	var out []string
 	err := filepath.WalkDir(hostDir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -127,6 +134,11 @@ func Check(c Client, instance, hostDir, guestDir string) ([]Conflict, error) {
 	for _, rel := range rels {
 		gp := path.Join(guestDir, rel)
 		existing, err := c.Pull(instance, gp)
+		var notFile *incus.NotAFileError
+		if errors.As(err, &notFile) {
+			conflicts = append(conflicts, Conflict{gp, "is a " + notFile.Type + " in the guest"})
+			continue
+		}
 		if err != nil {
 			continue // not there; writing it destroys nothing
 		}
@@ -173,6 +185,6 @@ func Error(conflicts []Conflict, instance, guestDir string) error {
 	b.WriteString("\nRead them before you decide — /work exists only inside the instance,\n")
 	b.WriteString("so the guest's copy may be the only one.\n")
 	fmt.Fprintf(&b, "  rig pull %s %s\n      # look first\n", instance, conflicts[0].GuestPath)
-	b.WriteString("  rig push --force <vm> <src-dir>\n      # then overwrite deliberately")
+	b.WriteString("  rig push --force <vm> <host-path>\n      # then overwrite deliberately")
 	return fmt.Errorf("%s", b.String())
 }

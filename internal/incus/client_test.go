@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -536,15 +537,68 @@ func TestMkdirTreatsConflictAsSuccessAndNothingElse(t *testing.T) {
 	}
 }
 
-func TestPullReturnsTheBytesAndDecodesErrors(t *testing.T) {
-	f := newFake(t)
-	f.handle("GET /1.0/instances/{name}/files", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("path") == "/etc/hostname" {
-			w.Write([]byte("myvm\n"))
+// guestFiles serves a small guest tree the way Incus does: every answer
+// carries the path's type, mode and mtime in headers, a directory's GET is its
+// listing, and a HEAD has no body.
+func guestFiles(f *fake) {
+	tree := map[string]string{ // path -> content; "/" suffix marks a directory
+		"/work/":           "",
+		"/work/notes.md":   "# notes\n",
+		"/work/sub/":       "",
+		"/work/sub/run.sh": "#!/bin/sh\n",
+		"/work/link":       "/nix/store/x",
+		"/etc/hostname":    "myvm\n",
+	}
+	serve := func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Query().Get("path")
+		h := w.Header()
+		h.Set("X-Incus-Modified", "2026-10-16 02:04:31 +0000 UTC")
+		h.Set("X-Incus-Uid", "0")
+		if _, ok := tree[p+"/"]; ok {
+			h.Set("X-Incus-Type", "directory")
+			h.Set("X-Incus-Mode", "0755")
+			var names []string
+			for k := range tree {
+				rest, ok := strings.CutPrefix(strings.TrimSuffix(k, "/"), p+"/")
+				if ok && !strings.Contains(rest, "/") {
+					names = append(names, rest)
+				}
+			}
+			if r.Method == http.MethodGet {
+				writeSync(w, names)
+			}
 			return
 		}
-		writeError(w, 404, "no such file")
-	})
+		content, ok := tree[p]
+		if !ok {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(404)
+				return
+			}
+			writeError(w, 404, "no such file")
+			return
+		}
+		h.Set("X-Incus-Type", "file")
+		h.Set("X-Incus-Mode", "0644")
+		if p == "/work/link" {
+			h.Set("X-Incus-Type", "symlink")
+			h.Set("X-Incus-Mode", "0777")
+		}
+		if p == "/work/sub/run.sh" {
+			h.Set("X-Incus-Mode", "0755")
+		}
+		h.Set("Content-Length", strconv.Itoa(len(content)))
+		if r.Method == http.MethodGet {
+			w.Write([]byte(content))
+		}
+	}
+	f.handle("GET /1.0/instances/{name}/files", serve)
+	f.handle("HEAD /1.0/instances/{name}/files", serve)
+}
+
+func TestPullReturnsTheBytesAndDecodesErrors(t *testing.T) {
+	f := newFake(t)
+	guestFiles(f)
 	c := f.client()
 	b, err := c.Pull("myvm", "/etc/hostname")
 	if err != nil || string(b) != "myvm\n" {
@@ -554,6 +608,69 @@ func TestPullReturnsTheBytesAndDecodesErrors(t *testing.T) {
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || !apiErr.NotFound() {
 		t.Errorf("a missing file must be a not-found APIError, got %v", err)
+	}
+}
+
+// The endpoint answers a directory with its listing and a symlink with its
+// target, at 200. Read as content, either is a wrong answer that exits 0:
+// `rig pull vm /work` once printed a JSON listing.
+func TestPullRefusesWhatIsNotAFile(t *testing.T) {
+	f := newFake(t)
+	guestFiles(f)
+	c := f.client()
+	for p, typ := range map[string]string{"/work": "directory", "/work/link": "symlink"} {
+		b, err := c.Pull("myvm", p)
+		var nf *NotAFileError
+		if !errors.As(err, &nf) || nf.Type != typ {
+			t.Errorf("%s: got %q, %v; want a NotAFileError naming a %s", p, b, err, typ)
+		}
+	}
+}
+
+func TestStatReadsTheHeadersAndNotTheContent(t *testing.T) {
+	f := newFake(t)
+	guestFiles(f)
+	c := f.client()
+	info, err := c.Stat("myvm", "/work/sub/run.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 10, 16, 2, 4, 31, 0, time.UTC)
+	if info.Type != "file" || info.Mode != 0o755 || info.Size != 10 || !info.Modified.Equal(want) {
+		t.Errorf("got %+v", info)
+	}
+	if len(f.all("GET", "/1.0/instances/myvm/files")) != 0 {
+		t.Error("Stat must not GET; that transfers the file")
+	}
+	_, err = c.Stat("myvm", "/nope")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || !apiErr.NotFound() {
+		t.Errorf("a missing path must be a not-found APIError, got %v", err)
+	}
+}
+
+// Tree is what pull plans with, so it must name every entry with its type,
+// put each directory before what it contains, and transfer no file.
+func TestTreeListsDirectoriesFirstAndReadsNoFile(t *testing.T) {
+	f := newFake(t)
+	guestFiles(f)
+	entries, err := f.client().Tree("myvm", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range entries {
+		got = append(got, e.Rel+":"+e.Type)
+	}
+	want := []string{"link:symlink", "notes.md:file", "sub:directory", "sub/run.sh:file"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("got %v, want %v", got, want)
+	}
+	for _, r := range f.all("GET", "/1.0/instances/myvm/files") {
+		q, _ := parseQuery(r.Query)
+		if p := q.Get("path"); p != "/work" && p != "/work/sub" {
+			t.Errorf("Tree read %s; it should only list directories", p)
+		}
 	}
 }
 
