@@ -106,6 +106,8 @@ func main() {
 		a.mountCmd(), a.unmountCmd(), a.forwardCmd(),
 		a.claimCmd(), a.releaseCmd(), a.applyCmd(), a.setupCmd(), a.hostCmd(), a.imageCmd(),
 	)
+	root.AddCommand(a.overseerCmd(root))
+	auditVerbs(root)
 
 	if err := root.Execute(); err != nil {
 		var exit *incus.ExitError

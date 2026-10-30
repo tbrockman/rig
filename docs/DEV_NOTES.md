@@ -189,6 +189,15 @@ look like something else. Decisions and their history are in DESIGN.md.
   post-tool-use` delivers only on an input that names the agent's session
   and no agent; anything else leaves the queue alone, and an input it cannot
   place is said once per launch in `stderr.log`.
+- Claude Code's permission rules (2.1.314 docs): deny, then ask, then
+  allow, first match wins, and an ask rule prompts even when a narrower
+  allow matches, so `Bash(rig rm *)` in ask over `Bash(rig *)` in allow
+  prompts as intended. A `*` may stand in the middle (`Bash(rig forward *
+  --to-guest)`); a rule is matched per subcommand of a compound command,
+  and ask rules apply inside subshells too. In `-p` mode a tool call that
+  would prompt is denied, and `--permission-mode dontAsk` makes that
+  explicit. The allow list is not a security boundary: `/usr/bin/rig` or
+  `sh -c 'rig …'` matches no rule; it is friction removed, not trust.
 - stream-json carries the account's rate limits: a `rate_limit_event` with
   `rate_limit_info.unifiedWindows.{five_hour,seven_day}.{utilization,resetsAt}`
   (seen once per run, at the first response), and each `result` event a

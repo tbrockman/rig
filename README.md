@@ -205,6 +205,16 @@ become `rig agent watch` events, each optionally with a message to send).
 loopback over vsock, held for as long as the VM runs; `guest.ports` is for a
 port other machines must reach.
 
+An overseer can run all of this for you: `rig overseer -f rig.yaml --prompt
+"…"` starts a coding agent on this host, in your terminal, with a prompt that
+makes it the operator's deputy (set up, keep healthy, keep moving, keep
+within budget, report in `OVERSEER.md`), every rig verb allowed and a short
+confirm list asked; `--prompt` alone makes the project first. `rig overseer
+prompt` prints the prompt for another harness. Every verb that acts on a
+VM, yours or the overseer's, is on the operator log, `rig agent log
+--operator <vm>`. `rig init` writes `brief.md`, the shape of the inner
+agent's brief, beside the manifest.
+
 What you send is signed with a key that stays on this host and verified in
 the guest before the agent sees it, and arrives after the agent's next tool
 call rather than at its next restart. It reaches the lead, the process that
@@ -255,7 +265,7 @@ values); `rig creds` swaps a key without a restart, as before.
 | VMs | |
 |---|---|
 | `image build`, `image list` | Build a guest image from `base/` or a project's guest flake |
-| `init` | Write a `rig.yaml` and a guest flake; `--with nvidia,docker,desktop` adds modules |
+| `init` | Write a `rig.yaml`, a guest flake and a brief template; `--with nvidia,docker,desktop` adds modules |
 | `schema` | Print rig.yaml's JSON Schema |
 | `apply -f`, `delete -f` | Create a manifest's VM or bring it back in line with the file; remove it |
 | `new` | Create a VM without a manifest (`--gpu` for this host's card) |
@@ -274,6 +284,7 @@ values); `rig creds` swaps a key without a restart, as before.
 | `agent install/start/stop` | The coding agent (Claude Code by default) as a systemd unit that resumes its session after a crash |
 | `agent status/watch/log/usage` | What it is doing (`--full` for the run's facts), one line per change for a notifier, what it said, what it has consumed |
 | `agent send/answer/asks/brief` | Signed messages, answers to its `rig ask`s, and brief changes as diffs, delivered mid-turn |
+| `overseer` | An agent on this host that sets up and runs a VM's agent for you, audited (`agent log --operator`) |
 
 | Grants and isolation | |
 |---|---|

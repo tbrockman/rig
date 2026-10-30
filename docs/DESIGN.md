@@ -135,6 +135,35 @@ parses the answer; the host makes it, since the guest build has no HTTP
 client and must not grow one. A budget or threshold names which kind it
 means, and the watch evaluates what exists.
 
+**An overseer, trusted and audited.** The second Claude Code session on
+the host that ran one mission's missions needed full host privileges, and
+Claude Code's permission prompts and its command classifier would have
+stalled it on ordinary rig verbs without a permissive mode; and nothing
+on the host recorded which rig verbs it ran on the VM, only what it sent.
+`rig overseer` starts such a session with a prompt rig assembles
+(`internal/agent/overseer.md`: the mandate, the hierarchy, rig's verbs,
+how to write a brief, the confirm list, the audit duty, and the state,
+which is a setup playbook when there is no manifest and the manifest's
+facts and the agent's status when there is) and, for a harness rig can
+launch (`Harness.Overseer`), the settings that make it run without
+friction: every rig verb allowed, taken from the command tree so a new
+verb is covered; the confirm list asked (a forward `--to-guest`, a device
+grant, a credential change, deleting a VM, a push from outside the
+project directory, a start without isolation), which wins over the allow
+list by Claude Code's own precedence; raw `incus`, `git push` and `sudo`
+denied. Interactive by default, so the confirm list can be answered;
+`--unattended` runs it with `-p` and prompts auto-denied, which turns the
+confirm list into a refusal with a message rather than a stall. It is not
+sandboxed beyond that: it needs the verbs that elevate, and a deputy that
+cannot act is no deputy. What makes it trustable is the operator log: every
+verb that acts on a VM appends one line on the host (time, actor, verb,
+arguments, outcome), under the state directory keyed by the VM's name
+rather than beside the manifest, since a `rig new` VM has none and a
+project directory is often a repository. `rig overseer` marks its child's
+verbs as the overseer's through the environment. The operator trusts the
+deputy after the fact, on that log and on its notes, instead of confirming
+each step in advance.
+
 **Defaults and records.** `rig agent start` resolves each option as the
 flag given now, else what the last start recorded, else the file, else
 the flag's default. The record stands in for the file once it exists,

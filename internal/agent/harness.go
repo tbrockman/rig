@@ -132,6 +132,12 @@ type Harness interface {
 	Delivery() []DeliveryPath                                     // how an operator's item reaches the agent, soonest first
 	Usage(events io.Reader) (Consumption, bool)                   // tokens consumed, summed from the event log; false for a harness that logs none
 	QuotaRequests(vars map[string]string) ([]QuotaRequest, error) // how to ask the provider for the credential's windows, best source first; none when the credential has no window (an API key)
+	// Overseer is the host-side half: how to launch this harness on the
+	// host as an overseer, with the system prompt, the mission, the model
+	// and the files (relative to OverseerOpts.FilesDir) that make it run
+	// without permission friction. ok is false for a harness rig cannot
+	// launch this way, which `rig overseer prompt` serves instead.
+	Overseer(o OverseerOpts) (argv []string, files map[string][]byte, ok bool)
 }
 
 // QuotaRequest is how the host asks a provider for a credential's windows:

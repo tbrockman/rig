@@ -838,7 +838,7 @@ func describeOptions(o agent.StartOptions) string {
 
 func (a *app) agentLogCmd() *cobra.Command {
 	var lines int
-	var follow, stderr bool
+	var follow, stderr, operator bool
 	cmd := &cobra.Command{
 		Use:   "log <vm>",
 		Short: "The agent's recent words, without the tool-call noise",
@@ -846,11 +846,45 @@ func (a *app) agentLogCmd() *cobra.Command {
 			"said. The raw log is megabytes of tool calls; this is the part worth an\n" +
 			"operator's attention, and it stays small enough to read often.\n\n" +
 			"--stderr prints the agent's stderr and the runner's notes instead: why a\n" +
-			"launch was refused, a crash, each resume. -f keeps printing either as it\n" +
-			"grows, reading the guest every few seconds, until interrupted.",
+			"launch was refused, a crash, each resume. --operator prints the operator\n" +
+			"log kept on this host: every rig verb run on the VM (start, stop, push,\n" +
+			"exec, forward, creds, every agent verb), by whom (you, or an overseer rig\n" +
+			"launched), with its arguments and outcome. -f keeps printing any of them\n" +
+			"as it grows, until interrupted.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			name := args[0]
+			if operator {
+				path, err := auditPath(name)
+				if err != nil {
+					return err
+				}
+				read := func() ([]string, error) {
+					b, err := os.ReadFile(path)
+					if errors.Is(err, os.ErrNotExist) {
+						return nil, nil
+					}
+					if err != nil {
+						return nil, err
+					}
+					return strings.Split(strings.TrimRight(string(b), "\n"), "\n"), nil
+				}
+				all, err := read()
+				if err != nil {
+					return err
+				}
+				if len(all) == 0 && !follow {
+					note("no operator log for %s yet (%s): nothing has acted on it since this rig", name, path)
+					return nil
+				}
+				for _, l := range all[max(0, len(all)-lines):] {
+					fmt.Println(l)
+				}
+				if !follow {
+					return nil
+				}
+				return followPolled(2*time.Second, all, read, func(l string) { fmt.Println(l) })
+			}
 			if err := a.requireInstance(name); err != nil {
 				return err
 			}
@@ -923,6 +957,7 @@ func (a *app) agentLogCmd() *cobra.Command {
 	cmd.Flags().IntVarP(&lines, "lines", "n", 10, "how many of the most recent messages, or lines with --stderr, to show")
 	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "keep printing as the agent goes on")
 	cmd.Flags().BoolVar(&stderr, "stderr", false, "the agent's stderr and the runner's notes, rather than what it said")
+	cmd.Flags().BoolVar(&operator, "operator", false, "the operator log on this host: every rig verb run on the VM, by whom, with its outcome")
 	return cmd
 }
 

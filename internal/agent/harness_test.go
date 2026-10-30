@@ -32,6 +32,9 @@ func (stub) TailResultsCmd(int) string                               { return ""
 func (stub) Delivery() []DeliveryPath                                { return CommonDelivery() }
 func (stub) Usage(io.Reader) (Consumption, bool)                     { return Consumption{}, false }
 func (stub) QuotaRequests(map[string]string) ([]QuotaRequest, error) { return nil, nil }
+func (stub) Overseer(OverseerOpts) ([]string, map[string][]byte, bool) {
+	return nil, nil, false
+}
 
 // The registry is package state; each test starts from an empty one and puts
 // back whatever it found, so tests cannot see each other's registrations.

@@ -73,7 +73,7 @@ func TestProjectTemplateIsTheManifestAndGuestFlake(t *testing.T) {
 	if err := WriteTree(ProjectTemplate(), dir, nil); err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{"rig.yaml", "guest/flake.nix", "guest/guest.nix", ".gitignore"} {
+	for _, p := range []string{"rig.yaml", "guest/flake.nix", "guest/guest.nix", ".gitignore", "brief.md"} {
 		if _, err := os.Stat(filepath.Join(dir, p)); err != nil {
 			t.Errorf("%s missing from the written template", p)
 		}

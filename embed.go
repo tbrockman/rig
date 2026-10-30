@@ -21,7 +21,7 @@ import (
 //go:embed base/flake.nix base/flake.lock base/base.nix base/nvidia.nix
 //go:embed base/docker.nix base/desktop.nix
 //go:embed base/rig-input/main.go
-//go:embed project-template/.gitignore project-template/rig.yaml
+//go:embed project-template/.gitignore project-template/rig.yaml project-template/brief.md
 //go:embed project-template/guest/flake.nix project-template/guest/guest.nix
 var assets embed.FS
 

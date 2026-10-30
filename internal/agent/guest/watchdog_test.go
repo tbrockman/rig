@@ -34,6 +34,9 @@ func (stub) TailResultsCmd(int) string                                     { ret
 func (stub) Delivery() []agent.DeliveryPath                                { return agent.CommonDelivery() }
 func (stub) Usage(io.Reader) (agent.Consumption, bool)                     { return agent.Consumption{}, false }
 func (stub) QuotaRequests(map[string]string) ([]agent.QuotaRequest, error) { return nil, nil }
+func (stub) Overseer(agent.OverseerOpts) ([]string, map[string][]byte, bool) {
+	return nil, nil, false
+}
 
 func (countingHarness) Usage(events io.Reader) (agent.Consumption, bool) {
 	buf, _ := io.ReadAll(events)
